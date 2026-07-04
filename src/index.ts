@@ -223,6 +223,35 @@ export function checkAndClearPendingUnlock(): boolean {
 }
 
 /**
+ * Android-only, last-resort recovery: forces a genuine process kill and
+ * relaunch. Some native-layer failures (observed: an expo-sqlite connection
+ * that NPEs on every operation, even a fresh `openDatabaseAsync` against a
+ * freshly-rebuilt database file) can only be cleared by a real process
+ * restart — closing/reopening the JS-side handle doesn't reach far enough.
+ * Apps that run this module's `AppBlockerService` as a foreground service
+ * can end up with an unusually long-lived Android process (the OS won't
+ * kill it just because the Activity was "closed"), which surfaces this kind
+ * of native-module degradation far more than it would in a normal app.
+ *
+ * Queues a relaunch (optionally straight back into `deepLink`, e.g. the
+ * blocker intercept URL the caller was trying to reach), then calls
+ * `Process.killProcess`. If that succeeds the process is gone before the
+ * call would otherwise return. The native call itself can still reject
+ * (e.g. a missing Android permission) — this is already the last-resort
+ * path, so that failure is swallowed rather than left as an unhandled
+ * rejection.
+ *
+ * No-op on iOS: that platform's process model doesn't exhibit this failure
+ * mode, and there is no equivalent restart primitive.
+ */
+export function restartAppForRecovery(deepLink?: string): void {
+  if (Platform.OS !== "android") return;
+  NativeModule.restartApp(deepLink ?? null).catch((err: unknown) => {
+    console.warn("[expo-app-blocker] restartAppForRecovery failed", err);
+  });
+}
+
+/**
  * One OS-level block event: the blocker intercepted a blocked app (iOS
  * shield render / Android foreground block). `interceptedAt` is epoch
  * milliseconds; `appName` is the localized app name when the platform

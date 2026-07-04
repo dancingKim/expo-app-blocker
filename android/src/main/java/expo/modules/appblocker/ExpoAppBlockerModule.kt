@@ -131,6 +131,43 @@ class ExpoAppBlockerModule : Module() {
       TemporaryUnlockController.remainingSeconds(context)
     }
 
+    // Last-resort recovery for an unrecoverable native state (observed:
+    // expo-sqlite's Android connection degrading after enough reuse in a
+    // long-lived process — a fresh `openDatabaseAsync` + first pragma NPEs
+    // even after a full DB rebuild). Apps that keep this module's
+    // AppBlockerService running as a foreground service can end up with an
+    // unusually long-lived process (the OS won't kill it just because the
+    // Activity was "closed"), which surfaces exactly this kind of
+    // native-module degradation far more than a normal app would. Only a
+    // genuine process kill clears it: queue the relaunch intent (optionally
+    // straight back into `deepLink`, e.g. the blocker intercept URL the
+    // caller was trying to reach) — `startActivity` only needs to queue the
+    // intent with ActivityManagerService, which survives our process dying
+    // right after — then kill this process outright. No AlarmManager/
+    // PendingIntent needed (and SCHEDULE_EXACT_ALARM would require a
+    // permission apps otherwise don't need just for this).
+    Function("restartApp") { deepLink: String? ->
+      val intent = if (!deepLink.isNullOrEmpty()) {
+        Intent(Intent.ACTION_VIEW, Uri.parse(deepLink))
+      } else {
+        context.packageManager.getLaunchIntentForPackage(context.packageName)
+      }
+      if (intent == null) {
+        Log.e(TAG, "restartApp: no launch intent resolvable, cannot self-heal")
+        return@Function
+      }
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+
+      context.startActivity(intent)
+
+      Log.w(
+        TAG,
+        "restartApp: relaunch queued, killing process ${Process.myPid()} to recover " +
+          "from an unrecoverable native state"
+      )
+      Process.killProcess(Process.myPid())
+    }
+
     AsyncFunction("getInstalledApps") {
       val pm = context.packageManager
       val intent = Intent(Intent.ACTION_MAIN).apply {
