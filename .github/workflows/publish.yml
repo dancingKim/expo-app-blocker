@@ -8,6 +8,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     if: "!startsWith(github.event.head_commit.message, 'v')"
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v6
@@ -43,12 +45,17 @@ jobs:
           npm version $NPM_VERSION --no-git-tag-version --allow-same-version
           # Then bump
           npm version ${{ steps.version.outputs.bump }} --no-git-tag-version
-          echo "New version: $(node -p 'require("./package.json").version')"
+          NEW_VERSION=$(node -p 'require("./package.json").version')
+          echo "New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        id: bump
 
       - name: Publish to npm
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Output version
-        run: echo "Published $(node -p 'require("./package.json").version')"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "v${{ steps.bump.outputs.new_version }}" --target "$GITHUB_SHA" --generate-notes
