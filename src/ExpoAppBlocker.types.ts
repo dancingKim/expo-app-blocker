@@ -70,7 +70,11 @@ export interface ScheduleWindow {
   startMinute: number;
   /** Minutes since local midnight when the window closes (0..1439). */
   endMinute: number;
-  /** ISO weekdays the window applies to: 1 = Monday … 7 = Sunday. */
+  /**
+   * ISO weekdays the window applies to: 1 = Monday … 7 = Sunday. An empty array means the
+   * window is never active on any day (weekdays must be filled explicitly) — identical on
+   * iOS and Android.
+   */
   weekdays: number[];
 }
 

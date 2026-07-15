@@ -39,6 +39,10 @@ public class ExpoAppBlockerModule: Module {
   // `unlockActivityName`.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
+  // DeviceActivity requires a monitored interval to be at least ~15 minutes. A
+  // cross-midnight split fragment shorter than this is skipped (the evaluator still
+  // corrects the shield at the next boundary that fires).
+  private let minScheduleIntervalMinutes = 15
   // Sub-minute usage steps. We register one DeviceActivityEvent per `usageStepSeconds`
   // of the budget (threshold = k×step seconds of measured usage). Each step's
   // eventDidReachThreshold lets the monitor write consumed SECONDS back to the App
@@ -683,26 +687,45 @@ public class ExpoAppBlockerModule: Module {
     // re-configuring with a different window count leaves no orphans.
     stopScheduleActivities()
 
+    // DeviceActivity intervals are only wake-up triggers; `reevaluateScheduleShield` /
+    // `isAnyScheduleWindowActive` (the evaluator) is the SSOT for shield state. A
+    // cross-midnight window (startMinute > endMinute) is split into two non-wrapping
+    // activities so we never rely on a wrapping interval firing:
+    //   evening [startMinute, 23:59]  +  morning [00:00, endMinute]
+    // Both names keep the schedule prefix so `stopScheduleActivities` still filters them.
     for (index, window) in windows.enumerated() {
-      let schedule = DeviceActivitySchedule(
-        intervalStart: scheduleTimeComponents(minuteOfDay: window.startMinute),
-        intervalEnd: scheduleTimeComponents(minuteOfDay: window.endMinute),
-        repeats: true
-      )
-      do {
-        // NOTE: for a cross-midnight window (startMinute > endMinute) this passes
-        // intervalStart > intervalEnd straight to DeviceActivitySchedule. Whether the
-        // system fires intervalDidStart/intervalDidEnd correctly for a wrapping interval
-        // is unverified — DEVICE-VERIFY. The monitor's boundary re-evaluation plus the
-        // immediate apply below bound any gap; each window is registered independently so
-        // one rejected schedule can't break the others.
-        try activityCenter.startMonitoring(
-          DeviceActivityName("\(scheduleActivityPrefix)\(index)"),
-          during: schedule,
-          events: [:]
+      if window.startMinute <= window.endMinute {
+        registerScheduleActivity(
+          name: "\(scheduleActivityPrefix)\(index)",
+          startMinute: window.startMinute,
+          endMinute: window.endMinute
         )
-      } catch {
-        print("[AppBlocker] schedule window \(index) startMonitoring failed: \(error.localizedDescription)")
+      } else {
+        let eveningEnd = 23 * 60 + 59
+        if eveningEnd - window.startMinute >= minScheduleIntervalMinutes {
+          registerScheduleActivity(
+            name: "\(scheduleActivityPrefix)\(index).evening",
+            startMinute: window.startMinute,
+            endMinute: eveningEnd
+          )
+        } else {
+          // Sub-15-minute evening fragment (start after 23:44): skip the wake-up; the
+          // evaluator corrects the shield at the next boundary that does fire.
+          print("[AppBlocker] schedule window \(index) evening fragment < \(minScheduleIntervalMinutes)m — skipping activity")
+        }
+        if window.endMinute > 0 {
+          if window.endMinute >= minScheduleIntervalMinutes {
+            registerScheduleActivity(
+              name: "\(scheduleActivityPrefix)\(index).morning",
+              startMinute: 0,
+              endMinute: window.endMinute
+            )
+          } else {
+            // Sub-15-minute morning fragment (endMinute < 15): skip the wake-up; the
+            // evaluator corrects the shield at the next boundary that does fire.
+            print("[AppBlocker] schedule window \(index) morning fragment < \(minScheduleIntervalMinutes)m — skipping activity")
+          }
+        }
       }
     }
 
@@ -712,6 +735,22 @@ public class ExpoAppBlockerModule: Module {
       applyScheduleShield(items)
     } else {
       clearScheduleShield()
+    }
+  }
+
+  /// Register one non-wrapping repeating DeviceActivity (no events — boundaries only).
+  /// Each window may register one or two of these; failures are logged and isolated so a
+  /// rejected schedule can't break the others.
+  private func registerScheduleActivity(name: String, startMinute: Int, endMinute: Int) {
+    let schedule = DeviceActivitySchedule(
+      intervalStart: scheduleTimeComponents(minuteOfDay: startMinute),
+      intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
+      repeats: true
+    )
+    do {
+      try activityCenter.startMonitoring(DeviceActivityName(name), during: schedule, events: [:])
+    } catch {
+      print("[AppBlocker] schedule activity \(name) startMonitoring failed: \(error.localizedDescription)")
     }
   }
 
