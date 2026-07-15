@@ -486,6 +486,48 @@ const config = getBlockConfiguration();
 clearAllBlocks();
 ```
 
+### Schedule Windows (time-based, both platforms)
+
+Block a set of apps during recurring local-time windows (e.g. bedtime, work hours),
+**independently of and unioned with** the immediate blocks above. With no schedule
+configured, immediate blocking behaves exactly as before.
+
+```typescript
+import {
+  setScheduleConfiguration,
+  getScheduleConfiguration,
+  clearScheduleConfiguration,
+} from 'expo-app-blocker';
+
+await setScheduleConfiguration({
+  windows: [
+    // Weeknights 23:00 → 07:00 (crosses midnight: endMinute < startMinute)
+    { startMinute: 23 * 60, endMinute: 7 * 60, weekdays: [1, 2, 3, 4, 5] },
+    // Weekday work focus 09:00 → 12:00
+    { startMinute: 9 * 60, endMinute: 12 * 60, weekdays: [1, 2, 3, 4, 5] },
+  ],
+  // iOS: FamilyActivity items from the picker. Android: package-name strings.
+  blockedItems: items,
+});
+
+const schedule = getScheduleConfiguration(); // current config, or null
+clearScheduleConfiguration();                 // stop schedule blocking (immediate blocks untouched)
+```
+
+- `startMinute` / `endMinute` are minutes since local midnight (`0..1439`).
+- `endMinute < startMinute` means the window crosses midnight; for the after-midnight
+  portion the weekday gate follows the window's **start** day.
+- `weekdays` are ISO weekdays: `1` = Monday … `7` = Sunday.
+- Any active window blocks the items; outside every window nothing is blocked.
+
+**How each platform enforces it:**
+
+| | Android | iOS |
+|---|---|---|
+| Mechanism | Foreground-service poll re-evaluates the wall clock each tick; a `SCHEDULE_EXACT_ALARM` wakes the service at each window boundary | A dedicated `ManagedSettingsStore` shielded/cleared by a `DeviceActivity` per window; the monitor extension gates on weekday and re-evaluates the union of windows at each boundary |
+| Independence | `isBlocked` = immediate packages **OR** (schedule packages AND a window is active) | Schedule shields live in a separate named store, unioned with the default store; clearing one leaves the other |
+| Caveats | Android 12+ waking a foreground service from an exact-alarm broadcast relies on the alarm's temporary allowlist; DST boundary shifts are not compensated | Cross-midnight `DeviceActivitySchedule` (intervalStart > intervalEnd) and sub-15-minute windows are not guaranteed by the API — needs on-device verification |
+
 ### Temporary Unlock (usage-based)
 
 `temporaryUnlock(minutes)` grants a budget of earned minutes that is consumed

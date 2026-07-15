@@ -55,6 +55,48 @@ export interface IOSBlockConfiguration {
   };
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Schedule-window blocking (time-based, independent of immediate blocking)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A recurring local-time window during which the schedule's `blockedItems` are shielded.
+ * Times are minutes since local midnight (0..1439). `endMinute < startMinute` means the
+ * window crosses midnight (e.g. 23:00–07:00 → `startMinute: 1380, endMinute: 420`); for
+ * the after-midnight portion the weekday gate follows the window's START day.
+ */
+export interface ScheduleWindow {
+  /** Minutes since local midnight when the window opens (0..1439). */
+  startMinute: number;
+  /** Minutes since local midnight when the window closes (0..1439). */
+  endMinute: number;
+  /** ISO weekdays the window applies to: 1 = Monday … 7 = Sunday. */
+  weekdays: number[];
+}
+
+/**
+ * iOS schedule configuration. `blockedItems` uses the same FamilyActivity tokens as
+ * {@link IOSBlockConfiguration} (from the picker).
+ */
+export interface IOSScheduleConfiguration {
+  windows: ScheduleWindow[];
+  blockedItems: IOSBlockedItem[];
+}
+
+/**
+ * Android schedule configuration. `blockedItems` is a list of package names, matching
+ * `setBlockedApps`.
+ */
+export interface AndroidScheduleConfiguration {
+  windows: ScheduleWindow[];
+  blockedItems: string[];
+}
+
+/** Platform-tagged union passed to {@link setScheduleConfiguration}. */
+export type ScheduleConfiguration =
+  | IOSScheduleConfiguration
+  | AndroidScheduleConfiguration;
+
 export interface TemporaryUnlockResult {
   unlocked: boolean;
   expiresAt: number;

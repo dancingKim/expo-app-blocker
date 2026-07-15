@@ -14,6 +14,7 @@ import type {
   AndroidConfig,
   IOSBlockedItem,
   IOSBlockConfiguration,
+  ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
   FamilyActivityPickerSelectionEvent,
@@ -28,6 +29,10 @@ export type {
   AndroidBlockableApp,
   IOSBlockedItem,
   IOSBlockConfiguration,
+  ScheduleWindow,
+  IOSScheduleConfiguration,
+  AndroidScheduleConfiguration,
+  ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
   ShieldConfig,
@@ -162,6 +167,40 @@ export function clearAllBlocks(): void {
 export function isAppBlocked(bundleIdentifier: string): boolean {
   if (Platform.OS !== "ios") return false;
   return NativeModule.isAppBlocked(bundleIdentifier);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Schedule-window blocking (both platforms — same JS API)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Block `config.blockedItems` whenever any of `config.windows` is currently active.
+ *
+ * Fully independent of, and unioned with, the immediate blocking set via
+ * `setBlockConfiguration` / `setBlockedApps`: with no schedule configured the immediate
+ * behavior is unchanged, and clearing one never clears the other. Outside every window
+ * the schedule blocks nothing.
+ *
+ * iOS: `blockedItems` are FamilyActivity items from the picker; enforced by a dedicated
+ * `ManagedSettingsStore` driven by `DeviceActivity` window boundaries.
+ * Android: `blockedItems` are package names; enforced by the foreground-service poll,
+ * with exact alarms waking the service at window boundaries.
+ */
+export async function setScheduleConfiguration(config: ScheduleConfiguration): Promise<void> {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return;
+  return NativeModule.setScheduleConfiguration(config);
+}
+
+/** Remove the schedule configuration and stop schedule-based blocking. Immediate blocks are untouched. */
+export function clearScheduleConfiguration(): void {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return;
+  NativeModule.clearScheduleConfiguration();
+}
+
+/** The current schedule configuration, or `null` if none is set. */
+export function getScheduleConfiguration(): ScheduleConfiguration | null {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return null;
+  return NativeModule.getScheduleConfiguration() ?? null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
