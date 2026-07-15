@@ -50,8 +50,11 @@ class AppBlockerService : Service() {
       return
     }
 
-    if (unlockController.hasTimeLeft) {
-      // Inside a blocked app with earned time — spend it and keep the app usable.
+    // Earned time applies to immediate-only blocks. Schedule blocking is a pure time
+    // commitment — earned time never bypasses it (matches iOS) — so a schedule-blocked
+    // app is enforced immediately without consuming the budget.
+    if (!isScheduleBlocked(foreground) && unlockController.hasTimeLeft) {
+      // Inside an immediate-only blocked app with earned time — spend it, keep it usable.
       val now = System.currentTimeMillis()
       if (consumingSinceMs > 0L) unlockController.consume(now - consumingSinceMs)
       consumingSinceMs = now
@@ -63,7 +66,8 @@ class AppBlockerService : Service() {
         enforceBlock(foreground, BlockReason.EXPIRED)
       }
     } else {
-      // Inside a blocked app with no earned time — block on entry.
+      // Schedule-blocked (earned time must not be burned on an app the shield makes
+      // unusable), or an immediate block with no earned time — block on entry.
       consumingSinceMs = 0L
       if (!blocking || foreground != lastForegroundPackage) {
         Log.d(TAG, "Blocked app in foreground: $foreground")
@@ -97,9 +101,15 @@ class AppBlockerService : Service() {
   // original immediate-block check — zero behavior change.
   private fun isBlocked(packageName: String): Boolean {
     if (packageName in AppBlockerPrefs.getBlockedPackages(this)) return true
-    return packageName in ScheduleStore.getSchedulePackages(this) &&
-      ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())
+    return isScheduleBlocked(packageName)
   }
+
+  // True when the app is blocked *by an active schedule window* right now. Schedule
+  // blocking is a pure time commitment — earned time never bypasses it (matches iOS,
+  // where the schedule ManagedSettingsStore is independent of temporary unlock).
+  private fun isScheduleBlocked(packageName: String): Boolean =
+    packageName in ScheduleStore.getSchedulePackages(this) &&
+      ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
     overlayManager.show(packageName, reason)
