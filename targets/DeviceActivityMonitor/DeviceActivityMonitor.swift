@@ -22,8 +22,15 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // Usage-step event-name prefix; the suffix is the threshold in seconds.
   private let usageStepEventPrefix = "appBlocker.usageStep."
   private let blockConfigStorageKey = "appBlocker.blockConfiguration.v1"
+  // Schedule-window blocking. Config is mirrored here by the module; each window is a
+  // DeviceActivity named "<prefix><index>". Shields live in a dedicated store, unioned
+  // with `store` and independent of the temporary-unlock logic.
+  private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
+  private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
 
   private let store = ManagedSettingsStore()
+  // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
+  private let scheduleStore = ManagedSettingsStore(named: "appBlocker.schedule")
   private var sharedDefaults: UserDefaults?
 
   override init() {
@@ -83,6 +90,14 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   override func intervalDidEnd(for activity: DeviceActivityName) {
     super.intervalDidEnd(for: activity)
 
+    // A schedule window boundary: re-evaluate the union of all windows (this handles
+    // overlapping windows and weekday gating) and shield/clear the schedule store
+    // accordingly. Never runs the unlock daily-reset below.
+    if activity.rawValue.hasPrefix(scheduleActivityPrefix) {
+      reevaluateScheduleShield()
+      return
+    }
+
     let comps = Calendar.current.dateComponents([.hour, .minute], from: Date())
     guard comps.hour == 23, (comps.minute ?? 0) >= 58 else {
       return
@@ -93,6 +108,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
   override func intervalDidStart(for activity: DeviceActivityName) {
     super.intervalDidStart(for: activity)
+
+    // A schedule window opened: re-evaluate and apply the schedule shield if any window
+    // is currently active (the opened one may be gated out by weekday).
+    if activity.rawValue.hasPrefix(scheduleActivityPrefix) {
+      reevaluateScheduleShield()
+    }
   }
 
   /// Extract the threshold seconds from an event name like `appBlocker.usageStep.90`;
@@ -125,6 +146,107 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
 
     applyBlocks(blockConfig)
+  }
+
+  // MARK: - Schedule-Window Blocking
+
+  /// Read the schedule config from the App Group and set the dedicated schedule store to
+  /// shield the items iff any window is currently active. Independent of the default
+  /// `store` (immediate blocks) and the temporary-unlock state.
+  private func reevaluateScheduleShield() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else {
+      clearScheduleShield()
+      return
+    }
+    let windows = parseScheduleWindows(dict)
+    if isAnyScheduleWindowActive(windows: windows, at: Date()) {
+      applyScheduleShield(parseScheduleItems(dict))
+    } else {
+      clearScheduleShield()
+    }
+  }
+
+  private func parseScheduleWindows(_ dict: [String: Any]) -> [MonitorScheduleWindow] {
+    guard let raw = dict["windows"] as? [[String: Any]] else { return [] }
+    return raw.compactMap { window in
+      guard let start = window["startMinute"] as? Int,
+            let end = window["endMinute"] as? Int else {
+        return nil
+      }
+      let weekdays = (window["weekdays"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
+      return MonitorScheduleWindow(startMinute: start, endMinute: end, weekdays: Set(weekdays))
+    }
+  }
+
+  /// True if any window covers `date`. A window with `endMinute < startMinute` crosses
+  /// midnight; its after-midnight portion is gated on the window's START day (yesterday).
+  private func isAnyScheduleWindowActive(windows: [MonitorScheduleWindow], at date: Date) -> Bool {
+    let comps = Calendar.current.dateComponents([.hour, .minute, .weekday], from: date)
+    let nowMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    let todayIso = isoWeekday(fromGregorian: comps.weekday ?? 1)
+    let yesterdayIso = todayIso == 1 ? 7 : todayIso - 1
+
+    for window in windows {
+      if window.startMinute <= window.endMinute {
+        if nowMinute >= window.startMinute, nowMinute < window.endMinute,
+           window.weekdays.contains(todayIso) {
+          return true
+        }
+      } else {
+        if nowMinute >= window.startMinute, window.weekdays.contains(todayIso) {
+          return true
+        }
+        if nowMinute < window.endMinute, window.weekdays.contains(yesterdayIso) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  /// Convert a Gregorian weekday (1 = Sunday … 7 = Saturday) to ISO (1 = Monday … 7 = Sunday).
+  private func isoWeekday(fromGregorian gregorian: Int) -> Int {
+    return ((gregorian + 5) % 7) + 1
+  }
+
+  private func parseScheduleItems(_ dict: [String: Any]) -> [MonitorBlockedItemInfo] {
+    guard let rawItems = dict["blockedItems"] as? [[String: Any]] else { return [] }
+    return rawItems.compactMap { selection -> MonitorBlockedItemInfo? in
+      guard let tokenString = selection["token"] as? String else { return nil }
+      let itemTypeRaw = (selection["type"] as? String ?? "app").lowercased()
+      let itemType: MonitorBlockedItemType
+      switch itemTypeRaw {
+      case "category":
+        itemType = .category
+      case "webdomain":
+        itemType = .webDomain
+      default:
+        itemType = .app
+      }
+      return MonitorBlockedItemInfo(
+        type: itemType,
+        tokenId: tokenString,
+        appToken: itemType == .app ? decodeApplicationToken(from: tokenString) : nil,
+        categoryToken: itemType == .category ? decodeCategoryToken(from: tokenString) : nil,
+        webDomainToken: itemType == .webDomain ? decodeWebDomainToken(from: tokenString) : nil
+      )
+    }
+  }
+
+  private func applyScheduleShield(_ items: [MonitorBlockedItemInfo]) {
+    let apps = items.compactMap { $0.appToken }
+    let categories = items.compactMap { $0.categoryToken }
+    let webDomains = items.compactMap { $0.webDomainToken }
+    scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
+    scheduleStore.shield.applicationCategories = categories.isEmpty ? nil : .specific(Set(categories))
+    scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
+  }
+
+  private func clearScheduleShield() {
+    scheduleStore.shield.applications = nil
+    scheduleStore.shield.applicationCategories = nil
+    scheduleStore.shield.webDomains = nil
   }
 
   private func parseBlockConfig(_ dict: [String: Any]) -> MonitorBlockConfig? {
@@ -262,4 +384,12 @@ struct MonitorBlockedItemInfo {
 struct MonitorBlockConfig {
   let items: [MonitorBlockedItemInfo]
   let isActive: Bool
+}
+
+/// One schedule window: local minute-of-day bounds (0..1439) plus the ISO weekdays
+/// (1 = Monday … 7 = Sunday) it applies to. `endMinute < startMinute` crosses midnight.
+struct MonitorScheduleWindow {
+  let startMinute: Int
+  let endMinute: Int
+  let weekdays: Set<Int>
 }

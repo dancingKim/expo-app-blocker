@@ -10,6 +10,11 @@ public class ExpoAppBlockerModule: Module {
 
   private let authCenter = AuthorizationCenter.shared
   private let store = ManagedSettingsStore()
+  // Dedicated store for schedule-window blocking. Kept separate from `store` so the two
+  // shield sources union at the system level and clearing one never clears the other
+  // (`ManagedSettingsStore.Name` is ExpressibleByStringLiteral). The monitor extension
+  // uses the identical name so both processes write the same store.
+  private let scheduleStore = ManagedSettingsStore(named: "appBlocker.schedule")
   private let activityCenter = DeviceActivityCenter()
   private var sharedDefaults: UserDefaults?
   private let userDefaults = UserDefaults.standard
@@ -28,6 +33,12 @@ public class ExpoAppBlockerModule: Module {
   // for the monitor's premature-fire guard (usage can't exceed elapsed wall-clock).
   private let unlockGrantedAtKey = "appBlocker.unlockGrantedAt.v1"
   private let unlockActivityName = "appBlocker.temporaryUnlock"
+  // Schedule-window blocking. The config (windows + blocked items) is persisted here and
+  // mirrored into the App Group so the monitor extension can read it. Each window is
+  // registered as its own DeviceActivity named "<prefix><index>", never colliding with
+  // `unlockActivityName`.
+  private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
+  private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
   // Sub-minute usage steps. We register one DeviceActivityEvent per `usageStepSeconds`
   // of the budget (threshold = k×step seconds of measured usage). Each step's
   // eventDidReachThreshold lets the monitor write consumed SECONDS back to the App
@@ -305,6 +316,28 @@ public class ExpoAppBlockerModule: Module {
         }
       }
     }
+
+    // MARK: Schedule-window blocking
+
+    AsyncFunction("setScheduleConfiguration") { (config: [String: Any], promise: Promise) in
+      self.stateQueue.async {
+        self.applyScheduleConfiguration(config)
+        self.persistScheduleConfiguration(config)
+        DispatchQueue.main.async {
+          promise.resolve(nil)
+        }
+      }
+    }
+
+    Function("clearScheduleConfiguration") {
+      self.stateQueue.async {
+        self.clearScheduleConfigurationInternal()
+      }
+    }
+
+    Function("getScheduleConfiguration") { () -> [String: Any]? in
+      return self.userDefaults.dictionary(forKey: self.scheduleConfigStorageKey)
+    }
   }
 
   // MARK: - Authorization
@@ -432,7 +465,27 @@ public class ExpoAppBlockerModule: Module {
       throw NSError(domain: "AppBlocker", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing blockedItems"])
     }
 
-    let items: [BlockedItemInfo] = rawItems.compactMap { selection -> BlockedItemInfo? in
+    let items = makeBlockedItems(from: rawItems)
+
+    let isActive = dict["isActive"] as? Bool ?? true
+
+    var schedule: ScheduleInfo?
+    if let scheduleDict = dict["schedule"] as? [String: Any] {
+      schedule = ScheduleInfo(
+        intervalStart: scheduleDict["intervalStart"] as? Int ?? 0,
+        intervalEnd: scheduleDict["intervalEnd"] as? Int ?? 24,
+        repeats: scheduleDict["repeats"] as? Bool ?? true,
+        warningTime: scheduleDict["warningTime"] as? Int ?? 5
+      )
+    }
+
+    return BlockConfig(items: items, isActive: isActive, schedule: schedule)
+  }
+
+  /// Decode an array of raw item dicts (the `blockedItems` shape shared by immediate and
+  /// schedule configs) into typed `BlockedItemInfo`s.
+  private func makeBlockedItems(from rawItems: [[String: Any]]) -> [BlockedItemInfo] {
+    return rawItems.compactMap { selection -> BlockedItemInfo? in
       guard let tokenString = selection["token"] as? String else {
         return nil
       }
@@ -461,20 +514,6 @@ public class ExpoAppBlockerModule: Module {
         iconBase64: selection["iconBase64"] as? String
       )
     }
-
-    let isActive = dict["isActive"] as? Bool ?? true
-
-    var schedule: ScheduleInfo?
-    if let scheduleDict = dict["schedule"] as? [String: Any] {
-      schedule = ScheduleInfo(
-        intervalStart: scheduleDict["intervalStart"] as? Int ?? 0,
-        intervalEnd: scheduleDict["intervalEnd"] as? Int ?? 24,
-        repeats: scheduleDict["repeats"] as? Bool ?? true,
-        warningTime: scheduleDict["warningTime"] as? Int ?? 5
-      )
-    }
-
-    return BlockConfig(items: items, isActive: isActive, schedule: schedule)
   }
 
   private func applyBlocks(_ config: BlockConfig) throws {
@@ -629,6 +668,134 @@ public class ExpoAppBlockerModule: Module {
   private func cancelRelockActivityLocked() {
     let activityName = DeviceActivityName(unlockActivityName)
     activityCenter.stopMonitoring([activityName])
+  }
+
+  // MARK: - Schedule-Window Blocking
+
+  /// Register one repeating DeviceActivity per window and immediately shield if a window
+  /// is already active. Only the schedule activities and the dedicated `scheduleStore` are
+  /// touched — the immediate-block `store` and the temporary-unlock activity are untouched.
+  private func applyScheduleConfiguration(_ config: [String: Any]) {
+    let windows = parseScheduleWindows(config)
+    let items = makeBlockedItems(from: (config["blockedItems"] as? [[String: Any]]) ?? [])
+
+    // Stop only previously-registered schedule activities (never the unlock activity), so
+    // re-configuring with a different window count leaves no orphans.
+    stopScheduleActivities()
+
+    for (index, window) in windows.enumerated() {
+      let schedule = DeviceActivitySchedule(
+        intervalStart: scheduleTimeComponents(minuteOfDay: window.startMinute),
+        intervalEnd: scheduleTimeComponents(minuteOfDay: window.endMinute),
+        repeats: true
+      )
+      do {
+        // NOTE: for a cross-midnight window (startMinute > endMinute) this passes
+        // intervalStart > intervalEnd straight to DeviceActivitySchedule. Whether the
+        // system fires intervalDidStart/intervalDidEnd correctly for a wrapping interval
+        // is unverified — DEVICE-VERIFY. The monitor's boundary re-evaluation plus the
+        // immediate apply below bound any gap; each window is registered independently so
+        // one rejected schedule can't break the others.
+        try activityCenter.startMonitoring(
+          DeviceActivityName("\(scheduleActivityPrefix)\(index)"),
+          during: schedule,
+          events: [:]
+        )
+      } catch {
+        print("[AppBlocker] schedule window \(index) startMonitoring failed: \(error.localizedDescription)")
+      }
+    }
+
+    // DeviceActivity only fires at interval boundaries, so if we're already inside a
+    // window at configuration time, apply the shield now.
+    if isAnyScheduleWindowActive(windows: windows, at: Date()) {
+      applyScheduleShield(items)
+    } else {
+      clearScheduleShield()
+    }
+  }
+
+  private func clearScheduleConfigurationInternal() {
+    stopScheduleActivities()
+    clearScheduleShield()
+    userDefaults.removeObject(forKey: scheduleConfigStorageKey)
+    sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
+  }
+
+  private func stopScheduleActivities() {
+    let scheduleActivities = activityCenter.activities.filter {
+      $0.rawValue.hasPrefix(scheduleActivityPrefix)
+    }
+    if !scheduleActivities.isEmpty {
+      activityCenter.stopMonitoring(scheduleActivities)
+    }
+  }
+
+  private func persistScheduleConfiguration(_ config: [String: Any]) {
+    userDefaults.set(config, forKey: scheduleConfigStorageKey)
+    sharedDefaults?.set(config, forKey: scheduleConfigStorageKey)
+  }
+
+  private func applyScheduleShield(_ items: [BlockedItemInfo]) {
+    let apps = items.compactMap { $0.appToken }
+    let categories = items.compactMap { $0.categoryToken }
+    let webDomains = items.compactMap { $0.webDomainToken }
+    scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
+    scheduleStore.shield.applicationCategories = categories.isEmpty ? nil : .specific(Set(categories))
+    scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
+  }
+
+  private func clearScheduleShield() {
+    scheduleStore.shield.applications = nil
+    scheduleStore.shield.applicationCategories = nil
+    scheduleStore.shield.webDomains = nil
+  }
+
+  private func parseScheduleWindows(_ config: [String: Any]) -> [ScheduleWindowInfo] {
+    guard let raw = config["windows"] as? [[String: Any]] else { return [] }
+    return raw.compactMap { window in
+      guard let start = window["startMinute"] as? Int,
+            let end = window["endMinute"] as? Int else {
+        return nil
+      }
+      let weekdays = (window["weekdays"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
+      return ScheduleWindowInfo(startMinute: start, endMinute: end, weekdays: Set(weekdays))
+    }
+  }
+
+  /// True if any window covers `date`. A window with `endMinute < startMinute` crosses
+  /// midnight; its after-midnight portion is gated on the window's START day (yesterday).
+  private func isAnyScheduleWindowActive(windows: [ScheduleWindowInfo], at date: Date) -> Bool {
+    let comps = Calendar.current.dateComponents([.hour, .minute, .weekday], from: date)
+    let nowMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    let todayIso = isoWeekday(fromGregorian: comps.weekday ?? 1)
+    let yesterdayIso = todayIso == 1 ? 7 : todayIso - 1
+
+    for window in windows {
+      if window.startMinute <= window.endMinute {
+        if nowMinute >= window.startMinute, nowMinute < window.endMinute,
+           window.weekdays.contains(todayIso) {
+          return true
+        }
+      } else {
+        if nowMinute >= window.startMinute, window.weekdays.contains(todayIso) {
+          return true
+        }
+        if nowMinute < window.endMinute, window.weekdays.contains(yesterdayIso) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  /// Convert a Gregorian weekday (1 = Sunday … 7 = Saturday) to ISO (1 = Monday … 7 = Sunday).
+  private func isoWeekday(fromGregorian gregorian: Int) -> Int {
+    return ((gregorian + 5) % 7) + 1
+  }
+
+  private func scheduleTimeComponents(minuteOfDay: Int) -> DateComponents {
+    return DateComponents(hour: minuteOfDay / 60, minute: minuteOfDay % 60)
   }
 
   private func isTemporarilyUnlockedInternal() -> Bool {
@@ -967,6 +1134,14 @@ struct ScheduleInfo {
   let intervalEnd: Int
   let repeats: Bool
   let warningTime: Int
+}
+
+/// One schedule window: local minute-of-day bounds (0..1439) plus the ISO weekdays
+/// (1 = Monday … 7 = Sunday) it applies to. `endMinute < startMinute` crosses midnight.
+struct ScheduleWindowInfo {
+  let startMinute: Int
+  let endMinute: Int
+  let weekdays: Set<Int>
 }
 
 // MARK: - FamilyActivityPicker SwiftUI View
