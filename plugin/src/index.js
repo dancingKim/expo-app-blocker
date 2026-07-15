@@ -73,6 +73,8 @@ function withAppBlockerAndroid(config, pluginConfig) {
       "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
       "android.permission.RECEIVE_BOOT_COMPLETED",
       "android.permission.POST_NOTIFICATIONS",
+      // Exact alarms wake AppBlockerService at schedule-window boundaries.
+      "android.permission.SCHEDULE_EXACT_ALARM",
     ];
 
     // PACKAGE_USAGE_STATS needs tools:ignore
@@ -110,6 +112,14 @@ function withAppBlockerAndroid(config, pluginConfig) {
       mainApplication.receiver.push({
         $: { "android:name": "expo.modules.appblocker.BootReceiver", "android:enabled": "true", "android:exported": "true" },
         "intent-filter": [{ action: [{ $: { "android:name": "android.intent.action.BOOT_COMPLETED" } }] }],
+      });
+    }
+
+    // Add AlarmReceiver (schedule-window boundary wakeups). Triggered only by our own
+    // exact-alarm PendingIntent, so it is not exported and needs no intent-filter.
+    if (!mainApplication.receiver.some((r) => r.$?.["android:name"] === "expo.modules.appblocker.AlarmReceiver")) {
+      mainApplication.receiver.push({
+        $: { "android:name": "expo.modules.appblocker.AlarmReceiver", "android:enabled": "true", "android:exported": "false" },
       });
     }
 

@@ -91,8 +91,15 @@ class AppBlockerService : Service() {
     handler.post(pollRunnable)
   }
 
-  private fun isBlocked(packageName: String): Boolean =
-    packageName in AppBlockerPrefs.getBlockedPackages(this)
+  // Union of immediate blocking and schedule-window blocking. Evaluated every poll tick,
+  // so an active window takes effect at its boundary (the wall clock is re-read here).
+  // When no schedule is configured `getSchedulePackages` is empty, so this reduces to the
+  // original immediate-block check — zero behavior change.
+  private fun isBlocked(packageName: String): Boolean {
+    if (packageName in AppBlockerPrefs.getBlockedPackages(this)) return true
+    return packageName in ScheduleStore.getSchedulePackages(this) &&
+      ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())
+  }
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
     overlayManager.show(packageName, reason)

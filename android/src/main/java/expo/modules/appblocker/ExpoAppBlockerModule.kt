@@ -103,6 +103,25 @@ class ExpoAppBlockerModule : Module() {
       AppBlockerPrefs.getBlockedPackages(context).toList()
     }
 
+    Function("setScheduleConfiguration") { config: Map<String, Any?> ->
+      ScheduleStore.setConfiguration(context, config)
+      // Arm the boundary alarm and make sure the service is alive so an already-open
+      // window is enforced on the next poll tick.
+      AlarmReceiver.scheduleNext(context)
+      AppBlockerService.start(context)
+      Log.d(TAG, "setScheduleConfiguration: $config")
+    }
+
+    Function("clearScheduleConfiguration") {
+      ScheduleStore.clear(context)
+      AlarmReceiver.cancel(context)
+      Log.d(TAG, "clearScheduleConfiguration")
+    }
+
+    Function("getScheduleConfiguration") {
+      ScheduleStore.getConfigurationMap(context)
+    }
+
     Function("drainPendingIntercepts") {
       AppBlockerPrefs.drainIntercepts(context)
     }

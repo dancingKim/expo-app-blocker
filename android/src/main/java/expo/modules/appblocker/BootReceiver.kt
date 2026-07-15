@@ -10,6 +10,8 @@ class BootReceiver : BroadcastReceiver() {
     if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
       Log.d(TAG, "BootReceiver: BOOT_COMPLETED received, starting service")
       AppBlockerService.start(context.applicationContext)
+      // Alarms do not survive a reboot — re-arm the next schedule-window boundary.
+      AlarmReceiver.scheduleNext(context.applicationContext)
     }
   }
 
