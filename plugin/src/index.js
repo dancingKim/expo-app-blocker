@@ -408,15 +408,24 @@ function withAppBlockerIOS(config, pluginConfig) {
   // their app.json plugins array. Resolved from this package's own
   // node_modules (declared dep), which also makes it work in pnpm/yarn
   // workspaces where transitive plugins aren't hoisted into the app root.
-  try {
-    const withTargetsDir = resolve("@bacons/apple-targets/app.plugin");
-    config = withTargetsDir(config, {});
-  } catch (err) {
-    throw new Error(
-      `[expo-app-blocker] Failed to load '@bacons/apple-targets'. In pnpm or ` +
-      `yarn-workspace monorepos, add it as a direct dependency of your app: ` +
-      `\`pnpm add @bacons/apple-targets\`. Original error: ${err.message}`
-    );
+  //
+  // Apps that already register '@bacons/apple-targets' themselves (e.g. for
+  // their own widget targets) must set `ios.registerAppleTargets: false` and
+  // order this plugin BEFORE their apple-targets entry: config-plugins allows
+  // only one xcode provider mod, so a second registration throws
+  // "provider has already been added". The template copy above still runs, so
+  // the app's single apple-targets pass picks these targets up from `targets/`.
+  if (pluginConfig?.ios?.registerAppleTargets !== false) {
+    try {
+      const withTargetsDir = resolve("@bacons/apple-targets/app.plugin");
+      config = withTargetsDir(config, {});
+    } catch (err) {
+      throw new Error(
+        `[expo-app-blocker] Failed to load '@bacons/apple-targets'. In pnpm or ` +
+        `yarn-workspace monorepos, add it as a direct dependency of your app: ` +
+        `\`pnpm add @bacons/apple-targets\`. Original error: ${err.message}`
+      );
+    }
   }
 
   config = withDangerousMod(config, [
