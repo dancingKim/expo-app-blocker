@@ -9,9 +9,10 @@ import android.os.Build
 import android.util.Log
 
 /**
- * Wakes [AppBlockerService] at each schedule-window boundary so window transitions are
- * enforced even if the service was killed while idle. The service's 500 ms poll handles
- * enforcement while it is alive; this alarm only guarantees it is running at the boundary.
+ * Wakes [AppBlockerService] at each schedule-window boundary — and at the immediate
+ * block's auto-release time — so those transitions are enforced even if the service was
+ * killed while idle. The service's 500 ms poll handles enforcement while it is alive; this
+ * alarm only guarantees it is running at the next boundary/expiry, whichever is sooner.
  *
  * WARNING (Android 12+): starting a foreground service from this background broadcast is
  * only permitted because [AlarmManager.setExactAndAllowWhileIdle] grants the app a short
@@ -22,8 +23,9 @@ import android.util.Log
 class AlarmReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     if (intent.action != ACTION_BOUNDARY) return
-    Log.d(TAG, "AlarmReceiver: window boundary, waking service + re-arming")
-    // Wake the service; its poll re-reads the wall clock and applies/clears the block.
+    Log.d(TAG, "AlarmReceiver: boundary/expiry, waking service + re-arming")
+    // Wake the service; its poll re-reads the wall clock and applies/clears the block
+    // (schedule transition or immediate-block auto-release, whichever this wake was for).
     AppBlockerService.start(context.applicationContext)
     // Chain the next boundary (exact alarms are one-shot).
     scheduleNext(context.applicationContext)
@@ -51,8 +53,15 @@ class AlarmReceiver : BroadcastReceiver() {
     fun scheduleNext(context: Context) {
       val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
       val pi = pendingIntent(context)
+      val now = System.currentTimeMillis()
 
-      val next = ScheduleStore.nextBoundaryAfter(context, System.currentTimeMillis())
+      // Wake at whichever comes first: the next schedule-window boundary, or the immediate
+      // block's auto-release instant (when one is planted and still in the future). The
+      // service does the actual transition/release on the tick that follows the wake — this
+      // alarm only guarantees a tick fires at that instant even if the service was killed.
+      val scheduleBoundary = ScheduleStore.nextBoundaryAfter(context, now)
+      val blockExpiry = AppBlockerPrefs.getBlockExpiresAt(context).takeIf { it > now }
+      val next = listOfNotNull(scheduleBoundary, blockExpiry).minOrNull()
       if (next == null) {
         am.cancel(pi)
         return

@@ -39,6 +39,7 @@ class AppBlockerService : Service() {
   }
 
   private fun tick() {
+    maybeExpireImmediateBlock()
     getCurrentForegroundPackage()?.let { currentForeground = it }
     val foreground = currentForeground
 
@@ -84,6 +85,22 @@ class AppBlockerService : Service() {
     }
   }
 
+  // The immediate block carries an optional auto-release time planted the moment it was
+  // locked (0 = no expiry). expiry is the release guarantee — a JS relock/clear signal
+  // only brings release *forward*, and a killed process drops that signal, so the native
+  // expiry is what guarantees the block ever lifts. Once it has passed, drop the immediate
+  // set + expiry together so subsequent ticks return to the pristine (nothing-blocked)
+  // state. Runs every tick; the boundary alarm guarantees a tick fires at the expiry
+  // instant even if the service had been killed. No-op with no expiry or before it passes.
+  // Schedule blocking is independent and untouched here.
+  private fun maybeExpireImmediateBlock() {
+    val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
+    if (expiry != 0L && System.currentTimeMillis() >= expiry) {
+      Log.d(TAG, "Immediate block auto-release time reached ($expiry) — clearing")
+      AppBlockerPrefs.setBlockedPackages(this, emptyList<String>())
+    }
+  }
+
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
@@ -100,8 +117,18 @@ class AppBlockerService : Service() {
   // When no schedule is configured `getSchedulePackages` is empty, so this reduces to the
   // original immediate-block check — zero behavior change.
   private fun isBlocked(packageName: String): Boolean {
-    if (packageName in AppBlockerPrefs.getBlockedPackages(this)) return true
+    if (isImmediateBlocked(packageName)) return true
     return isScheduleBlocked(packageName)
+  }
+
+  // Immediate blocking gated on the auto-release expiry (0 = no expiry). Enforced only
+  // while `now < expiry`; once passed the block is no longer applied even before
+  // [maybeExpireImmediateBlock] clears the prefs, so release can't be delayed by a
+  // pending write. Schedule blocking is separate and never gated by this.
+  private fun isImmediateBlocked(packageName: String): Boolean {
+    if (packageName !in AppBlockerPrefs.getBlockedPackages(this)) return false
+    val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
+    return expiry == 0L || System.currentTimeMillis() < expiry
   }
 
   // True when the app is blocked *by an active schedule window* right now. Schedule

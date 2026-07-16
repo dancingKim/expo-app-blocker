@@ -99,6 +99,17 @@ class ExpoAppBlockerModule : Module() {
       Log.d(TAG, "setBlockedApps: $packageNames")
     }
 
+    // Plant (or clear) the immediate block's auto-release time. Epoch millis; <= 0 clears
+    // it. The service gates the immediate block on this and lazily clears it once passed,
+    // and re-arming the boundary alarm makes it wake the service at the expiry instant so
+    // release happens even if this app process was later killed. JS sends the millis as a
+    // Double (epoch ms overflows Int).
+    Function("setBlockExpiryAndroid") { expiresAtMillis: Double ->
+      AppBlockerPrefs.setBlockExpiresAt(context, expiresAtMillis.toLong())
+      AlarmReceiver.scheduleNext(context)
+      Log.d(TAG, "setBlockExpiryAndroid: $expiresAtMillis")
+    }
+
     Function("getBlockedApps") {
       AppBlockerPrefs.getBlockedPackages(context).toList()
     }

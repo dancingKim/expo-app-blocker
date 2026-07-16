@@ -377,7 +377,16 @@ const apps = await getInstalledApps();
 
 setBlockedApps(['com.instagram.android', 'com.google.android.youtube']);
 const blocked = getBlockedApps(); // ['com.instagram.android', ...]
+
+// Optional native auto-release (Android only). The block lifts on its own at
+// `expiresAtMillis` even if the app process is killed — the expiry is stored in native
+// prefs and a boundary alarm wakes the service to release it. Don't use a JS setTimeout
+// for this: RN timers are paused in the background and lost when the OS kills the app.
+setBlockedApps(['com.instagram.android'], { expiresAtMillis: Date.now() + 25 * 60_000 });
 ```
+
+> `expiresAtMillis` is ignored on iOS — the Focus lock there uses a `DeviceActivity`
+> interval for timed release instead.
 
 ### Android: Monitoring
 

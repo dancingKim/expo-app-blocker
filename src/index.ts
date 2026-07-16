@@ -111,9 +111,27 @@ export async function getInstalledApps(): Promise<AndroidBlockableApp[]> {
   return NativeModule.getInstalledApps();
 }
 
-export function setBlockedApps(packageNames: string[]): void {
+/**
+ * Replace the set of immediately-blocked apps (Android only; no-op elsewhere).
+ *
+ * Pass `options.expiresAtMillis` (epoch ms) to plant a native auto-release time: the
+ * block lifts on its own at that instant **even if the app process is later killed**,
+ * because the expiry lives in native prefs and a boundary alarm wakes the blocker service
+ * to release it. Omit it (or pass `0`) for a block with no auto-release — then only an
+ * explicit `setBlockedApps([])` / `relockApps()` clears it. Do **not** rely on a JS-side
+ * `setTimeout` for release: RN timers are paused in the background and lost when the OS
+ * kills the app, so a JS-only "unblock later" can silently never fire.
+ *
+ * iOS auto-expiry is not implemented here — the Focus lock uses a `DeviceActivity`
+ * interval for its own timed release; `options` is ignored off Android.
+ */
+export function setBlockedApps(
+  packageNames: string[],
+  options?: { expiresAtMillis?: number }
+): void {
   if (Platform.OS !== "android") return;
   NativeModule.setBlockedApps(packageNames);
+  NativeModule.setBlockExpiryAndroid(options?.expiresAtMillis ?? 0);
 }
 
 export function getBlockedApps(): string[] {

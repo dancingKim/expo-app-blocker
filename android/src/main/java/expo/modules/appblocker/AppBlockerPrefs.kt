@@ -12,6 +12,7 @@ object AppBlockerPrefs {
   private const val INTERCEPT_DEBOUNCE_MS = 2_000L
   private const val MAX_PENDING_INTERCEPTS = 200
   const val KEY_BLOCKED_PACKAGES = "blocked_packages"
+  private const val KEY_BLOCK_EXPIRES_AT = "block_expires_at_millis"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
   private const val KEY_OVERLAY_BG_COLOR = "overlay_bg_color"
@@ -38,8 +39,29 @@ object AppBlockerPrefs {
     get(context).getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet()
 
   fun setBlockedPackages(context: Context, packages: Collection<String>) {
+    val set = packages.toSet()
+    val editor = get(context).edit().putStringSet(KEY_BLOCKED_PACKAGES, set)
+    // An empty immediate-block set means nothing is blocked now, so drop any pending
+    // auto-release expiry with it — expiry is only meaningful alongside a non-empty set,
+    // and a stale timestamp must never gate a later block.
+    if (set.isEmpty()) editor.putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+    editor.apply()
+  }
+
+  /** Immediate-block auto-release time (epoch millis); 0 means no expiry. */
+  fun getBlockExpiresAt(context: Context): Long =
+    get(context).getLong(KEY_BLOCK_EXPIRES_AT, 0L)
+
+  /**
+   * Plant/clear the immediate-block auto-release time. This is the *release guarantee*
+   * stored the moment we lock: an app/server relock signal can only bring release
+   * *forward*, and a killed process drops that signal, so the block is guaranteed to lift
+   * only because this timestamp lives in prefs and the service enforces it. Any value
+   * <= 0 clears it (no expiry).
+   */
+  fun setBlockExpiresAt(context: Context, expiresAtMillis: Long) {
     get(context).edit()
-      .putStringSet(KEY_BLOCKED_PACKAGES, packages.toSet())
+      .putLong(KEY_BLOCK_EXPIRES_AT, if (expiresAtMillis > 0L) expiresAtMillis else 0L)
       .apply()
   }
 
