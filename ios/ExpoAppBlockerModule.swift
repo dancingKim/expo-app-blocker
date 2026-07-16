@@ -39,6 +39,12 @@ public class ExpoAppBlockerModule: Module {
   // `unlockActivityName`.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
+  // Immediate-block wall-clock expiry (#535). When `setBlockConfiguration` carries
+  // `expiresAtMillis`, one DeviceActivity fires at that instant and the monitor extension lifts
+  // the immediate shield — a kill-proof release guarantee mirroring Android's `expiresAtMillis`.
+  // The interval's START is the expiry instant (intervalDidStart), so short blocks work despite
+  // DeviceActivity's ~15-minute minimum interval length (only the start boundary matters).
+  private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
   // DeviceActivity requires a monitored interval to be at least ~15 minutes. A
   // cross-midnight split fragment shorter than this is skipped (the evaluator still
   // corrects the shield at the next boundary that fires).
@@ -68,6 +74,14 @@ public class ExpoAppBlockerModule: Module {
     Name("ExpoAppBlocker")
 
     Events("onPendingUnlockRequest")
+
+    // #535: whether THIS binary bundles the guardian Family Controls extensions. Lets the JS
+    // exposure gate (#541) tell a guardian-capable build from one where the .appex were not
+    // attached (the extensions ship only on the internal variant), independent of the OTA JS
+    // bundle. Android has no separate extension — the blocker is compiled in — so it is `true`.
+    Constants([
+      "guardianExtensionAttached": self.hasGuardianExtension()
+    ])
 
     // Native view that renders blocked app tokens with real names and icons
     View(BlockedAppsView.self) {
@@ -173,6 +187,8 @@ public class ExpoAppBlockerModule: Module {
           self.currentBlockConfig = blockConfig
           try self.applyBlocks(blockConfig)
           self.persistBlockConfiguration(config)
+          // #535: (re)arm or cancel the wall-clock expiry DeviceActivity for this config.
+          self.updateImmediateExpiryMonitoring(blockConfig)
 
           DispatchQueue.main.async {
             promise.resolve(nil)
@@ -198,6 +214,7 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
+        self.cancelImmediateExpiryActivity()  // #535: drop any pending wall-clock expiry
         self.store.shield.applications = nil
         self.store.shield.applicationCategories = nil
         self.store.shield.webDomains = nil
@@ -344,6 +361,24 @@ public class ExpoAppBlockerModule: Module {
     }
   }
 
+  // MARK: - Guardian binary capability (#535)
+
+  /// Does THIS binary actually bundle the guardian Family Controls extensions? The shield/monitor
+  /// `.appex` live under the app bundle's PlugIns dir only when the (internal) variant built them
+  /// in — a fact of the native binary, independent of the JS/OTA bundle. Presence of the
+  /// ShieldConfiguration extension is the marker; the exposure gate (#541) reads it via the
+  /// `guardianExtensionAttached` constant.
+  private func hasGuardianExtension() -> Bool {
+    guard let pluginsURL = Bundle.main.builtInPlugInsURL,
+          let contents = try? FileManager.default.contentsOfDirectory(
+            at: pluginsURL, includingPropertiesForKeys: nil) else {
+      return false
+    }
+    return contents.contains {
+      $0.pathExtension == "appex" && $0.lastPathComponent.contains("ShieldConfiguration")
+    }
+  }
+
   // MARK: - Authorization
 
   private func getAuthStatus() -> (authorized: Bool, statusString: String) {
@@ -483,7 +518,11 @@ public class ExpoAppBlockerModule: Module {
       )
     }
 
-    return BlockConfig(items: items, isActive: isActive, schedule: schedule)
+    // #535: wall-clock expiry (epoch millis). JS may send it as any JSON number, so read via
+    // NSNumber. Absent → nil (no expiry, back-compat with callers that don't pass it).
+    let expiresAtMillis = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue
+
+    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis)
   }
 
   /// Decode an array of raw item dicts (the `blockedItems` shape shared by immediate and
@@ -525,6 +564,23 @@ public class ExpoAppBlockerModule: Module {
       store.shield.applications = nil
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
+      return
+    }
+
+    // #535: immediate-block wall-clock expiry backstop (mirrors Android's `isImmediateBlocked`
+    // wall-clock gate). If the configured expiry has passed, treat the block as released — clear
+    // the shield AND drop the persisted config so a killed-app relaunch (ensureLoadedPersistedConfig)
+    // never re-applies an expired block. The monitor extension is the kill-proof path; this covers
+    // the case where the app comes back to the foreground after expiry.
+    if let expiry = config.expiresAtMillis, expiry > 0,
+       Date().timeIntervalSince1970 * 1000.0 >= expiry {
+      store.shield.applications = nil
+      store.shield.applicationCategories = nil
+      store.shield.webDomains = nil
+      cancelImmediateExpiryActivity()
+      currentBlockConfig = nil
+      userDefaults.removeObject(forKey: blockConfigStorageKey)
+      sharedDefaults?.removeObject(forKey: blockConfigStorageKey)
       return
     }
 
@@ -672,6 +728,65 @@ public class ExpoAppBlockerModule: Module {
   private func cancelRelockActivityLocked() {
     let activityName = DeviceActivityName(unlockActivityName)
     activityCenter.stopMonitoring([activityName])
+  }
+
+  // MARK: - Immediate-Block Wall-Clock Expiry (#535)
+
+  /// (Re)arm or cancel the wall-clock expiry DeviceActivity for the current immediate block. A
+  /// DeviceActivity fires at the expiry instant so the monitor extension lifts the shield even if
+  /// the host app is force-quit — the iOS analogue of Android's `expiresAtMillis` backstop.
+  private func updateImmediateExpiryMonitoring(_ config: BlockConfig) {
+    cancelImmediateExpiryActivity()
+    guard config.isActive, let expiry = config.expiresAtMillis, expiry > 0 else { return }
+    let expiryDate = Date(timeIntervalSince1970: expiry / 1000.0)
+    let now = Date()
+    guard expiryDate > now else { return }  // already past — applyBlocks handled the release
+    // Same-day only: a DeviceActivitySchedule interval is a time-of-day window, so a next-day
+    // expiry can't be expressed as a reliable one-shot. Cross-midnight focus sessions are rare;
+    // the app-foreground expiry gate (applyBlocks) clears the block on next launch as the fallback.
+    guard Calendar.current.isDate(expiryDate, inSameDayAs: now) else {
+      print("[AppBlocker] immediate-expiry crosses midnight — relying on foreground clear")
+      return
+    }
+    startImmediateExpiryMonitoring(expiresAt: expiryDate)
+  }
+
+  /// Register a one-shot DeviceActivity whose interval STARTS at the expiry instant. Only the
+  /// start boundary matters (the monitor's `intervalDidStart` lifts the block there), so a short
+  /// block still works despite DeviceActivity's ~15-minute minimum interval length — we pad the
+  /// interval past that minimum. An expiry within ~16 min of midnight can't fit a non-wrapping
+  /// ≥15-min window, so it falls back to the app-foreground clear.
+  private func startImmediateExpiryMonitoring(expiresAt: Date) {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+
+    let startComps = Calendar.current.dateComponents([.hour, .minute, .second], from: expiresAt)
+    let startMinute = (startComps.hour ?? 0) * 60 + (startComps.minute ?? 0)
+    let endMinute = startMinute + minScheduleIntervalMinutes + 1
+    guard endMinute <= 23 * 60 + 59 else {
+      print("[AppBlocker] immediate-expiry within ~16m of midnight — relying on foreground clear")
+      return
+    }
+    let schedule = DeviceActivitySchedule(
+      intervalStart: startComps,
+      intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
+      repeats: false
+    )
+    do {
+      try activityCenter.startMonitoring(
+        DeviceActivityName(immediateExpiryActivityName),
+        during: schedule,
+        events: [:]
+      )
+    } catch {
+      print("[AppBlocker] immediate-expiry startMonitoring failed: \(error.localizedDescription)")
+    }
+  }
+
+  private func cancelImmediateExpiryActivity() {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+    activityCenter.stopMonitoring([DeviceActivityName(immediateExpiryActivityName)])
   }
 
   // MARK: - Schedule-Window Blocking
@@ -948,6 +1063,12 @@ public class ExpoAppBlockerModule: Module {
       ]
     }
 
+    // #535: persist the wall-clock expiry so it survives relaunch and the monitor extension can
+    // read it from the App Group copy to gate its release.
+    if let expiresAtMillis = config.expiresAtMillis {
+      result["expiresAtMillis"] = expiresAtMillis
+    }
+
     return result
   }
 
@@ -1170,6 +1291,8 @@ struct BlockConfig {
   let items: [BlockedItemInfo]
   let isActive: Bool
   let schedule: ScheduleInfo?
+  // #535: optional wall-clock auto-release (epoch millis). nil / <= 0 = no expiry.
+  let expiresAtMillis: Double?
 }
 
 struct ScheduleInfo {

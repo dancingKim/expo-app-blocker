@@ -8,6 +8,13 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let pendingUnlockKey = "appBlocker.pendingUnlock.v1"
   private let pendingInterceptsKey = "appBlocker.pendingIntercepts.v1"
   private let lastInterceptTsKey = "appBlocker.lastInterceptTs.v1"
+  // #522: the guarded task id the app wrote into the App Group when it armed the
+  // block. Carried into the "하러 가기" notification payload so the JS
+  // notification-response router can land on that specific task (home tab +
+  // main CTA promotion + first-step 'suggest' bubble). Absent → the router
+  // falls back to the current CTA (next/smallest). The *writer* of this key is
+  // the enforcement slice, not this extension.
+  private let guardedItemIdKey = "appBlocker.guardedItemId.v1"
   private let interceptDebounceMs: Double = 2_000
   private let maxPendingIntercepts = 200
   private let pendingUnlockNotificationIdentifier = "expo.appblocker.pendingUnlock.local"
@@ -113,7 +120,18 @@ class ShieldActionExtension: ShieldActionDelegate {
     content.title = notificationTitle
     content.body = notificationBody
     content.sound = .default
-    content.userInfo = ["link": "/unlock"]
+    // #522: guardian landing payload. `kind` is the router's discriminator
+    // (mirrors notificationScheduler's reminder/timer/nudge convention); `link`
+    // is kept for back-compat. `itemId` is included only when the app armed the
+    // block for a known task.
+    var userInfo: [String: Any] = ["kind": "guardian", "link": "/unlock"]
+    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
+      sharedDefaults.synchronize()
+      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
+        userInfo["itemId"] = guardedItemId
+      }
+    }
+    content.userInfo = userInfo
 
     // Attach the app icon to the notification only when the app opted in.
     // When false the system app icon is the only icon shown — avoids the

@@ -21,6 +21,14 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   private let shieldBlurStyle: UIBlurEffect.Style? = SHIELD_BLUR_STYLE_PLACEHOLDER
   private let shieldTitleColor = UIColor(red: SHIELD_TITLE_R_PLACEHOLDER, green: SHIELD_TITLE_G_PLACEHOLDER, blue: SHIELD_TITLE_B_PLACEHOLDER, alpha: 1.0)
   private let shieldSubtitleColor = UIColor(red: SHIELD_SUBTITLE_R_PLACEHOLDER, green: SHIELD_SUBTITLE_G_PLACEHOLDER, blue: SHIELD_SUBTITLE_B_PLACEHOLDER, alpha: 1.0)
+  // #525 schedule-window shield copy — hand-synced with guardianCopy.ts schedule.*ShieldTitle/
+  // Subtitle. Weekday: keeps the "하러 가기" redirect button (NOT an unlock — the schedule store
+  // survives the unlock path, so the button only returns to the app). Bedtime: sleepy, no
+  // buttons, auto-releases at the window's end (pure time promise).
+  private let scheduleWeekdayTitle = "지금은 나랑 있자."
+  private let scheduleWeekdaySubtitle = "문은 이따 열려."
+  private let scheduleBedtimeTitle = "지금은 잘 시간이야."
+  private let scheduleBedtimeSubtitle = "내일 또 하자."
 
   private var mascotIcon: UIImage? {
     let bundle = Bundle(for: type(of: self))
@@ -35,6 +43,39 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
       return items.count
     }
     return 0
+  }
+
+  // #523: variant subtitle the enforcement slice writes into the App Group on arm
+  // (e.g. focus "지금은 그거 하나만."). Absent/empty → fall back to the fixed line.
+  private func focusShieldSubtitle() -> String? {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return nil }
+    guard let value = defaults.string(forKey: "appBlocker.shieldFocusSubtitle.v1"), !value.isEmpty else { return nil }
+    return value
+  }
+
+  // #525: the active schedule window's variant ("bedtime" | "schedule"), written by the
+  // DeviceActivity monitor (the SSOT for which window is active). nil = not inside a window,
+  // so the default/focus shield path renders instead.
+  private func scheduleShieldVariant() -> String? {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return nil }
+    guard let value = defaults.string(forKey: "appBlocker.scheduleShieldVariant.v1"), !value.isEmpty else { return nil }
+    return value
+  }
+
+  private func scheduleShieldConfig() -> ShieldConfiguration? {
+    guard let variant = scheduleShieldVariant() else { return nil }
+    let bedtime = variant == "bedtime"
+    return ShieldConfiguration(
+      backgroundBlurStyle: shieldBlurStyle,
+      backgroundColor: shieldBackgroundColor,
+      icon: mascotIcon,
+      title: ShieldConfiguration.Label(text: bedtime ? scheduleBedtimeTitle : scheduleWeekdayTitle, color: shieldTitleColor),
+      subtitle: ShieldConfiguration.Label(text: bedtime ? scheduleBedtimeSubtitle : scheduleWeekdaySubtitle, color: shieldSubtitleColor),
+      // Bedtime: no buttons (time promise, auto-release at window end). Weekday: redirect button.
+      primaryButtonLabel: bedtime ? nil : ShieldConfiguration.Label(text: shieldPrimaryButtonLabel, color: .white),
+      primaryButtonBackgroundColor: bedtime ? nil : shieldPrimaryButtonColor,
+      secondaryButtonLabel: nil
+    )
   }
 
   private func isTemporarilyUnlocked() -> Bool {
@@ -101,11 +142,20 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     // (debounced) for the app to drain.
     recordIntercept(appName: appName)
 
+    // #525: inside a schedule window → render the sleepy (bedtime) / weekday variant. The
+    // monitor's variant key is the SSOT; outside every window it's absent → fall through to
+    // the default/focus shield below.
+    if let scheduleConfig = scheduleShieldConfig() {
+      return scheduleConfig
+    }
+
     let count = getBlockedAppCount()
     // The plugin replaces this placeholder with a Swift string literal
     // containing `\(count)` interpolation, or `""` when the user opted out.
     let context = count > 1 ? SHIELD_COUNT_SUFFIX_SWIFT_PLACEHOLDER : ""
-    let subtitle = shieldSubtitle.replacingOccurrences(of: "{appName}", with: appName) + context
+    // #523: prefer the armed variant subtitle (focus etc.); fall back to the fixed line.
+    let baseSubtitle = focusShieldSubtitle() ?? shieldSubtitle
+    let subtitle = baseSubtitle.replacingOccurrences(of: "{appName}", with: appName) + context
 
     let hasSecondary = !shieldSecondaryButtonLabel.isEmpty && shieldSecondaryButtonLabel != "none"
 

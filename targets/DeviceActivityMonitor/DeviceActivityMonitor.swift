@@ -27,6 +27,15 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // with `store` and independent of the temporary-unlock logic.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
+  // #525: the shield variant of the currently-active schedule window ("bedtime" | "schedule").
+  // The monitor is the SSOT for which window is active, so it records the variant here on shield
+  // apply; ShieldConfiguration reads it to render the sleepy (bedtime) vs weekday shield. Removed
+  // when no window is active. The per-window "variant" tag rides in the App Group schedule config
+  // (the module persists the raw config dict, so JS-supplied fields survive).
+  private let scheduleShieldVariantKey = "appBlocker.scheduleShieldVariant.v1"
+  // #535: the immediate-block wall-clock expiry DeviceActivity. Its interval STARTS at the expiry
+  // instant, so intervalDidStart (below) is the kill-proof point to lift the immediate shield.
+  private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -109,11 +118,36 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   override func intervalDidStart(for activity: DeviceActivityName) {
     super.intervalDidStart(for: activity)
 
+    // #535: the immediate-block wall-clock expiry fired (interval starts at the expiry instant).
+    // Lift the immediate shield if the persisted expiry has actually passed. Kill-proof: runs even
+    // when the host app was force-quit.
+    if activity.rawValue == immediateExpiryActivityName {
+      expireImmediateBlockIfDue()
+      return
+    }
+
     // A schedule window opened: re-evaluate and apply the schedule shield if any window
     // is currently active (the opened one may be gated out by weekday).
     if activity.rawValue.hasPrefix(scheduleActivityPrefix) {
       reevaluateScheduleShield()
     }
+  }
+
+  /// #535: lift the immediate-block shield once its persisted wall-clock expiry passes. Guards
+  /// against a spurious/early boundary fire (only releases when now >= expiry) and drops the App
+  /// Group config copy so the shield doesn't re-render; the host clears its userDefaults.standard
+  /// copy on next foreground (the module's applyBlocks expiry gate).
+  private func expireImmediateBlockIfDue() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let dict = defaults.dictionary(forKey: blockConfigStorageKey),
+          let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue, expiry > 0 else {
+      return
+    }
+    guard Date().timeIntervalSince1970 * 1000.0 >= expiry else { return }
+    store.shield.applications = nil
+    store.shield.applicationCategories = nil
+    store.shield.webDomains = nil
+    defaults.removeObject(forKey: blockConfigStorageKey)
   }
 
   /// Extract the threshold seconds from an event name like `appBlocker.usageStep.90`;
@@ -157,13 +191,17 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else {
       clearScheduleShield()
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
       return
     }
     let windows = parseScheduleWindows(dict)
-    if isAnyScheduleWindowActive(windows: windows, at: Date()) {
+    // #525: the active window's variant drives the shield copy. nil = no window active.
+    if let variant = activeScheduleVariant(windows: windows, at: Date()) {
       applyScheduleShield(parseScheduleItems(dict))
+      defaults.set(variant, forKey: scheduleShieldVariantKey)
     } else {
       clearScheduleShield()
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
     }
   }
 
@@ -175,34 +213,40 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         return nil
       }
       let weekdays = (window["weekdays"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
-      return MonitorScheduleWindow(startMinute: start, endMinute: end, weekdays: Set(weekdays))
+      // #525: variant tag rides in the JS-supplied window ("bedtime" for the sleep preset,
+      // "schedule" for weekday windows). Missing → treat as a plain weekday window.
+      let variant = (window["variant"] as? String) ?? "schedule"
+      return MonitorScheduleWindow(startMinute: start, endMinute: end, weekdays: Set(weekdays), variant: variant)
     }
   }
 
-  /// True if any window covers `date`. A window with `endMinute < startMinute` crosses
-  /// midnight; its after-midnight portion is gated on the window's START day (yesterday).
-  private func isAnyScheduleWindowActive(windows: [MonitorScheduleWindow], at date: Date) -> Bool {
+  /// True if `window` covers `date`'s minute-of-day + weekday. A window with
+  /// `endMinute < startMinute` crosses midnight; its after-midnight portion is gated on the
+  /// window's START day (yesterday).
+  private func isWindowActive(_ window: MonitorScheduleWindow, nowMinute: Int, todayIso: Int, yesterdayIso: Int) -> Bool {
+    if window.startMinute <= window.endMinute {
+      return nowMinute >= window.startMinute && nowMinute < window.endMinute && window.weekdays.contains(todayIso)
+    }
+    if nowMinute >= window.startMinute, window.weekdays.contains(todayIso) { return true }
+    if nowMinute < window.endMinute, window.weekdays.contains(yesterdayIso) { return true }
+    return false
+  }
+
+  /// #525: the shield variant of the currently-active window, or nil if none is active. A
+  /// weekday ("schedule") window takes precedence over "bedtime" when both overlap — the
+  /// weekday shield keeps its redirect button, so an overlap never traps the user behind the
+  /// button-less sleepy shield.
+  private func activeScheduleVariant(windows: [MonitorScheduleWindow], at date: Date) -> String? {
     let comps = Calendar.current.dateComponents([.hour, .minute, .weekday], from: date)
     let nowMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
     let todayIso = isoWeekday(fromGregorian: comps.weekday ?? 1)
     let yesterdayIso = todayIso == 1 ? 7 : todayIso - 1
 
-    for window in windows {
-      if window.startMinute <= window.endMinute {
-        if nowMinute >= window.startMinute, nowMinute < window.endMinute,
-           window.weekdays.contains(todayIso) {
-          return true
-        }
-      } else {
-        if nowMinute >= window.startMinute, window.weekdays.contains(todayIso) {
-          return true
-        }
-        if nowMinute < window.endMinute, window.weekdays.contains(yesterdayIso) {
-          return true
-        }
-      }
+    var bedtimeActive = false
+    for window in windows where isWindowActive(window, nowMinute: nowMinute, todayIso: todayIso, yesterdayIso: yesterdayIso) {
+      if window.variant == "bedtime" { bedtimeActive = true } else { return "schedule" }
     }
-    return false
+    return bedtimeActive ? "bedtime" : nil
   }
 
   /// Convert a Gregorian weekday (1 = Sunday … 7 = Saturday) to ISO (1 = Monday … 7 = Sunday).
@@ -396,4 +440,6 @@ struct MonitorScheduleWindow {
   let startMinute: Int
   let endMinute: Int
   let weekdays: Set<Int>
+  // #525: "bedtime" (sleepy shield, no button) | "schedule" (weekday shield, redirect button).
+  let variant: String
 }
