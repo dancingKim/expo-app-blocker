@@ -163,12 +163,15 @@ public class ExpoAppBlockerModule: Module {
 
         let initialAppTokens = Set(self.currentBlockConfig?.items.compactMap { $0.appToken } ?? [])
         let initialCategoryTokens = Set(self.currentBlockConfig?.items.compactMap { $0.categoryToken } ?? [])
+        let hostHolder = WeakViewControllerBox()
         let pickerView = FamilyActivityPickerView(
           initialApplicationTokens: initialAppTokens,
           initialCategoryTokens: initialCategoryTokens,
-          promise: promise
+          promise: promise,
+          hostHolder: hostHolder
         )
         let hostingController = UIHostingController(rootView: pickerView)
+        hostHolder.value = hostingController
 
         if let rootVC = self.getRootViewController() {
           hostingController.modalPresentationStyle = .formSheet
@@ -1312,18 +1315,28 @@ struct ScheduleWindowInfo {
 
 // MARK: - FamilyActivityPicker SwiftUI View
 
+/// Holds a weak reference to the picker's UIHostingController so the SwiftUI
+/// view can dismiss only its own presented sheet. Dismissing the window's root
+/// VC instead cascades the whole RN modal stack underneath the picker (#535).
+final class WeakViewControllerBox {
+  weak var value: UIViewController?
+}
+
 struct FamilyActivityPickerView: View {
   @State private var selection: FamilyActivitySelection
   @State private var didAppear = false
   @State private var didFinish = false
   let promise: Promise
+  let hostHolder: WeakViewControllerBox
 
   init(
     initialApplicationTokens: Set<ApplicationToken>,
     initialCategoryTokens: Set<ActivityCategoryToken>,
-    promise: Promise
+    promise: Promise,
+    hostHolder: WeakViewControllerBox
   ) {
     self.promise = promise
+    self.hostHolder = hostHolder
 
     var initialSelection = FamilyActivitySelection()
     initialSelection.applicationTokens = initialApplicationTokens
@@ -1459,13 +1472,8 @@ struct FamilyActivityPickerView: View {
 
   private func dismissWithCancel() {
     didFinish = true
-
-    DispatchQueue.main.async {
-      if let rootVC = getRootViewController() {
-        rootVC.dismiss(animated: true) {
-          self.promise.reject("PICKER_CANCELLED", "User cancelled Family Activity Picker")
-        }
-      }
+    dismissPicker {
+      self.promise.reject("PICKER_CANCELLED", "User cancelled Family Activity Picker")
     }
   }
 
@@ -1503,21 +1511,23 @@ struct FamilyActivityPickerView: View {
 
   private func dismissWithResult(_ result: [[String: Any]]) {
     didFinish = true
-
-    DispatchQueue.main.async {
-      if let rootVC = getRootViewController() {
-        rootVC.dismiss(animated: true) {
-          self.promise.resolve(result)
-        }
-      }
+    dismissPicker {
+      self.promise.resolve(result)
     }
   }
 
-  private func getRootViewController() -> UIViewController? {
-    let scenes = UIApplication.shared.connectedScenes
-    let windowScene = scenes.first as? UIWindowScene
-    let window = windowScene?.windows.first
-    return window?.rootViewController
+  /// Dismiss only the picker's own sheet by asking its presenting VC to dismiss
+  /// it — this drops just the picker (and anything above it), unlike dismissing
+  /// the window's root VC, which cascades the whole RN modal stack (#535). Always
+  /// settle the promise, even when the sheet has already been dismissed.
+  private func dismissPicker(completion: @escaping () -> Void) {
+    DispatchQueue.main.async {
+      if let host = hostHolder.value, let presenter = host.presentingViewController {
+        presenter.dismiss(animated: true, completion: completion)
+      } else {
+        completion()
+      }
+    }
   }
 
   private func handleInteractiveDismissIfNeeded() {
