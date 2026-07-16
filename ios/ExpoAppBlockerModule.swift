@@ -14,7 +14,7 @@ public class ExpoAppBlockerModule: Module {
   // shield sources union at the system level and clearing one never clears the other
   // (`ManagedSettingsStore.Name` is ExpressibleByStringLiteral). The monitor extension
   // uses the identical name so both processes write the same store.
-  private let scheduleStore = ManagedSettingsStore(named: "appBlocker.schedule")
+  private let scheduleStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.schedule"))
   private let activityCenter = DeviceActivityCenter()
   private var sharedDefaults: UserDefaults?
   private let userDefaults = UserDefaults.standard
@@ -780,7 +780,11 @@ public class ExpoAppBlockerModule: Module {
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
     scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
-    scheduleStore.shield.applicationCategories = categories.isEmpty ? nil : .specific(Set(categories))
+    if categories.isEmpty {
+      scheduleStore.shield.applicationCategories = nil
+    } else {
+      scheduleStore.shield.applicationCategories = .specific(Set(categories))
+    }
     scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
   }
 

@@ -30,7 +30,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
-  private let scheduleStore = ManagedSettingsStore(named: "appBlocker.schedule")
+  private let scheduleStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.schedule"))
   private var sharedDefaults: UserDefaults?
 
   override init() {
@@ -239,7 +239,11 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
     scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
-    scheduleStore.shield.applicationCategories = categories.isEmpty ? nil : .specific(Set(categories))
+    if categories.isEmpty {
+      scheduleStore.shield.applicationCategories = nil
+    } else {
+      scheduleStore.shield.applicationCategories = .specific(Set(categories))
+    }
     scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
   }
 
