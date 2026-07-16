@@ -122,8 +122,9 @@ export async function getInstalledApps(): Promise<AndroidBlockableApp[]> {
  * `setTimeout` for release: RN timers are paused in the background and lost when the OS
  * kills the app, so a JS-only "unblock later" can silently never fire.
  *
- * iOS auto-expiry is not implemented here — the Focus lock uses a `DeviceActivity`
- * interval for its own timed release; `options` is ignored off Android.
+ * This wrapper is Android-only (`options` is ignored off Android). The iOS immediate-block path is
+ * {@link setBlockConfiguration}, whose `expiresAtMillis` provides the symmetric native wall-clock
+ * backstop.
  */
 export function setBlockedApps(
   packageNames: string[],
@@ -165,11 +166,54 @@ export async function presentFamilyActivityPicker(): Promise<IOSBlockedItem[]> {
   return NativeModule.presentFamilyActivityPicker();
 }
 
+/**
+ * Set the immediate iOS block (Family Controls shields), replacing any previous one.
+ *
+ * Pass `config.expiresAtMillis` (epoch ms) for a native wall-clock auto-release: a `DeviceActivity`
+ * fires at that instant and the monitor extension lifts the shield **even if the app is force-quit**
+ * — symmetric with Android's `setBlockedApps({ expiresAtMillis })`. Omit it for a block with no
+ * auto-release (only `clearAllBlocks()` clears it).
+ */
 export async function setBlockConfiguration(config: IOSBlockConfiguration): Promise<void> {
   if (Platform.OS !== "ios") {
     throw new Error("Block configuration is only available on iOS");
   }
   return NativeModule.setBlockConfiguration(config);
+}
+
+/**
+ * Android-only: arm the guarded task id alongside an immediate block, so a block-triggered app
+ * redirect can route the user back to that task (drained via {@link consumePendingGuardedLaunch}).
+ * Mirrors the iOS App Group `appBlocker.guardedItemId.v1` the app writes on arm. `null`/empty clears
+ * it. No-op off Android.
+ */
+export function setGuardedItemId(itemId: string | null): void {
+  if (Platform.OS !== "android") return;
+  NativeModule.setGuardedItemIdAndroid(itemId ?? null);
+}
+
+/**
+ * Android-only: drain the one-shot "a block just redirected you here" flag. Returns the guarded task
+ * id (possibly an empty string when none was armed) when a fresh guarded launch is pending, else
+ * `null`. The verified launcher intent the overlay fires can't carry routing data, so the app's
+ * notification/deep-link router (#522) consumes this on resume to land on the guarded task. Always
+ * `null` off Android (iOS routes via the ShieldAction notification payload instead).
+ */
+export function consumePendingGuardedLaunch(): string | null {
+  if (Platform.OS !== "android") return null;
+  return NativeModule.consumePendingGuardedLaunch() ?? null;
+}
+
+/**
+ * Whether THIS native binary actually bundles the guardian enforcement code — the iOS Family
+ * Controls extensions (shield/monitor `.appex`) or the Android blocker — independent of the JS/OTA
+ * bundle. iOS reads the app bundle's PlugIns dir; Android is always `true` (the blocker is compiled
+ * in). The exposure gate (#541) uses this so it never promises guardian on a build that can't
+ * enforce it. `false` on unsupported platforms / when the native module is absent.
+ */
+export function isGuardianExtensionAttached(): boolean {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return false;
+  return NativeModule.guardianExtensionAttached === true;
 }
 
 export function getBlockConfiguration(): IOSBlockConfiguration | null {

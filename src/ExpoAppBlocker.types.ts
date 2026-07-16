@@ -53,6 +53,14 @@ export interface IOSBlockConfiguration {
     repeats: boolean;
     warningTime: number;
   };
+  /**
+   * Wall-clock auto-release time (epoch ms), symmetric with Android's `setBlockedApps`
+   * `expiresAtMillis`. When set, a `DeviceActivity` fires at that instant and the monitor
+   * extension lifts the shield **even if the app process is force-quit**. Omit (or `<= 0`) for a
+   * block with no auto-release — then only an explicit `clearAllBlocks()` clears it. Do not rely on
+   * a JS-side timer for release: it is lost when the OS kills the app.
+   */
+  expiresAtMillis?: number;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
