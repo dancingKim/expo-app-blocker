@@ -139,9 +139,13 @@ class AppBlockerService : Service() {
       ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
-    overlayManager.show(packageName, reason)
+    overlayManager.show(packageName)
     showBlockedNotification(packageName, reason)
     recordIntercept(packageName)
+    // #535: the block just redirected the user to the app — stamp the consumable guarded-launch
+    // flag so the JS router (#522) lands on the guarded task on resume (the launcher intent that
+    // OverlayManager fires can't carry routing data).
+    AppBlockerPrefs.recordPendingGuardedLaunch(this, System.currentTimeMillis())
     blocking = true
     consumingSinceMs = 0L
   }
@@ -287,10 +291,14 @@ class AppBlockerService : Service() {
     }
   }
 
+  // #526: the always-on foreground-service notification is owned here (not injectable via
+  // configureAndroid, which only reaches the block/overlay copy). Copy SSOT lives in the app at
+  // guardianCopy.awareness.androidForegroundNotification; kept voice-compliant (no 3rd person,
+  // no "~하는 중").
   private fun buildNotification(): Notification =
     NotificationCompat.Builder(this, CHANNEL_ID)
-      .setContentTitle("App Blocker")
-      .setContentText("Monitoring blocked apps")
+      .setContentTitle("앱 잠금 켜짐")
+      .setContentText("고른 앱은 지금 잠겨 있어.")
       .setSmallIcon(applicationInfo.icon)
       .setOngoing(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)

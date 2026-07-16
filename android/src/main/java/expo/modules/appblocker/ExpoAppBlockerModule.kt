@@ -28,6 +28,11 @@ class ExpoAppBlockerModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ExpoAppBlocker")
 
+    // #535: Android compiles the blocker in (no separate extension), so guardian is attached
+    // whenever this native module is present. Mirrors iOS's guardianExtensionAttached for the JS
+    // exposure gate (#541).
+    Constants("guardianExtensionAttached" to true)
+
     OnCreate {
       AppBlockerService.start(context)
       Log.d(TAG, "Module OnCreate: started AppBlockerService")
@@ -112,6 +117,22 @@ class ExpoAppBlockerModule : Module() {
 
     Function("getBlockedApps") {
       AppBlockerPrefs.getBlockedPackages(context).toList()
+    }
+
+    // #535: guarded task id the app arms alongside an immediate block (mirrors the iOS
+    // appBlocker.guardedItemId.v1 App Group key). Recorded into the consumable pending-launch flag
+    // when a block redirects the user, so the JS router (#522) can land on that task. null/empty clears.
+    Function("setGuardedItemIdAndroid") { itemId: String? ->
+      AppBlockerPrefs.setGuardedItemId(context, itemId)
+      Log.d(TAG, "setGuardedItemIdAndroid: $itemId")
+    }
+
+    // #535: drain the one-shot "a block just redirected you here" flag. Returns the guarded task id
+    // (possibly empty string) when a fresh guarded launch is pending, else null. The verified
+    // launcher intent can't carry routing data, so the JS router (#522) consumes this on resume to
+    // land on the guarded task — analogous to the home widget's consumePendingLaunchAction.
+    Function("consumePendingGuardedLaunch") {
+      AppBlockerPrefs.consumePendingGuardedLaunch(context)
     }
 
     Function("setScheduleConfiguration") { config: Map<String, Any?> ->

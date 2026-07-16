@@ -6,7 +6,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
-import android.net.Uri
 import android.os.Build
 import android.util.Log
 import android.util.TypedValue
@@ -24,11 +23,11 @@ class OverlayManager(private val context: Context) {
 
   private var overlayView: View? = null
 
-  fun show(blockedPackageName: String? = null, reason: BlockReason = BlockReason.OPENED) {
+  fun show(blockedPackageName: String? = null) {
     if (overlayView != null) {
       Log.d(TAG, "Overlay already visible")
       if (blockedPackageName != null) {
-        navigateToApp(blockedPackageName, reason)
+        navigateToApp()
       } else {
         bringAppToFront()
       }
@@ -47,7 +46,7 @@ class OverlayManager(private val context: Context) {
     }
 
     if (blockedPackageName != null) {
-      navigateToApp(blockedPackageName, reason)
+      navigateToApp()
     } else {
       bringAppToFront()
     }
@@ -72,26 +71,25 @@ class OverlayManager(private val context: Context) {
     packageName
   }
 
-  private fun navigateToApp(blockedPackageName: String, reason: BlockReason) {
-    val appName = resolveAppName(blockedPackageName)
+  // #535: the verified app-open on Android is the launcher intent (ACTION_MAIN + CATEGORY_LAUNCHER
+  // + explicit component + NEW_TASK — exactly what an icon tap fires). A bare ACTION_VIEW deep-link
+  // intent silently fails to foreground the app on some real devices, so we fire the launcher intent
+  // and let routing ride the consumable guarded-launch flag (drained by the JS router #522 on
+  // resume) rather than intent data.
+  private fun navigateToApp() {
+    val launchIntent = context.packageManager
+      .getLaunchIntentForPackage(context.packageName)
+      ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
 
-    // Use the app's own scheme for deep linking
-    val scheme = getAppScheme()
-    val deepLinkIntent = Intent(
-      Intent.ACTION_VIEW,
-      Uri.parse(
-        "${scheme}://blocked?app=${Uri.encode(appName)}" +
-          "&package=${Uri.encode(blockedPackageName)}&reason=${reason.slug}"
-      )
-    ).apply {
-      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+    if (launchIntent == null) {
+      Log.w(TAG, "No launch intent for package ${context.packageName}")
+      return
     }
 
     try {
-      context.startActivity(deepLinkIntent)
+      context.startActivity(launchIntent)
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to deep link", e)
-      bringAppToFront()
+      Log.e(TAG, "Failed to launch app", e)
     }
   }
 
@@ -111,12 +109,6 @@ class OverlayManager(private val context: Context) {
     }
 
     context.startActivity(launchIntent)
-  }
-
-  private fun getAppScheme(): String {
-    val resId = context.resources.getIdentifier("expo_app_blocker_scheme", "string", context.packageName)
-    if (resId != 0) return context.getString(resId)
-    return context.packageName.replace(".", "-")
   }
 
   private fun buildOverlayView(appName: String): View {

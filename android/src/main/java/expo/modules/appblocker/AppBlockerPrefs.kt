@@ -31,6 +31,13 @@ object AppBlockerPrefs {
   private const val KEY_OVERLAY_SPINNER_COLOR = "overlay_spinner_color"
   private const val KEY_NOTIFICATION_TITLE = "notification_title"
   private const val KEY_NOTIFICATION_TEXT = "notification_text"
+  // #535: guarded-launch routing (Android overlay landing). guardedItemId is armed by the app;
+  // pending* is the one-shot flag stamped when a block redirects the user, drained by the JS router.
+  private const val KEY_GUARDED_ITEM_ID = "guarded_item_id"
+  private const val KEY_PENDING_GUARDED_LAUNCH = "pending_guarded_launch"
+  private const val KEY_PENDING_GUARDED_LAUNCH_TS = "pending_guarded_launch_ts"
+  // Mirror the iOS home-widget freshness window: a guarded launch older than this is stale.
+  private const val MAX_PENDING_GUARDED_LAUNCH_AGE_MS = 5 * 60 * 1000L
 
   fun get(context: Context): SharedPreferences =
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -63,6 +70,47 @@ object AppBlockerPrefs {
     get(context).edit()
       .putLong(KEY_BLOCK_EXPIRES_AT, if (expiresAtMillis > 0L) expiresAtMillis else 0L)
       .apply()
+  }
+
+  /**
+   * #535: the guarded task id armed alongside an immediate block (mirrors iOS's App Group
+   * `appBlocker.guardedItemId.v1`). null/empty clears it. Stamped into the pending-launch flag when
+   * a block redirects the user.
+   */
+  fun setGuardedItemId(context: Context, itemId: String?) {
+    val editor = get(context).edit()
+    if (itemId.isNullOrEmpty()) editor.remove(KEY_GUARDED_ITEM_ID) else editor.putString(KEY_GUARDED_ITEM_ID, itemId)
+    editor.apply()
+  }
+
+  /**
+   * #535: record a one-shot "a block just redirected the user here" flag, stamping the currently
+   * armed guarded task id (possibly empty) and the time. The JS router drains it on resume via
+   * [consumePendingGuardedLaunch] and lands on that task.
+   */
+  fun recordPendingGuardedLaunch(context: Context, atMillis: Long) {
+    val prefs = get(context)
+    val itemId = prefs.getString(KEY_GUARDED_ITEM_ID, "") ?: ""
+    prefs.edit()
+      .putString(KEY_PENDING_GUARDED_LAUNCH, itemId)
+      .putLong(KEY_PENDING_GUARDED_LAUNCH_TS, atMillis)
+      .apply()
+  }
+
+  /**
+   * #535: return and clear the pending guarded-launch flag. Returns the guarded task id (possibly
+   * empty string) when a fresh guarded launch is pending, or null when none is pending or it is stale.
+   */
+  fun consumePendingGuardedLaunch(context: Context): String? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_PENDING_GUARDED_LAUNCH_TS, 0L)
+    if (ts <= 0L) return null
+    val itemId = prefs.getString(KEY_PENDING_GUARDED_LAUNCH, "") ?: ""
+    prefs.edit()
+      .remove(KEY_PENDING_GUARDED_LAUNCH)
+      .remove(KEY_PENDING_GUARDED_LAUNCH_TS)
+      .apply()
+    return if (System.currentTimeMillis() - ts <= MAX_PENDING_GUARDED_LAUNCH_AGE_MS) itemId else null
   }
 
   /**
