@@ -163,16 +163,40 @@ public class ExpoAppBlockerModule: Module {
 
         let initialAppTokens = Set(self.currentBlockConfig?.items.compactMap { $0.appToken } ?? [])
         let initialCategoryTokens = Set(self.currentBlockConfig?.items.compactMap { $0.categoryToken } ?? [])
+        // Scoped, weak handle to the picker's own controller. The exit paths
+        // must dismiss ONLY this controller — never rootVC.dismiss(), which
+        // collapses an RN modal (e.g. SettingsModal) presented beneath the
+        // picker and desyncs React Native's modal bookkeeping (touches freeze
+        // until app restart). weakHost is assigned after the controller exists.
+        var weakHost: () -> UIViewController? = { nil }
+        let dismissPicker: (@escaping () -> Void) -> Void = { completion in
+          DispatchQueue.main.async {
+            if let host = weakHost() {
+              host.dismiss(animated: true, completion: completion)
+            } else {
+              completion()
+            }
+          }
+        }
+
         let pickerView = FamilyActivityPickerView(
           initialApplicationTokens: initialAppTokens,
           initialCategoryTokens: initialCategoryTokens,
-          promise: promise
+          promise: promise,
+          dismissPicker: dismissPicker
         )
         let hostingController = UIHostingController(rootView: pickerView)
+        weakHost = { [weak hostingController] in hostingController }
 
         if let rootVC = self.getRootViewController() {
+          // Present on the topmost presented controller so the picker stacks
+          // above any RN modal rather than under it.
+          var topVC = rootVC
+          while let presented = topVC.presentedViewController {
+            topVC = presented
+          }
           hostingController.modalPresentationStyle = .formSheet
-          rootVC.present(hostingController, animated: true)
+          topVC.present(hostingController, animated: true)
         } else {
           promise.reject("NO_ROOT_VC", "Could not find root view controller")
         }
@@ -1409,13 +1433,17 @@ struct FamilyActivityPickerView: View {
   @State private var didAppear = false
   @State private var didFinish = false
   let promise: Promise
+  // Dismisses only the picker's own controller, then runs the completion.
+  let dismissPicker: (@escaping () -> Void) -> Void
 
   init(
     initialApplicationTokens: Set<ApplicationToken>,
     initialCategoryTokens: Set<ActivityCategoryToken>,
-    promise: Promise
+    promise: Promise,
+    dismissPicker: @escaping (@escaping () -> Void) -> Void
   ) {
     self.promise = promise
+    self.dismissPicker = dismissPicker
 
     var initialSelection = FamilyActivitySelection()
     initialSelection.applicationTokens = initialApplicationTokens
@@ -1551,13 +1579,8 @@ struct FamilyActivityPickerView: View {
 
   private func dismissWithCancel() {
     didFinish = true
-
-    DispatchQueue.main.async {
-      if let rootVC = getRootViewController() {
-        rootVC.dismiss(animated: true) {
-          self.promise.reject("PICKER_CANCELLED", "User cancelled Family Activity Picker")
-        }
-      }
+    dismissPicker {
+      self.promise.reject("PICKER_CANCELLED", "User cancelled Family Activity Picker")
     }
   }
 
@@ -1595,21 +1618,9 @@ struct FamilyActivityPickerView: View {
 
   private func dismissWithResult(_ result: [[String: Any]]) {
     didFinish = true
-
-    DispatchQueue.main.async {
-      if let rootVC = getRootViewController() {
-        rootVC.dismiss(animated: true) {
-          self.promise.resolve(result)
-        }
-      }
+    dismissPicker {
+      self.promise.resolve(result)
     }
-  }
-
-  private func getRootViewController() -> UIViewController? {
-    let scenes = UIApplication.shared.connectedScenes
-    let windowScene = scenes.first as? UIWindowScene
-    let window = windowScene?.windows.first
-    return window?.rootViewController
   }
 
   private func handleInteractiveDismissIfNeeded() {
