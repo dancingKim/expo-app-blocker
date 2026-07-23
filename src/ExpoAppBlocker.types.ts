@@ -44,8 +44,21 @@ export interface IOSBlockedItem {
 // iOS-specific types
 // ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * #563: block semantics. `"block"` (default) shields the listed apps (denylist). `"allow"` keeps the
+ * listed apps open and shields everything else (allowlist, via `ShieldSettings.ActivityCategoryPolicy
+ * .all(except:)` on iOS / an inverted foreground check on Android). iOS never shields system-
+ * essential apps; Android exempts launcher/system UI/dialer/IME/settings/host explicitly.
+ */
+export type BlockMode = "block" | "allow";
+
 export interface IOSBlockConfiguration {
-  blockedItems: IOSBlockedItem[];
+  /** #563: `"allow"` reinterprets the item set (in `allowedItems`) as the apps to KEEP open. */
+  mode?: BlockMode;
+  /** Denylist items (mode "block"). Optional in allow mode. */
+  blockedItems?: IOSBlockedItem[];
+  /** #563: allowlist — the apps to keep open (mode "allow"). Everything else is shielded. */
+  allowedItems?: IOSBlockedItem[];
   isActive: boolean;
   schedule?: {
     intervalStart: number;
@@ -87,21 +100,28 @@ export interface ScheduleWindow {
 }
 
 /**
- * iOS schedule configuration. `blockedItems` uses the same FamilyActivity tokens as
- * {@link IOSBlockConfiguration} (from the picker).
+ * iOS schedule configuration. Items use the same FamilyActivity tokens as
+ * {@link IOSBlockConfiguration} (from the picker). #563: in `mode: "allow"` the kept apps ride in
+ * `allowedItems` and an active window shields everything else; legacy `mode: "block"` shields
+ * `blockedItems`.
  */
 export interface IOSScheduleConfiguration {
+  mode?: BlockMode;
   windows: ScheduleWindow[];
-  blockedItems: IOSBlockedItem[];
+  blockedItems?: IOSBlockedItem[];
+  allowedItems?: IOSBlockedItem[];
 }
 
 /**
- * Android schedule configuration. `blockedItems` is a list of package names, matching
- * `setBlockedApps`.
+ * Android schedule configuration. Items are package names, matching `setBlockedApps` /
+ * `setAllowedApps`. #563: `allowedItems` (mode "allow") = kept packages; `blockedItems` (legacy) =
+ * shielded packages.
  */
 export interface AndroidScheduleConfiguration {
+  mode?: BlockMode;
   windows: ScheduleWindow[];
-  blockedItems: string[];
+  blockedItems?: string[];
+  allowedItems?: string[];
 }
 
 /** Platform-tagged union passed to {@link setScheduleConfiguration}. */

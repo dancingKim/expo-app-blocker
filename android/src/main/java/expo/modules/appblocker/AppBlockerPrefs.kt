@@ -12,6 +12,13 @@ object AppBlockerPrefs {
   private const val INTERCEPT_DEBOUNCE_MS = 2_000L
   private const val MAX_PENDING_INTERCEPTS = 200
   const val KEY_BLOCKED_PACKAGES = "blocked_packages"
+  // #563 allowlist: the kept apps for the immediate block, plus the immediate-block mode
+  // ("allow" | "block" | absent = none). In allow mode the service shields everything except
+  // KEY_ALLOWED_PACKAGES (+ system-essential apps); in block mode it shields KEY_BLOCKED_PACKAGES.
+  const val KEY_ALLOWED_PACKAGES = "allowed_packages"
+  const val KEY_IMMEDIATE_MODE = "immediate_mode"
+  const val MODE_ALLOW = "allow"
+  const val MODE_BLOCK = "block"
   private const val KEY_BLOCK_EXPIRES_AT = "block_expires_at_millis"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
@@ -51,8 +58,60 @@ object AppBlockerPrefs {
     // An empty immediate-block set means nothing is blocked now, so drop any pending
     // auto-release expiry with it — expiry is only meaningful alongside a non-empty set,
     // and a stale timestamp must never gate a later block.
-    if (set.isEmpty()) editor.putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+    if (set.isEmpty()) {
+      editor.putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+      editor.remove(KEY_IMMEDIATE_MODE)
+    } else {
+      // #563: mark legacy denylist mode so the service picks the right enforcement branch.
+      editor.putString(KEY_IMMEDIATE_MODE, MODE_BLOCK)
+    }
     editor.apply()
+  }
+
+  /** #563: the kept apps for allowlist immediate blocking. */
+  fun getAllowedPackages(context: Context): Set<String> =
+    get(context).getStringSet(KEY_ALLOWED_PACKAGES, emptySet()) ?: emptySet()
+
+  /** #563: the immediate-block mode ("allow" | "block"), or null when no immediate block is armed. */
+  fun getImmediateMode(context: Context): String? =
+    get(context).getString(KEY_IMMEDIATE_MODE, null)
+
+  /**
+   * #563: arm allowlist immediate blocking — shield everything except `packages` (+ system apps).
+   * An EMPTY list is the release signal: it clears the immediate block entirely (mode → none, no
+   * allowed set, expiry dropped) so "allow nothing / block everything" can never be armed by
+   * accident. Non-empty sets mode = "allow".
+   */
+  fun setAllowedPackages(context: Context, packages: Collection<String>) {
+    val set = packages.toSet()
+    val editor = get(context).edit()
+    if (set.isEmpty()) {
+      clearImmediate(editor)
+    } else {
+      editor
+        .putStringSet(KEY_ALLOWED_PACKAGES, set)
+        .putString(KEY_IMMEDIATE_MODE, MODE_ALLOW)
+    }
+    editor.apply()
+  }
+
+  /**
+   * #563: clear the immediate block regardless of mode — both the denylist and allowlist sets,
+   * the mode, and the auto-release expiry. Used on release and on auto-expiry so the next tick
+   * returns to the pristine (nothing-blocked) state.
+   */
+  fun clearImmediateBlock(context: Context) {
+    val editor = get(context).edit()
+    clearImmediate(editor)
+    editor.apply()
+  }
+
+  private fun clearImmediate(editor: SharedPreferences.Editor) {
+    editor
+      .remove(KEY_BLOCKED_PACKAGES)
+      .remove(KEY_ALLOWED_PACKAGES)
+      .remove(KEY_IMMEDIATE_MODE)
+      .putLong(KEY_BLOCK_EXPIRES_AT, 0L)
   }
 
   /** Immediate-block auto-release time (epoch millis); 0 means no expiry. */

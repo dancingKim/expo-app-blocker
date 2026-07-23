@@ -30,6 +30,10 @@ class AppBlockerService : Service() {
   private var consumingSinceMs = 0L
   // Whether a block is currently being enforced (overlay shown / app redirected).
   private var blocking = false
+  // #563 allowlist: packages that must never be shielded (launcher / system UI / dialer / IME /
+  // settings / host). Resolved once lazily — these rarely change within a session, and probing the
+  // PackageManager every 500 ms tick would be wasteful.
+  private val essentialApps: Set<String> by lazy { SystemEssentialApps.resolve(this) }
 
   private val pollRunnable = object : Runnable {
     override fun run() {
@@ -97,7 +101,8 @@ class AppBlockerService : Service() {
     val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
     if (expiry != 0L && System.currentTimeMillis() >= expiry) {
       Log.d(TAG, "Immediate block auto-release time reached ($expiry) — clearing")
-      AppBlockerPrefs.setBlockedPackages(this, emptyList<String>())
+      // #563: clear whichever mode is armed (allowlist or legacy denylist) so release is complete.
+      AppBlockerPrefs.clearImmediateBlock(this)
     }
   }
 
@@ -125,18 +130,39 @@ class AppBlockerService : Service() {
   // while `now < expiry`; once passed the block is no longer applied even before
   // [maybeExpireImmediateBlock] clears the prefs, so release can't be delayed by a
   // pending write. Schedule blocking is separate and never gated by this.
+  //
+  // #563 allowlist: in "allow" mode the immediate block shields every app EXCEPT the kept set
+  // (+ system-essential apps); "block" mode is the legacy denylist. No armed mode → nothing blocked.
   private fun isImmediateBlocked(packageName: String): Boolean {
-    if (packageName !in AppBlockerPrefs.getBlockedPackages(this)) return false
+    val mode = AppBlockerPrefs.getImmediateMode(this) ?: return false
     val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
-    return expiry == 0L || System.currentTimeMillis() < expiry
+    val notExpired = expiry == 0L || System.currentTimeMillis() < expiry
+    if (!notExpired) return false
+    return when (mode) {
+      AppBlockerPrefs.MODE_ALLOW ->
+        packageName !in AppBlockerPrefs.getAllowedPackages(this) && !isSystemEssential(packageName)
+      else -> packageName in AppBlockerPrefs.getBlockedPackages(this)
+    }
   }
 
   // True when the app is blocked *by an active schedule window* right now. Schedule
   // blocking is a pure time commitment — earned time never bypasses it (matches iOS,
   // where the schedule ManagedSettingsStore is independent of temporary unlock).
-  private fun isScheduleBlocked(packageName: String): Boolean =
-    packageName in ScheduleStore.getSchedulePackages(this) &&
-      ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())
+  //
+  // #563 allowlist: in "allow" mode an active window shields everything except the kept set
+  // (+ system-essential apps); "block" mode is the legacy denylist.
+  private fun isScheduleBlocked(packageName: String): Boolean {
+    if (!ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false
+    return when (ScheduleStore.getMode(this)) {
+      AppBlockerPrefs.MODE_ALLOW ->
+        packageName !in ScheduleStore.getSchedulePackages(this) && !isSystemEssential(packageName)
+      else -> packageName in ScheduleStore.getSchedulePackages(this)
+    }
+  }
+
+  // #563: never shield launcher / system UI / dialer / IME / settings / the host app, so allowlist
+  // "block everything else" can't brick the phone or seal off the OS-level emergency exit.
+  private fun isSystemEssential(packageName: String): Boolean = packageName in essentialApps
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
     overlayManager.show(packageName)
@@ -298,7 +324,7 @@ class AppBlockerService : Service() {
   private fun buildNotification(): Notification =
     NotificationCompat.Builder(this, CHANNEL_ID)
       .setContentTitle("앱 잠금 켜짐")
-      .setContentText("고른 앱은 지금 잠겨 있어.")
+      .setContentText("허용한 앱만 열려.")
       .setSmallIcon(applicationInfo.icon)
       .setOngoing(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)

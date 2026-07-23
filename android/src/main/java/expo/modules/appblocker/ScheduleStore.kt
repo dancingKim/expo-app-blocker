@@ -20,13 +20,18 @@ import org.json.JSONObject
 object ScheduleStore {
   private const val KEY_SCHEDULE_WINDOWS = "schedule_windows"
   private const val KEY_SCHEDULE_PACKAGES = "schedule_packages"
+  // #563: schedule block mode ("allow" | "block"). In allow mode KEY_SCHEDULE_PACKAGES holds the
+  // KEPT apps and the service shields everything else (+ system-essential apps) while a window is
+  // active; in block mode it holds the apps to shield. Absent → block (legacy).
+  private const val KEY_SCHEDULE_MODE = "schedule_mode"
   private const val MINUTE_MS = 60_000L
 
   data class Window(val startMinute: Int, val endMinute: Int, val weekdays: Set<Int>)
 
   /**
-   * Persist the schedule config sent from JS: `{ windows: [...], blockedItems: [pkg,...] }`.
-   * `blockedItems` on Android is a list of package-name strings (mirrors `setBlockedApps`).
+   * Persist the schedule config sent from JS. #563: `{ mode, windows, allowedItems }` in allow mode
+   * (`allowedItems` = kept package names), or the legacy `{ windows, blockedItems }` (blocked package
+   * names). On Android both item lists are plain package-name strings.
    */
   fun setConfiguration(context: Context, config: Map<String, Any?>) {
     val windowsJson = JSONArray()
@@ -44,7 +49,9 @@ object ScheduleStore {
       )
     }
 
-    val packages = (config["blockedItems"] as? List<*>)
+    val mode = (config["mode"] as? String) ?: AppBlockerPrefs.MODE_BLOCK
+    val itemsKey = if (mode == AppBlockerPrefs.MODE_ALLOW) "allowedItems" else "blockedItems"
+    val packages = (config[itemsKey] as? List<*>)
       ?.mapNotNull { it as? String }
       ?.toSet()
       ?: emptySet()
@@ -52,6 +59,7 @@ object ScheduleStore {
     AppBlockerPrefs.get(context).edit()
       .putString(KEY_SCHEDULE_WINDOWS, windowsJson.toString())
       .putStringSet(KEY_SCHEDULE_PACKAGES, packages)
+      .putString(KEY_SCHEDULE_MODE, mode)
       .apply()
   }
 
@@ -59,11 +67,16 @@ object ScheduleStore {
     AppBlockerPrefs.get(context).edit()
       .remove(KEY_SCHEDULE_WINDOWS)
       .remove(KEY_SCHEDULE_PACKAGES)
+      .remove(KEY_SCHEDULE_MODE)
       .apply()
   }
 
   fun getSchedulePackages(context: Context): Set<String> =
     AppBlockerPrefs.get(context).getStringSet(KEY_SCHEDULE_PACKAGES, emptySet()) ?: emptySet()
+
+  /** #563: the schedule block mode ("allow" | "block"); defaults to "block" (legacy). */
+  fun getMode(context: Context): String =
+    AppBlockerPrefs.get(context).getString(KEY_SCHEDULE_MODE, null) ?: AppBlockerPrefs.MODE_BLOCK
 
   fun getWindows(context: Context): List<Window> {
     val json = AppBlockerPrefs.get(context).getString(KEY_SCHEDULE_WINDOWS, null) ?: return emptyList()
@@ -91,7 +104,10 @@ object ScheduleStore {
     val windows = getWindows(context)
     val packages = getSchedulePackages(context)
     if (windows.isEmpty() && packages.isEmpty()) return null
+    val mode = getMode(context)
+    val itemsKey = if (mode == AppBlockerPrefs.MODE_ALLOW) "allowedItems" else "blockedItems"
     return mapOf(
+      "mode" to mode,
       "windows" to windows.map {
         mapOf(
           "startMinute" to it.startMinute,
@@ -99,7 +115,7 @@ object ScheduleStore {
           "weekdays" to it.weekdays.sorted(),
         )
       },
-      "blockedItems" to packages.toList(),
+      itemsKey to packages.toList(),
     )
   }
 

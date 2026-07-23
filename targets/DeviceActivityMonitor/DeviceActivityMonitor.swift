@@ -195,9 +195,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
     let windows = parseScheduleWindows(dict)
+    // #563 allowlist: the kept apps ride under `allowedItems` (mode "allow") or `blockedItems`
+    // (legacy). The mode picks the shield policy in applyScheduleShield.
+    let mode: BlockMode = (dict["mode"] as? String) == "allow" ? .allow : .block
     // #525: the active window's variant drives the shield copy. nil = no window active.
     if let variant = activeScheduleVariant(windows: windows, at: Date()) {
-      applyScheduleShield(parseScheduleItems(dict))
+      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode)
       defaults.set(variant, forKey: scheduleShieldVariantKey)
     } else {
       clearScheduleShield()
@@ -254,8 +257,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return ((gregorian + 5) % 7) + 1
   }
 
-  private func parseScheduleItems(_ dict: [String: Any]) -> [MonitorBlockedItemInfo] {
-    guard let rawItems = dict["blockedItems"] as? [[String: Any]] else { return [] }
+  private func parseScheduleItems(_ dict: [String: Any], mode: BlockMode) -> [MonitorBlockedItemInfo] {
+    let key = mode == .allow ? "allowedItems" : "blockedItems"
+    guard let rawItems = dict[key] as? [[String: Any]] else { return [] }
     return rawItems.compactMap { selection -> MonitorBlockedItemInfo? in
       guard let tokenString = selection["token"] as? String else { return nil }
       let itemTypeRaw = (selection["type"] as? String ?? "app").lowercased()
@@ -278,17 +282,46 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
   }
 
-  private func applyScheduleShield(_ items: [MonitorBlockedItemInfo]) {
+  private func applyScheduleShield(_ items: [MonitorBlockedItemInfo], mode: BlockMode) {
+    // #563 allowlist: an active window shields everything except the kept apps.
+    if mode == .allow {
+      applyAllowlistShield(scheduleStore, allowed: items)
+      return
+    }
     let apps = items.compactMap { $0.appToken }
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
-    scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
+    if apps.isEmpty {
+      scheduleStore.shield.applications = nil
+    } else {
+      scheduleStore.shield.applications = Set(apps)
+    }
     if categories.isEmpty {
       scheduleStore.shield.applicationCategories = nil
     } else {
       scheduleStore.shield.applicationCategories = .specific(Set(categories))
     }
-    scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
+    if webDomains.isEmpty {
+      scheduleStore.shield.webDomains = nil
+    } else {
+      scheduleStore.shield.webDomains = Set(webDomains)
+    }
+  }
+
+  /// #563 allowlist shield: shield every app EXCEPT the kept (allowed) app tokens via
+  /// `ShieldSettings.ActivityCategoryPolicy.all(except:)`. Empty allowed set → no shield (the app
+  /// gates 0 allowed apps as "lock not possible", so empty is never a real block-all here).
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo]) {
+    let allowedAppTokens = Set(items.compactMap { $0.appToken })
+    if allowedAppTokens.isEmpty {
+      managedStore.shield.applications = nil
+      managedStore.shield.applicationCategories = nil
+      managedStore.shield.webDomains = nil
+      return
+    }
+    managedStore.shield.applications = nil
+    managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
+    managedStore.shield.webDomains = nil
   }
 
   private func clearScheduleShield() {
@@ -298,8 +331,13 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   private func parseBlockConfig(_ dict: [String: Any]) -> MonitorBlockConfig? {
+    // #563 allowlist: `mode == "allow"` reads the kept apps from `allowedItems`; legacy reads the
+    // blocked apps from `blockedItems`.
+    let mode: BlockMode = (dict["mode"] as? String) == "allow" ? .allow : .block
     let rawItems: [[String: Any]]
-    if let blockedItems = dict["blockedItems"] as? [[String: Any]] {
+    if mode == .allow, let allowedItems = dict["allowedItems"] as? [[String: Any]] {
+      rawItems = allowedItems
+    } else if let blockedItems = dict["blockedItems"] as? [[String: Any]] {
       rawItems = blockedItems
     } else if let appSelections = dict["appSelections"] as? [[String: Any]] {
       rawItems = appSelections.map { item in
@@ -307,6 +345,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         normalized["type"] = "app"
         return normalized
       }
+    } else if mode == .allow {
+      rawItems = []
     } else {
       return nil
     }
@@ -337,7 +377,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
 
     let isActive = dict["isActive"] as? Bool ?? true
-    return MonitorBlockConfig(items: items, isActive: isActive)
+    return MonitorBlockConfig(items: items, isActive: isActive, mode: mode)
   }
 
   private func applyBlocks(_ config: MonitorBlockConfig) {
@@ -345,6 +385,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       store.shield.applications = nil
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
+      return
+    }
+
+    // #563 allowlist: shield every app except the kept ones (system apps are never shielded by iOS).
+    if config.mode == .allow {
+      applyAllowlistShield(store, allowed: config.items)
       return
     }
 
@@ -421,6 +467,13 @@ enum MonitorBlockedItemType: String {
   case webDomain
 }
 
+/// #563: block semantics (see the app module's BlockMode). `.allow` = keep the listed apps open,
+/// shield everything else via `.all(except:)`.
+enum BlockMode: String {
+  case block
+  case allow
+}
+
 struct MonitorBlockedItemInfo {
   let type: MonitorBlockedItemType
   let tokenId: String
@@ -432,6 +485,8 @@ struct MonitorBlockedItemInfo {
 struct MonitorBlockConfig {
   let items: [MonitorBlockedItemInfo]
   let isActive: Bool
+  // #563: block vs allow semantics for `items`.
+  let mode: BlockMode
 }
 
 /// One schedule window: local minute-of-day bounds (0..1439) plus the ISO weekdays

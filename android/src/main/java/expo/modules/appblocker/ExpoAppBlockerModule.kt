@@ -104,6 +104,15 @@ class ExpoAppBlockerModule : Module() {
       Log.d(TAG, "setBlockedApps: $packageNames")
     }
 
+    // #563 allowlist immediate blocking: shield every app EXCEPT `packageNames` (+ system-essential
+    // apps) while armed. An empty list clears the immediate block (release). Expiry is planted
+    // separately via setBlockExpiryAndroid, exactly like setBlockedApps.
+    Function("setAllowedAppsAndroid") { packageNames: List<String> ->
+      AppBlockerPrefs.setAllowedPackages(context, packageNames)
+      AppBlockerService.start(context)
+      Log.d(TAG, "setAllowedAppsAndroid: $packageNames")
+    }
+
     // Plant (or clear) the immediate block's auto-release time. Epoch millis; <= 0 clears
     // it. The service gates the immediate block on this and lazily clears it once passed,
     // and re-arming the boundary alarm makes it wake the service at the expiry instant so

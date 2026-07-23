@@ -29,6 +29,7 @@ export type {
   AndroidBlockableApp,
   IOSBlockedItem,
   IOSBlockConfiguration,
+  BlockMode,
   ScheduleWindow,
   IOSScheduleConfiguration,
   AndroidScheduleConfiguration,
@@ -132,6 +133,25 @@ export function setBlockedApps(
 ): void {
   if (Platform.OS !== "android") return;
   NativeModule.setBlockedApps(packageNames);
+  NativeModule.setBlockExpiryAndroid(options?.expiresAtMillis ?? 0);
+}
+
+/**
+ * #563 allowlist immediate blocking (Android only; no-op elsewhere). Shields every app EXCEPT
+ * `packageNames` (plus system-essential apps: launcher / system UI / dialer / IME / settings / the
+ * host app) while armed. An EMPTY array is the release signal — it clears the immediate block, so
+ * "allow nothing / block everything" can never be armed by accident.
+ *
+ * `options.expiresAtMillis` plants the same native wall-clock auto-release as {@link setBlockedApps}
+ * (kill-proof; released by the boundary alarm even if the process dies). The iOS allowlist path is
+ * {@link setBlockConfiguration} with `{ mode: "allow", allowedItems }`.
+ */
+export function setAllowedApps(
+  packageNames: string[],
+  options?: { expiresAtMillis?: number }
+): void {
+  if (Platform.OS !== "android") return;
+  NativeModule.setAllowedAppsAndroid(packageNames);
   NativeModule.setBlockExpiryAndroid(options?.expiresAtMillis ?? 0);
 }
 

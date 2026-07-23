@@ -491,8 +491,15 @@ public class ExpoAppBlockerModule: Module {
   // MARK: - Block Configuration
 
   private func parseBlockConfig(_ dict: [String: Any]) throws -> BlockConfig {
+    // #563 allowlist mode: `mode == "allow"` reinterprets the item set as the apps to KEEP OPEN;
+    // every other app is shielded. Absent/"block" → the original denylist (shield the listed apps).
+    let mode: BlockMode = (dict["mode"] as? String) == "allow" ? .allow : .block
+
     let rawItems: [[String: Any]]
-    if let blockedItems = dict["blockedItems"] as? [[String: Any]] {
+    // In allow mode the kept apps ride under `allowedItems`; in block mode under `blockedItems`.
+    if mode == .allow, let allowedItems = dict["allowedItems"] as? [[String: Any]] {
+      rawItems = allowedItems
+    } else if let blockedItems = dict["blockedItems"] as? [[String: Any]] {
       rawItems = blockedItems
     } else if let appSelections = dict["appSelections"] as? [[String: Any]] {
       rawItems = appSelections.map { item in
@@ -500,6 +507,9 @@ public class ExpoAppBlockerModule: Module {
         normalized["type"] = "app"
         return normalized
       }
+    } else if mode == .allow {
+      // Allow mode with no kept apps: valid shape (the app gates 0 → no lock), no items.
+      rawItems = []
     } else {
       throw NSError(domain: "AppBlocker", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing blockedItems"])
     }
@@ -522,7 +532,7 @@ public class ExpoAppBlockerModule: Module {
     // NSNumber. Absent → nil (no expiry, back-compat with callers that don't pass it).
     let expiresAtMillis = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue
 
-    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis)
+    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis, mode: mode)
   }
 
   /// Decode an array of raw item dicts (the `blockedItems` shape shared by immediate and
@@ -588,6 +598,14 @@ public class ExpoAppBlockerModule: Module {
       store.shield.applications = nil
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
+      return
+    }
+
+    // #563 allowlist: shield every app EXCEPT the kept (allowed) ones. iOS's Family Controls
+    // does not shield system-essential apps (Phone/Settings/…), so no explicit exception list is
+    // needed here — the except-set is just the user's allowed apps.
+    if config.mode == .allow {
+      applyAllowlistShield(store, allowed: config.items)
       return
     }
 
@@ -796,7 +814,10 @@ public class ExpoAppBlockerModule: Module {
   /// touched — the immediate-block `store` and the temporary-unlock activity are untouched.
   private func applyScheduleConfiguration(_ config: [String: Any]) {
     let windows = parseScheduleWindows(config)
-    let items = makeBlockedItems(from: (config["blockedItems"] as? [[String: Any]]) ?? [])
+    // #563 allowlist: read the kept apps from `allowedItems` (mode "allow") or the blocked apps
+    // from `blockedItems` (legacy). The shield policy is chosen by `mode` in `applyScheduleShield`.
+    let mode = scheduleMode(config)
+    let items = makeBlockedItems(from: scheduleItemsRaw(config, mode: mode))
 
     // Stop only previously-registered schedule activities (never the unlock activity), so
     // re-configuring with a different window count leaves no orphans.
@@ -847,10 +868,25 @@ public class ExpoAppBlockerModule: Module {
     // DeviceActivity only fires at interval boundaries, so if we're already inside a
     // window at configuration time, apply the shield now.
     if isAnyScheduleWindowActive(windows: windows, at: Date()) {
-      applyScheduleShield(items)
+      applyScheduleShield(items, mode: mode)
     } else {
       clearScheduleShield()
     }
+  }
+
+  /// #563: the schedule block mode ("allow" | "block"), read from the JS config dict. Absent → block
+  /// (legacy denylist), so an old config keeps its meaning.
+  private func scheduleMode(_ config: [String: Any]) -> BlockMode {
+    return (config["mode"] as? String) == "allow" ? .allow : .block
+  }
+
+  /// #563: the raw item dicts for the schedule shield — the kept apps (`allowedItems`) in allow
+  /// mode, the blocked apps (`blockedItems`) in legacy mode.
+  private func scheduleItemsRaw(_ config: [String: Any], mode: BlockMode) -> [[String: Any]] {
+    if mode == .allow {
+      return (config["allowedItems"] as? [[String: Any]]) ?? []
+    }
+    return (config["blockedItems"] as? [[String: Any]]) ?? []
   }
 
   /// Register one non-wrapping repeating DeviceActivity (no events — boundaries only).
@@ -890,17 +926,48 @@ public class ExpoAppBlockerModule: Module {
     sharedDefaults?.set(config, forKey: scheduleConfigStorageKey)
   }
 
-  private func applyScheduleShield(_ items: [BlockedItemInfo]) {
+  private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode) {
+    // #563 allowlist: an active window shields everything except the kept apps.
+    if mode == .allow {
+      applyAllowlistShield(scheduleStore, allowed: items)
+      return
+    }
     let apps = items.compactMap { $0.appToken }
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
-    scheduleStore.shield.applications = apps.isEmpty ? nil : Set(apps)
+    if apps.isEmpty {
+      scheduleStore.shield.applications = nil
+    } else {
+      scheduleStore.shield.applications = Set(apps)
+    }
     if categories.isEmpty {
       scheduleStore.shield.applicationCategories = nil
     } else {
       scheduleStore.shield.applicationCategories = .specific(Set(categories))
     }
-    scheduleStore.shield.webDomains = webDomains.isEmpty ? nil : Set(webDomains)
+    if webDomains.isEmpty {
+      scheduleStore.shield.webDomains = nil
+    } else {
+      scheduleStore.shield.webDomains = Set(webDomains)
+    }
+  }
+
+  /// #563 allowlist shield: shield every app in every category EXCEPT the kept (allowed) app
+  /// tokens. `ShieldSettings.ActivityCategoryPolicy.all(except:)` is the Family Controls primitive
+  /// for "block all but these". An empty allow set would mean "shield everything" — the app never
+  /// arms a lock with 0 allowed apps (0 = lock not possible), so we treat empty defensively as "no
+  /// shield" rather than a block-all footgun. iOS never shields the controlling app or system apps.
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo]) {
+    let allowedAppTokens = Set(items.compactMap { $0.appToken })
+    if allowedAppTokens.isEmpty {
+      managedStore.shield.applications = nil
+      managedStore.shield.applicationCategories = nil
+      managedStore.shield.webDomains = nil
+      return
+    }
+    managedStore.shield.applications = nil
+    managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
+    managedStore.shield.webDomains = nil
   }
 
   private func clearScheduleShield() {
@@ -1051,8 +1118,13 @@ public class ExpoAppBlockerModule: Module {
     var result: [String: Any] = [
       "blockedItems": blockedItems,
       "appSelections": appSelections,
-      "isActive": config.isActive
+      "isActive": config.isActive,
+      // #563: surface the block mode; in allow mode the item list is the kept (allowed) apps.
+      "mode": config.mode.rawValue
     ]
+    if config.mode == .allow {
+      result["allowedItems"] = blockedItems
+    }
 
     if let schedule = config.schedule {
       result["schedule"] = [
@@ -1274,6 +1346,13 @@ enum BlockedItemType: String {
   case webDomain
 }
 
+/// #563: block semantics. `.block` = shield the listed apps (legacy denylist). `.allow` = keep the
+/// listed apps open and shield everything else (allowlist, via `.all(except:)`).
+enum BlockMode: String {
+  case block
+  case allow
+}
+
 struct BlockedItemInfo {
   let type: BlockedItemType
   let tokenId: String
@@ -1293,6 +1372,8 @@ struct BlockConfig {
   let schedule: ScheduleInfo?
   // #535: optional wall-clock auto-release (epoch millis). nil / <= 0 = no expiry.
   let expiresAtMillis: Double?
+  // #563: block vs allow semantics for `items` (see BlockMode).
+  let mode: BlockMode
 }
 
 struct ScheduleInfo {
