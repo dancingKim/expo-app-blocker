@@ -810,9 +810,12 @@ public class ExpoAppBlockerModule: Module {
 
   // MARK: - Schedule-Window Blocking
 
-  /// Register one repeating DeviceActivity per window and immediately shield if a window
-  /// is already active. Only the schedule activities and the dedicated `scheduleStore` are
-  /// touched — the immediate-block `store` and the temporary-unlock activity are untouched.
+  /// #570 free-window inversion: each window is now a "free time" span the user may use freely;
+  /// while the schedule is armed, everything OUTSIDE the free windows is shielded and INSIDE a
+  /// window is fully open. Register one repeating DeviceActivity per window (boundary wake-ups),
+  /// then apply the shield now iff we are currently outside all free windows. Only the schedule
+  /// activities and the dedicated `scheduleStore` are touched — the immediate-block `store` and
+  /// the temporary-unlock activity are untouched.
   private func applyScheduleConfiguration(_ config: [String: Any]) {
     let windows = parseScheduleWindows(config)
     // #563 allowlist: read the kept apps from `allowedItems` (mode "allow") or the blocked apps
@@ -866,12 +869,16 @@ public class ExpoAppBlockerModule: Module {
       }
     }
 
-    // DeviceActivity only fires at interval boundaries, so if we're already inside a
-    // window at configuration time, apply the shield now.
-    if isAnyScheduleWindowActive(windows: windows, at: Date()) {
-      applyScheduleShield(items, mode: mode)
-    } else {
+    // #570 inversion: shield while OUTSIDE all free windows; open while inside one.
+    // DeviceActivity only fires at interval boundaries, so seed the initial state here.
+    // 0 windows = not armed (JS clears the config in that case) — clear defensively so an
+    // empty window set can never become a 24h lockdown (#570 S2 regression guard).
+    if windows.isEmpty {
       clearScheduleShield()
+    } else if isAnyScheduleWindowActive(windows: windows, at: Date()) {
+      clearScheduleShield()
+    } else {
+      applyScheduleShield(items, mode: mode)
     }
   }
 

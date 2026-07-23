@@ -145,14 +145,21 @@ class AppBlockerService : Service() {
     }
   }
 
-  // True when the app is blocked *by an active schedule window* right now. Schedule
-  // blocking is a pure time commitment — earned time never bypasses it (matches iOS,
-  // where the schedule ManagedSettingsStore is independent of temporary unlock).
+  // #570 free-window inversion: a schedule window is now "free time". While the schedule is armed
+  // (>= 1 window configured), everything OUTSIDE the free windows is blocked and inside a window is
+  // fully open. Schedule blocking is still a pure time commitment — earned time never bypasses the
+  // out-of-window block (matches iOS, where the schedule ManagedSettingsStore is independent of
+  // temporary unlock).
   //
-  // #563 allowlist: in "allow" mode an active window shields everything except the kept set
+  // Regression guard (#570 S2/S4): 0 windows = not armed → block nothing (an empty window set can
+  // never become a 24h lockdown); turning 시간표 off clears the windows, so an off schedule also
+  // blocks nothing.
+  //
+  // #563 allowlist: in "allow" mode the out-of-window block shields everything except the kept set
   // (+ system-essential apps); "block" mode is the legacy denylist.
   private fun isScheduleBlocked(packageName: String): Boolean {
-    if (!ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false
+    if (ScheduleStore.getWindows(this).isEmpty()) return false                          // not armed / off
+    if (ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false // inside a free window → open
     return when (ScheduleStore.getMode(this)) {
       AppBlockerPrefs.MODE_ALLOW ->
         packageName !in ScheduleStore.getSchedulePackages(this) && !isSystemEssential(packageName)

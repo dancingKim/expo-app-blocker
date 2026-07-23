@@ -99,9 +99,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   override func intervalDidEnd(for activity: DeviceActivityName) {
     super.intervalDidEnd(for: activity)
 
-    // A schedule window boundary: re-evaluate the union of all windows (this handles
-    // overlapping windows and weekday gating) and shield/clear the schedule store
-    // accordingly. Never runs the unlock daily-reset below.
+    // #570: a free window boundary — re-evaluate the union of all windows (handles overlaps and
+    // weekday gating). A free window just ended → now outside it → the shield is re-applied
+    // (intervalDidEnd = re-apply). Never runs the unlock daily-reset below.
     if activity.rawValue.hasPrefix(scheduleActivityPrefix) {
       reevaluateScheduleShield()
       return
@@ -126,8 +126,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    // A schedule window opened: re-evaluate and apply the schedule shield if any window
-    // is currently active (the opened one may be gated out by weekday).
+    // #570: a free window opened — re-evaluate. Now inside a free window → the shield is lifted
+    // (intervalDidStart = release); intervalDidEnd re-applies it. reevaluate handles overlaps and
+    // weekday gating (the opened window may be gated out by weekday).
     if activity.rawValue.hasPrefix(scheduleActivityPrefix) {
       reevaluateScheduleShield()
     }
@@ -198,13 +199,24 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // #563 allowlist: the kept apps ride under `allowedItems` (mode "allow") or `blockedItems`
     // (legacy). The mode picks the shield policy in applyScheduleShield.
     let mode: BlockMode = (dict["mode"] as? String) == "allow" ? .allow : .block
-    // #525: the active window's variant drives the shield copy. nil = no window active.
-    if let variant = activeScheduleVariant(windows: windows, at: Date()) {
-      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode)
-      defaults.set(variant, forKey: scheduleShieldVariantKey)
-    } else {
+    // #570 free-window inversion: a window = "free time". Shield everything OUTSIDE the free
+    // windows while armed; open (clear) while inside one. 0 windows = not armed → clear (never a
+    // 24h lockdown; JS clears the config in that case, this is the defensive backstop).
+    if windows.isEmpty {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
+      return
+    }
+    if activeScheduleVariant(windows: windows, at: Date()) != nil {
+      // Inside a free window → fully open.
+      clearScheduleShield()
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
+    } else {
+      // Outside all free windows → shield everything but the allowed apps. The gap shield always
+      // records the "schedule" (weekday, redirect-button) variant; the per-window bedtime/schedule
+      // tag no longer selects the shield (it was the in-window shield of the old lock model).
+      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode)
+      defaults.set("schedule", forKey: scheduleShieldVariantKey)
     }
   }
 
