@@ -2,6 +2,7 @@ import ManagedSettings
 import ManagedSettingsUI
 import UIKit
 import UserNotifications
+import os
 
 class ShieldActionExtension: ShieldActionDelegate {
   private let appGroupIdentifier = "APP_GROUP_PLACEHOLDER"
@@ -18,6 +19,17 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let interceptDebounceMs: Double = 2_000
   private let maxPendingIntercepts = 200
   private let pendingUnlockNotificationIdentifier = "expo.appblocker.pendingUnlock.local"
+  // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
+  // gives no API to open the container app from a ShieldAction, so the primary
+  // button posts a local notification whose tap deep-links home). When that
+  // notification never appears, the failure is one of: handler never fired |
+  // add() returned an error | add() succeeded but the system suppressed the
+  // banner (authorization / focus / shield-foreground). This single JSON key in
+  // the App Group records the last attempt (handlerFiredAt, addResult, addAt,
+  // authorizationStatus) so the container app — or Console via os_log — can
+  // attribute the miss on a real device. Cheap and permanent.
+  private let shieldActionProbeKey = "appBlocker.shieldActionProbe.v1"
+  private let probeLog = Logger(subsystem: "expo.appblocker", category: "ShieldAction")
   // Notification copy + behavior — configurable via plugin options so apps
   // can localize without forking. Defaults preserve the original English
   // copy and the icon attachment.
@@ -45,6 +57,10 @@ class ShieldActionExtension: ShieldActionDelegate {
     recordIntercept()
     switch action {
     case .primaryButtonPressed:
+      // #583 diagnostics: prove the handler fired before we even try to post.
+      // A later reader seeing addResult still "pending" knows the add()
+      // completion never returned.
+      recordProbeHandlerFired()
       setPendingUnlockFlag()
       schedulePendingUnlockNotification { didSchedule in
         let response: ShieldActionResponse = didSchedule ? .none : .defer
@@ -67,6 +83,111 @@ class ShieldActionExtension: ShieldActionDelegate {
 
     DispatchQueue.main.async {
       completionHandler(response)
+    }
+  }
+
+  // MARK: - #583 landing-notification diagnostics
+
+  /// Merge fields into the single App Group probe JSON (last-attempt snapshot).
+  private func writeProbe(_ fields: [String: Any]) {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    var probe: [String: Any] = [:]
+    if let json = defaults.string(forKey: shieldActionProbeKey),
+       let data = json.data(using: .utf8),
+       let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      probe = parsed
+    }
+    for (key, value) in fields { probe[key] = value }
+    if let data = try? JSONSerialization.data(withJSONObject: probe),
+       let json = String(data: data, encoding: .utf8) {
+      defaults.set(json, forKey: shieldActionProbeKey)
+    }
+    defaults.synchronize()
+  }
+
+  /// Record that primaryButtonPressed actually fired, with a provisional
+  /// addResult so an unread completion is distinguishable from a real outcome.
+  private func recordProbeHandlerFired() {
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+    writeProbe(["handlerFiredAt": nowMs, "addResult": "pending"])
+    probeLog.log("ShieldAction primaryButtonPressed handler fired @\(nowMs, privacy: .public)")
+  }
+
+  private func setPendingUnlockFlag() {
+    guard let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    sharedDefaults.set(true, forKey: pendingUnlockKey)
+    sharedDefaults.synchronize()
+
+    let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
+    CFNotificationCenterPostNotification(
+      notificationCenter,
+      CFNotificationName("expo.appblocker.pendingUnlock" as CFString),
+      nil,
+      nil,
+      true
+    )
+  }
+
+  private func schedulePendingUnlockNotification(completion: @escaping (Bool) -> Void) {
+    let center = UNUserNotificationCenter.current()
+
+    let content = UNMutableNotificationContent()
+    content.title = notificationTitle
+    content.body = notificationBody
+    content.sound = .default
+    // #583 candidate fix: a shield is on-screen (system UI) when this fires, so
+    // the container app's banner can be suppressed at the default (.active)
+    // level. .timeSensitive asks the system to break through. This only elevates
+    // when the extension carries the
+    // com.apple.developer.usernotifications.time-sensitive entitlement (added to
+    // ShieldAction's expo-target.config.js); without it the system silently
+    // downgrades to .active, so this line is safe to ship ahead of the App ID
+    // capability.
+    content.interruptionLevel = .timeSensitive
+    // #522: guardian landing payload. `kind` is the router's discriminator
+    // (mirrors notificationScheduler's reminder/timer/nudge convention); `link`
+    // is kept for back-compat. `itemId` is included only when the app armed the
+    // block for a known task.
+    var userInfo: [String: Any] = ["kind": "guardian", "link": "/unlock"]
+    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
+      sharedDefaults.synchronize()
+      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
+        userInfo["itemId"] = guardedItemId
+      }
+    }
+    content.userInfo = userInfo
+
+    // Attach the app icon to the notification only when the app opted in.
+    // When false the system app icon is the only icon shown — avoids the
+    // "duplicate icon" look on iOS notification banners.
+    if notificationAttachIcon, let iconURL = iconFileURL() {
+      if let attachment = try? UNNotificationAttachment(identifier: "icon", url: iconURL, options: nil) {
+        content.attachments = [attachment]
+      }
+    }
+
+    let request = UNNotificationRequest(
+      identifier: pendingUnlockNotificationIdentifier,
+      content: content,
+      trigger: nil
+    )
+
+    // #583 diagnostics: capture the authorization status the extension sees —
+    // a .denied / .notDetermined app can add() successfully yet show nothing.
+    center.getNotificationSettings { settings in
+      let authStatus = settings.authorizationStatus.rawValue
+      center.removePendingNotificationRequests(withIdentifiers: [self.pendingUnlockNotificationIdentifier])
+      center.add(request) { error in
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+        let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
+        self.writeProbe([
+          "addResult": addResult,
+          "addAt": nowMs,
+          "authorizationStatus": authStatus,
+        ])
+        self.probeLog.log("ShieldAction add() \(addResult, privacy: .public) authStatus=\(authStatus, privacy: .public)")
+        completion(error == nil)
+      }
     }
   }
 
@@ -96,62 +217,6 @@ class ShieldActionExtension: ShieldActionDelegate {
     }
     defaults.set(nowMs, forKey: lastInterceptTsKey)
     defaults.synchronize()
-  }
-
-  private func setPendingUnlockFlag() {
-    guard let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
-    sharedDefaults.set(true, forKey: pendingUnlockKey)
-    sharedDefaults.synchronize()
-
-    let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
-    CFNotificationCenterPostNotification(
-      notificationCenter,
-      CFNotificationName("expo.appblocker.pendingUnlock" as CFString),
-      nil,
-      nil,
-      true
-    )
-  }
-
-  private func schedulePendingUnlockNotification(completion: @escaping (Bool) -> Void) {
-    let center = UNUserNotificationCenter.current()
-
-    let content = UNMutableNotificationContent()
-    content.title = notificationTitle
-    content.body = notificationBody
-    content.sound = .default
-    // #522: guardian landing payload. `kind` is the router's discriminator
-    // (mirrors notificationScheduler's reminder/timer/nudge convention); `link`
-    // is kept for back-compat. `itemId` is included only when the app armed the
-    // block for a known task.
-    var userInfo: [String: Any] = ["kind": "guardian", "link": "/unlock"]
-    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
-      sharedDefaults.synchronize()
-      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
-        userInfo["itemId"] = guardedItemId
-      }
-    }
-    content.userInfo = userInfo
-
-    // Attach the app icon to the notification only when the app opted in.
-    // When false the system app icon is the only icon shown — avoids the
-    // "duplicate icon" look on iOS notification banners.
-    if notificationAttachIcon, let iconURL = iconFileURL() {
-      if let attachment = try? UNNotificationAttachment(identifier: "icon", url: iconURL, options: nil) {
-        content.attachments = [attachment]
-      }
-    }
-
-    let request = UNNotificationRequest(
-      identifier: pendingUnlockNotificationIdentifier,
-      content: content,
-      trigger: nil
-    )
-
-    center.removePendingNotificationRequests(withIdentifiers: [pendingUnlockNotificationIdentifier])
-    center.add(request) { error in
-      completion(error == nil)
-    }
   }
 
   private func iconFileURL() -> URL? {
