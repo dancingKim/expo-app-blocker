@@ -601,9 +601,10 @@ public class ExpoAppBlockerModule: Module {
       return
     }
 
-    // #563 allowlist: shield every app EXCEPT the kept (allowed) ones. iOS's Family Controls
-    // does not shield system-essential apps (Phone/Settings/…), so no explicit exception list is
-    // needed here — the except-set is just the user's allowed apps.
+    // #563 allowlist: shield every app EXCEPT the kept (allowed) ones. The except-set is the user's
+    // allowed apps; whether Family Controls also implicitly exempts system-essential apps
+    // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
+    // PR's manual-check list), so no explicit exception list is added here.
     if config.mode == .allow {
       applyAllowlistShield(store, allowed: config.items)
       return
@@ -954,9 +955,12 @@ public class ExpoAppBlockerModule: Module {
 
   /// #563 allowlist shield: shield every app in every category EXCEPT the kept (allowed) app
   /// tokens. `ShieldSettings.ActivityCategoryPolicy.all(except:)` is the Family Controls primitive
-  /// for "block all but these". An empty allow set would mean "shield everything" — the app never
-  /// arms a lock with 0 allowed apps (0 = lock not possible), so we treat empty defensively as "no
-  /// shield" rather than a block-all footgun. iOS never shields the controlling app or system apps.
+  /// for "block all but these". Only ApplicationTokens can go in the except-set — category/web
+  /// tokens can't, so the app layer refuses a selection that contains non-app items (they'd silently
+  /// drop out of `compactMap` here and shield everything). An empty allow set would mean "shield
+  /// everything" — the app never arms a lock with 0 allowed apps (0 = lock not possible), so we
+  /// treat empty defensively as "no shield" rather than a block-all footgun. Whether iOS implicitly
+  /// exempts the controlling app / system-essential apps is pending real-device verification.
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo]) {
     let allowedAppTokens = Set(items.compactMap { $0.appToken })
     if allowedAppTokens.isEmpty {

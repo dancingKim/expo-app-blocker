@@ -309,7 +309,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   /// #563 allowlist shield: shield every app EXCEPT the kept (allowed) app tokens via
-  /// `ShieldSettings.ActivityCategoryPolicy.all(except:)`. Empty allowed set → no shield (the app
+  /// `ShieldSettings.ActivityCategoryPolicy.all(except:)`. Only ApplicationTokens can go in the
+  /// except-set (the app layer refuses non-app selections). Empty allowed set → no shield (the app
   /// gates 0 allowed apps as "lock not possible", so empty is never a real block-all here).
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo]) {
     let allowedAppTokens = Set(items.compactMap { $0.appToken })
@@ -388,7 +389,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    // #563 allowlist: shield every app except the kept ones (system apps are never shielded by iOS).
+    // #563 allowlist: shield every app except the kept ones (whether iOS also exempts
+    // system-essential/controlling apps is pending real-device verification).
     if config.mode == .allow {
       applyAllowlistShield(store, allowed: config.items)
       return
