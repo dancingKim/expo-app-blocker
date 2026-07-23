@@ -15,6 +15,14 @@ class ShieldActionExtension: ShieldActionDelegate {
   // falls back to the current CTA (next/smallest). The *writer* of this key is
   // the enforcement slice, not this extension.
   private let guardedItemIdKey = "appBlocker.guardedItemId.v1"
+  // #572 Phase 0 spike: App Group diagnostic keys + notification identity for the
+  // "지금 필요해" secondary-button → local-notification probe. handlerTsKey proves the
+  // handler fired at all; addResultKey records the UNUserNotificationCenter.add()
+  // callback outcome so a missing banner can be attributed to (handler not called |
+  // add error | posted-but-not-shown).
+  private let spikeHandlerTsKey = "appBlocker.spike.g5.handlerTs.v1"
+  private let spikeAddResultKey = "appBlocker.spike.g5.addResult.v1"
+  private let spikeNotificationIdentifier = "expo.appblocker.spike.g5.reasonPrompt"
   private let interceptDebounceMs: Double = 2_000
   private let maxPendingIntercepts = 200
   private let pendingUnlockNotificationIdentifier = "expo.appblocker.pendingUnlock.local"
@@ -52,7 +60,12 @@ class ShieldActionExtension: ShieldActionDelegate {
       }
 
     case .secondaryButtonPressed:
-      complete(on: .close, completionHandler: completionHandler)
+      // #572 Phase 0 spike: record the handler fired, post a local notification
+      // from the extension, record the add() outcome, then close the shield.
+      recordSpikeHandlerCalled()
+      scheduleSpikeReasonNotification {
+        self.complete(on: .close, completionHandler: completionHandler)
+      }
 
     @unknown default:
       complete(on: .close, completionHandler: completionHandler)
@@ -68,6 +81,57 @@ class ShieldActionExtension: ShieldActionDelegate {
     DispatchQueue.main.async {
       completionHandler(response)
     }
+  }
+
+  // MARK: - #572 Phase 0 spike helpers
+
+  /// Record that the secondaryButtonPressed handler actually fired. Writes a
+  /// provisional add-result too, so a reader that later sees "add pending" knows
+  /// the add() completion never returned.
+  private func recordSpikeHandlerCalled() {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+    defaults.set(nowMs, forKey: spikeHandlerTsKey)
+    defaults.set("handler-called @\(nowMs); add pending", forKey: spikeAddResultKey)
+    defaults.synchronize()
+  }
+
+  /// Post an immediate local notification from the ShieldAction extension —
+  /// the capability #572 Phase 0 verifies on a real device.
+  private func scheduleSpikeReasonNotification(completion: @escaping () -> Void) {
+    let center = UNUserNotificationCenter.current()
+
+    let content = UNMutableNotificationContent()
+    content.title = "이유 하나만 적으면 열려"
+    content.body = "지금 왜 필요한지 한 줄만."
+    content.sound = .default
+    content.userInfo = ["kind": "guardian", "spike": "g5-shield-action-notify", "link": "/unlock"]
+
+    let request = UNNotificationRequest(
+      identifier: spikeNotificationIdentifier,
+      content: content,
+      trigger: nil
+    )
+
+    center.removePendingNotificationRequests(withIdentifiers: [spikeNotificationIdentifier])
+    center.add(request) { error in
+      self.recordSpikeAddResult(error: error)
+      completion()
+    }
+  }
+
+  /// Record the add() callback outcome — the core diagnostic for this spike.
+  private func recordSpikeAddResult(error: Error?) {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+    let result: String
+    if let error = error {
+      result = "add-error @\(nowMs): \(error.localizedDescription)"
+    } else {
+      result = "add-ok @\(nowMs)"
+    }
+    defaults.set(result, forKey: spikeAddResultKey)
+    defaults.synchronize()
   }
 
   /// Queue a block event (JSON-string queue in the App Group), debounced,

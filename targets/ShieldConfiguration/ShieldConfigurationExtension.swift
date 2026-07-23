@@ -157,7 +157,11 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     let baseSubtitle = focusShieldSubtitle() ?? shieldSubtitle
     let subtitle = baseSubtitle.replacingOccurrences(of: "{appName}", with: appName) + context
 
-    let hasSecondary = !shieldSecondaryButtonLabel.isEmpty && shieldSecondaryButtonLabel != "none"
+    // #572 Phase 0 spike: force-render the secondary "지금 필요해" escape button.
+    // The app plugin ships secondaryButtonLabel: null (→ "none"), so the normal
+    // placeholder path would hide it; hard-coding here guarantees the button that
+    // drives the ShieldAction secondaryButtonPressed local-notification probe.
+    let spikeSecondaryLabel = "지금 필요해"
 
     return ShieldConfiguration(
       backgroundBlurStyle: shieldBlurStyle,
@@ -167,7 +171,7 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
       subtitle: ShieldConfiguration.Label(text: subtitle, color: shieldSubtitleColor),
       primaryButtonLabel: ShieldConfiguration.Label(text: shieldPrimaryButtonLabel, color: .white),
       primaryButtonBackgroundColor: shieldPrimaryButtonColor,
-      secondaryButtonLabel: hasSecondary ? ShieldConfiguration.Label(text: shieldSecondaryButtonLabel, color: shieldSubtitleColor) : nil
+      secondaryButtonLabel: ShieldConfiguration.Label(text: spikeSecondaryLabel, color: shieldSubtitleColor)
     )
   }
 
