@@ -61,7 +61,10 @@ class AlarmReceiver : BroadcastReceiver() {
       // alarm only guarantees a tick fires at that instant even if the service was killed.
       val scheduleBoundary = ScheduleStore.nextBoundaryAfter(context, now)
       val blockExpiry = AppBlockerPrefs.getBlockExpiresAt(context).takeIf { it > now }
-      val next = listOfNotNull(scheduleBoundary, blockExpiry).minOrNull()
+      // #572: wake at the escape ticket's expiry too, so the block re-applies at that instant even if
+      // the service was killed while the ticket was open (setExactAndAllowWhileIdle below).
+      val suppressionEnd = AppBlockerPrefs.getSuppressionUntil(context).takeIf { it > now }
+      val next = listOfNotNull(scheduleBoundary, blockExpiry, suppressionEnd).minOrNull()
       if (next == null) {
         am.cancel(pi)
         return

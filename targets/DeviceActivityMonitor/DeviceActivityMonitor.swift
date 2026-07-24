@@ -36,6 +36,11 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // #535: the immediate-block wall-clock expiry DeviceActivity. Its interval STARTS at the expiry
   // instant, so intervalDidStart (below) is the kill-proof point to lift the immediate shield.
   private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
+  // #572 escape ticket: while `now < suppressionUntil` both shields stay down (the ticket is
+  // layer-agnostic). The suppression-expiry DeviceActivity's interval STARTS at that instant, so
+  // intervalDidStart is the kill-proof point to recompute the shields from the persisted config.
+  private let suppressionUntilKey = "appBlocker.suppressionUntil.v1"
+  private let suppressionExpiryActivityName = "appBlocker.suppressionExpiry"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -126,6 +131,13 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
+    // #572: the escape-ticket expiry fired. Drop the ticket and recompute BOTH shields from the
+    // persisted config — kill-proof re-application (the SSOT for re-lock, no RN timer involved).
+    if activity.rawValue == suppressionExpiryActivityName {
+      expireSuppressionIfDue()
+      return
+    }
+
     // #570: a free window opened — re-evaluate. Now inside a free window → the shield is lifted
     // (intervalDidStart = release); intervalDidEnd re-applies it. reevaluate handles overlaps and
     // weekday gating (the opened window may be gated out by weekday).
@@ -151,6 +163,53 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     defaults.removeObject(forKey: blockConfigStorageKey)
   }
 
+  // MARK: - Escape Ticket Suppression (#572)
+
+  /// True while an escape ticket is live (`now < suppressionUntil`). Shared with the app module's
+  /// gate so a ticket keeps every shield the monitor would apply down until it expires.
+  private func isSuppressed() -> Bool {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
+      return false
+    }
+    return Date().timeIntervalSince1970 * 1000.0 < until
+  }
+
+  /// #572: the escape-ticket window has passed. Drop the persisted ticket and recompute both shields
+  /// from the stored config (kill-proof re-application). Guards a spurious/early boundary fire.
+  private func expireSuppressionIfDue() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
+      return
+    }
+    guard Date().timeIntervalSince1970 * 1000.0 >= until else { return }
+    defaults.removeObject(forKey: suppressionUntilKey)
+    recomputeShieldsAfterSuppression()
+  }
+
+  /// Re-apply the immediate shield from the persisted config (unless its OWN wall-clock expiry has
+  /// passed → drop it) and re-evaluate the schedule window state. Runs only after the ticket flag is
+  /// cleared, so the gates in `reapplyBlockConfiguration` / `reevaluateScheduleShield` don't skip.
+  private func recomputeShieldsAfterSuppression() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    if let dict = defaults.dictionary(forKey: blockConfigStorageKey) {
+      let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue ?? 0
+      if expiry > 0, Date().timeIntervalSince1970 * 1000.0 >= expiry {
+        store.shield.applications = nil
+        store.shield.applicationCategories = nil
+        store.shield.webDomains = nil
+        defaults.removeObject(forKey: blockConfigStorageKey)
+      } else {
+        reapplyBlockConfiguration()
+      }
+    } else {
+      store.shield.applications = nil
+      store.shield.applicationCategories = nil
+      store.shield.webDomains = nil
+    }
+    reevaluateScheduleShield()
+  }
+
   /// Extract the threshold seconds from an event name like `appBlocker.usageStep.90`;
   /// 0 if the name is not a usage step.
   private func parseStepSeconds(from rawName: String) -> Int {
@@ -167,6 +226,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   private func reapplyBlockConfiguration() {
+    // #572: a live escape ticket keeps the shield down — never re-block while it is valid (e.g. a
+    // stray usage-step boundary). The monitor re-applies from this same path once the ticket expires.
+    if isSuppressed() { return }
+
     let userDefaults = sharedDefaults ?? UserDefaults.standard
 
     guard let configDict = userDefaults.dictionary(forKey: blockConfigStorageKey) else {
@@ -190,6 +253,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// `store` (immediate blocks) and the temporary-unlock state.
   private func reevaluateScheduleShield() {
     let defaults = sharedDefaults ?? UserDefaults.standard
+    // #572: a live escape ticket also suppresses the schedule shield — keep it down while valid.
+    if isSuppressed() {
+      clearScheduleShield()
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
+      return
+    }
     guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)

@@ -19,6 +19,11 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let interceptDebounceMs: Double = 2_000
   private let maxPendingIntercepts = 200
   private let pendingUnlockNotificationIdentifier = "expo.appblocker.pendingUnlock.local"
+  // #572 escape ticket ("지금 필요해", secondary button): a distinct local notification whose tap
+  // deep-links to the reason-writing screen. Kept separate from the primary landing notification so
+  // the two never replace each other. Payload contract (agreed with the mobile slice):
+  //   { kind: "guardian_escape", itemId?: <App Group guardedItemId, when armed> }
+  private let guardianEscapeNotificationIdentifier = "expo.appblocker.guardianEscape.local"
   // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
   // gives no API to open the container app from a ShieldAction, so the primary
   // button posts a local notification whose tap deep-links home). When that
@@ -68,7 +73,14 @@ class ShieldActionExtension: ShieldActionDelegate {
       }
 
     case .secondaryButtonPressed:
-      complete(on: .close, completionHandler: completionHandler)
+      // #572 escape ticket: post the escape landing notification (same 2-tap flow as primary —
+      // the OS gives no API to open the container app from a ShieldAction). Routes to the reason
+      // screen via the payload's kind; does NOT set the pendingUnlock flag (that is the earn path).
+      recordProbeEscapeHandlerFired()
+      scheduleEscapeNotification { didSchedule in
+        let response: ShieldActionResponse = didSchedule ? .none : .defer
+        self.complete(on: response, completionHandler: completionHandler)
+      }
 
     @unknown default:
       complete(on: .close, completionHandler: completionHandler)
@@ -186,6 +198,67 @@ class ShieldActionExtension: ShieldActionDelegate {
           "authorizationStatus": authStatus,
         ])
         self.probeLog.log("ShieldAction add() \(addResult, privacy: .public) authStatus=\(authStatus, privacy: .public)")
+        completion(error == nil)
+      }
+    }
+  }
+
+  // MARK: - #572 escape-notification diagnostics + posting
+
+  /// Record that secondaryButtonPressed actually fired, mirroring `recordProbeHandlerFired` but under
+  /// distinct probe keys so the escape diagnostics never overwrite the primary landing's.
+  private func recordProbeEscapeHandlerFired() {
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+    writeProbe(["escapeHandlerFiredAt": nowMs, "escapeAddResult": "pending"])
+    probeLog.log("ShieldAction secondaryButtonPressed handler fired @\(nowMs, privacy: .public)")
+  }
+
+  /// Post the escape landing notification. Reuses the app-configured landing copy (the banner is just
+  /// "open the app" — the actual escape UX is the in-app reason screen the payload routes to). The
+  /// payload `kind` is the router's discriminator; `itemId` rides only when the app armed the block
+  /// for a known task.
+  private func scheduleEscapeNotification(completion: @escaping (Bool) -> Void) {
+    let center = UNUserNotificationCenter.current()
+
+    let content = UNMutableNotificationContent()
+    content.title = notificationTitle
+    content.body = notificationBody
+    content.sound = .default
+    content.interruptionLevel = .timeSensitive
+
+    var userInfo: [String: Any] = ["kind": "guardian_escape"]
+    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
+      sharedDefaults.synchronize()
+      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
+        userInfo["itemId"] = guardedItemId
+      }
+    }
+    content.userInfo = userInfo
+
+    if notificationAttachIcon, let iconURL = iconFileURL() {
+      if let attachment = try? UNNotificationAttachment(identifier: "icon", url: iconURL, options: nil) {
+        content.attachments = [attachment]
+      }
+    }
+
+    let request = UNNotificationRequest(
+      identifier: guardianEscapeNotificationIdentifier,
+      content: content,
+      trigger: nil
+    )
+
+    center.getNotificationSettings { settings in
+      let authStatus = settings.authorizationStatus.rawValue
+      center.removePendingNotificationRequests(withIdentifiers: [self.guardianEscapeNotificationIdentifier])
+      center.add(request) { error in
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+        let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
+        self.writeProbe([
+          "escapeAddResult": addResult,
+          "escapeAddAt": nowMs,
+          "authorizationStatus": authStatus,
+        ])
+        self.probeLog.log("ShieldAction escape add() \(addResult, privacy: .public) authStatus=\(authStatus, privacy: .public)")
         completion(error == nil)
       }
     }

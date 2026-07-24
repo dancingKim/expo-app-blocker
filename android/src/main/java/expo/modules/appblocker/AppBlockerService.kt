@@ -44,8 +44,19 @@ class AppBlockerService : Service() {
 
   private fun tick() {
     maybeExpireImmediateBlock()
+    maybeExpireSuppression()
     getCurrentForegroundPackage()?.let { currentForeground = it }
     val foreground = currentForeground
+
+    // #572 escape ticket: a valid ticket suppresses ALL blocking (immediate + schedule), independent
+    // of the lock layers — keep every app open while it is live. On the first tick after it expires
+    // (maybeExpireSuppression cleared the pref above) this is false, so the block re-applies then.
+    if (AppBlockerPrefs.isSuppressed(this)) {
+      consumingSinceMs = 0L
+      clearBlock()
+      lastForegroundPackage = foreground
+      return
+    }
 
     if (foreground == null || !isBlocked(foreground)) {
       // Outside any blocked app: pause consumption and drop any active block.
@@ -103,6 +114,16 @@ class AppBlockerService : Service() {
       Log.d(TAG, "Immediate block auto-release time reached ($expiry) — clearing")
       // #563: clear whichever mode is armed (allowlist or legacy denylist) so release is complete.
       AppBlockerPrefs.clearImmediateBlock(this)
+    }
+  }
+
+  // #572: drop an escape ticket once its wall-clock instant has passed so the next tick re-blocks
+  // (and a stale timestamp never lingers). Independent of the immediate-block expiry above.
+  private fun maybeExpireSuppression() {
+    val until = AppBlockerPrefs.getSuppressionUntil(this)
+    if (until != 0L && System.currentTimeMillis() >= until) {
+      Log.d(TAG, "Escape ticket expired ($until) — clearing suppression")
+      AppBlockerPrefs.clearSuppression(this)
     }
   }
 

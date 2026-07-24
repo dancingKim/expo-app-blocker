@@ -45,6 +45,14 @@ public class ExpoAppBlockerModule: Module {
   // The interval's START is the expiry instant (intervalDidStart), so short blocks work despite
   // DeviceActivity's ~15-minute minimum interval length (only the start boundary matters).
   private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
+  // G5 escape ticket (#572). A wall-clock suppression window independent of EVERY lock layer
+  // (immediate / schedule / focus / earn): while `now < suppressionUntil`, both shields stay down —
+  // "차단됨 = 잠금 AND NOT 유효티켓" in the door-state formula. At the instant a one-shot
+  // DeviceActivity fires and the monitor recomputes the shields from the persisted config
+  // (kill-proof, mirroring the immediate-expiry backstop). Persisted in the App Group too so the
+  // monitor extension can read it. Absent key = never suppressed = original behavior (back-compat).
+  private let suppressionUntilKey = "appBlocker.suppressionUntil.v1"
+  private let suppressionExpiryActivityName = "appBlocker.suppressionExpiry"
   // DeviceActivity requires a monitored interval to be at least ~15 minutes. A
   // cross-midnight split fragment shorter than this is skipped (the evaluator still
   // corrects the shield at the next boundary that fires).
@@ -239,6 +247,7 @@ public class ExpoAppBlockerModule: Module {
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
         self.cancelImmediateExpiryActivity()  // #535: drop any pending wall-clock expiry
+        self.clearSuppressionState()          // #572: tearing down blocks drops any escape ticket
         self.store.shield.applications = nil
         self.store.shield.applicationCategories = nil
         self.store.shield.webDomains = nil
@@ -360,6 +369,57 @@ public class ExpoAppBlockerModule: Module {
           promise.resolve(["locked": true])
         }
       }
+    }
+
+    // MARK: Escape ticket suppression (#572)
+
+    // Suppress ALL blocking (immediate + schedule) until `untilMillis` (epoch ms), independent of
+    // every lock layer, then auto-re-apply from the stored config. Distinct from `temporaryUnlock`
+    // (earn): that is usage-based and never touches the schedule store; this is a wall-clock window
+    // that lowers BOTH stores and is re-applied by the monitor at the expiry instant (kill-proof).
+    AsyncFunction("suppressBlocks") { (untilMillis: Double, promise: Promise) in
+      self.stateQueue.async {
+        self.ensureLoadedPersistedConfig()
+        let nowMillis = Date().timeIntervalSince1970 * 1000.0
+        // Already-expired / absent target = no-op: never lower a shield without a live window.
+        guard untilMillis > nowMillis else {
+          DispatchQueue.main.async {
+            promise.resolve(["active": false, "untilMillis": 0, "remainingMs": 0])
+          }
+          return
+        }
+
+        self.sharedDefaults?.set(untilMillis, forKey: self.suppressionUntilKey)
+        self.userDefaults.set(untilMillis, forKey: self.suppressionUntilKey)
+
+        // Lower both shields now — the ticket is layer-agnostic suppression.
+        DispatchQueue.main.async {
+          self.store.shield.applications = nil
+          self.store.shield.applicationCategories = nil
+          self.store.shield.webDomains = nil
+          self.scheduleStore.shield.applications = nil
+          self.scheduleStore.shield.applicationCategories = nil
+          self.scheduleStore.shield.webDomains = nil
+        }
+
+        // Kill-proof re-application: a one-shot DeviceActivity fires at the expiry instant and the
+        // monitor recomputes the shields from the persisted config (RN timers must not re-lock).
+        self.updateSuppressionExpiryMonitoring(untilMillis: untilMillis)
+
+        DispatchQueue.main.async {
+          promise.resolve([
+            "active": true,
+            "untilMillis": untilMillis,
+            "remainingMs": Int(untilMillis - nowMillis)
+          ])
+        }
+      }
+    }
+
+    // Current escape-ticket state (remaining ms) for the door card '열림 · 타이머 N분' display. An
+    // already-expired ticket reads back inactive.
+    Function("getSuppressionState") { () -> [String: Any] in
+      return self.suppressionState()
     }
 
     // MARK: Schedule-window blocking
@@ -625,6 +685,15 @@ public class ExpoAppBlockerModule: Module {
       return
     }
 
+    // #572: a live escape ticket suppresses the immediate shield (layer-agnostic). Keep it down;
+    // the monitor re-applies from this same config when the ticket expires.
+    if isSuppressedInternal() {
+      store.shield.applications = nil
+      store.shield.applicationCategories = nil
+      store.shield.webDomains = nil
+      return
+    }
+
     // #563 allowlist: shield every app EXCEPT the kept (allowed) ones. The except-set is the user's
     // allowed apps; whether Family Controls also implicitly exempts system-essential apps
     // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
@@ -832,6 +901,90 @@ public class ExpoAppBlockerModule: Module {
     activityCenter.stopMonitoring([DeviceActivityName(immediateExpiryActivityName)])
   }
 
+  // MARK: - Escape Ticket Suppression (#572)
+
+  /// The current escape-ticket state: `active` (a live window), `untilMillis` (the wall-clock end),
+  /// and `remainingMs`. Reads back inactive once the window has passed (self-cleaning for the host).
+  private func suppressionState() -> [String: Any] {
+    let until = (sharedDefaults?.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue
+      ?? (userDefaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue ?? 0
+    let nowMillis = Date().timeIntervalSince1970 * 1000.0
+    let remaining = until - nowMillis
+    if until <= 0 || remaining <= 0 {
+      return ["active": false, "untilMillis": 0, "remainingMs": 0]
+    }
+    return ["active": true, "untilMillis": until, "remainingMs": Int(remaining)]
+  }
+
+  /// True while an escape ticket is live (`now < suppressionUntil`). The shield-apply paths gate on
+  /// this so a ticket keeps every shield down regardless of the lock layers.
+  private func isSuppressedInternal() -> Bool {
+    let until = (sharedDefaults?.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue
+      ?? (userDefaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue ?? 0
+    guard until > 0 else { return false }
+    return Date().timeIntervalSince1970 * 1000.0 < until
+  }
+
+  /// Drop the persisted ticket and cancel its expiry DeviceActivity. Called on block teardown so a
+  /// dangling ticket / orphan activity can't outlive the blocks it suppressed.
+  private func clearSuppressionState() {
+    sharedDefaults?.removeObject(forKey: suppressionUntilKey)
+    userDefaults.removeObject(forKey: suppressionUntilKey)
+    cancelSuppressionExpiryActivity()
+  }
+
+  /// (Re)arm the one-shot DeviceActivity that fires at the ticket's expiry instant so the monitor
+  /// re-applies the shields even if the host app is force-quit — same pattern as the immediate
+  /// wall-clock expiry. Same-day only (a DeviceActivitySchedule interval is a time-of-day window);
+  /// a cross-midnight ticket falls back to the app-foreground re-apply (applyBlocks' gate clears
+  /// once `isSuppressedInternal` goes false).
+  private func updateSuppressionExpiryMonitoring(untilMillis: Double) {
+    cancelSuppressionExpiryActivity()
+    let expiryDate = Date(timeIntervalSince1970: untilMillis / 1000.0)
+    let now = Date()
+    guard expiryDate > now else { return }
+    guard Calendar.current.isDate(expiryDate, inSameDayAs: now) else {
+      print("[AppBlocker] suppression expiry crosses midnight — relying on foreground re-apply")
+      return
+    }
+    startSuppressionExpiryMonitoring(expiresAt: expiryDate)
+  }
+
+  /// Register the one-shot expiry DeviceActivity (interval STARTS at the expiry instant, so only its
+  /// start boundary matters — padded past DeviceActivity's ~15-minute minimum length).
+  private func startSuppressionExpiryMonitoring(expiresAt: Date) {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+
+    let startComps = Calendar.current.dateComponents([.hour, .minute, .second], from: expiresAt)
+    let startMinute = (startComps.hour ?? 0) * 60 + (startComps.minute ?? 0)
+    let endMinute = startMinute + minScheduleIntervalMinutes + 1
+    guard endMinute <= 23 * 60 + 59 else {
+      print("[AppBlocker] suppression expiry within ~16m of midnight — relying on foreground re-apply")
+      return
+    }
+    let schedule = DeviceActivitySchedule(
+      intervalStart: startComps,
+      intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
+      repeats: false
+    )
+    do {
+      try activityCenter.startMonitoring(
+        DeviceActivityName(suppressionExpiryActivityName),
+        during: schedule,
+        events: [:]
+      )
+    } catch {
+      print("[AppBlocker] suppression-expiry startMonitoring failed: \(error.localizedDescription)")
+    }
+  }
+
+  private func cancelSuppressionExpiryActivity() {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+    activityCenter.stopMonitoring([DeviceActivityName(suppressionExpiryActivityName)])
+  }
+
   // MARK: - Schedule-Window Blocking
 
   /// #570 free-window inversion: each window is now a "free time" span the user may use freely;
@@ -897,7 +1050,9 @@ public class ExpoAppBlockerModule: Module {
     // DeviceActivity only fires at interval boundaries, so seed the initial state here.
     // 0 windows = not armed (JS clears the config in that case) — clear defensively so an
     // empty window set can never become a 24h lockdown (#570 S2 regression guard).
-    if windows.isEmpty {
+    // #572: a live escape ticket also suppresses the schedule shield (the ticket is the only escape
+    // for an out-of-window schedule lock). Keep it down; the monitor re-evaluates on ticket expiry.
+    if isSuppressedInternal() || windows.isEmpty {
       clearScheduleShield()
     } else if isAnyScheduleWindowActive(windows: windows, at: Date()) {
       clearScheduleShield()
@@ -940,6 +1095,7 @@ public class ExpoAppBlockerModule: Module {
   private func clearScheduleConfigurationInternal() {
     stopScheduleActivities()
     clearScheduleShield()
+    clearSuppressionState()  // #572: tearing down the schedule drops any escape ticket
     userDefaults.removeObject(forKey: scheduleConfigStorageKey)
     sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
   }

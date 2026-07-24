@@ -17,6 +17,7 @@ import type {
   ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
+  SuppressionState,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
@@ -36,6 +37,7 @@ export type {
   ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
+  SuppressionState,
   ShieldConfig,
   AndroidConfig,
   PluginConfig,
@@ -341,6 +343,55 @@ export async function relockApps(): Promise<RelockResult> {
 export function checkAndClearPendingUnlock(): boolean {
   if (Platform.OS !== "ios") return false;
   return NativeModule.checkAndClearPendingUnlock();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Escape ticket suppression (#572) — both platforms, same JS API
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Suppress ALL blocking (immediate + schedule) until `untilMillis` (epoch ms), independent of every
+ * lock layer, then auto-re-apply from the stored config. Distinct from {@link temporaryUnlock}
+ * (earn), which is usage-based and never touches schedule blocking: this is a wall-clock window that
+ * lowers both shields and is re-applied **natively at the expiry instant even if the app is killed**
+ * (iOS: a one-shot `DeviceActivity` → the monitor recomputes; Android: the boundary alarm wakes the
+ * service to re-block). Do not re-lock with a JS timer — that is lost when the OS kills the app.
+ *
+ * A `untilMillis` at/​before now is a no-op (never lowers a shield without a live window). Calling
+ * again replaces the active ticket. Clearing the blocks ({@link clearAllBlocks} /
+ * {@link clearScheduleConfiguration}) also drops the ticket.
+ */
+export async function suppressBlocks(options: {
+  untilMillis: number;
+}): Promise<SuppressionState> {
+  const { untilMillis } = options;
+  if (Platform.OS === "android") {
+    NativeModule.suppressBlocksAndroid(untilMillis);
+    const now = Date.now();
+    return {
+      active: untilMillis > now,
+      untilMillis,
+      remainingMs: Math.max(0, untilMillis - now),
+    };
+  }
+  if (Platform.OS === "ios") {
+    return NativeModule.suppressBlocks(untilMillis);
+  }
+  return { active: false, untilMillis: 0, remainingMs: 0 };
+}
+
+/**
+ * The current escape-ticket state (`remainingMs` in milliseconds), for the door card
+ * '열림 · 타이머 N분' display. Reads back inactive once the ticket has expired.
+ */
+export function getSuppressionState(): SuppressionState {
+  if (Platform.OS === "android") {
+    return NativeModule.getSuppressionStateAndroid();
+  }
+  if (Platform.OS === "ios") {
+    return NativeModule.getSuppressionState();
+  }
+  return { active: false, untilMillis: 0, remainingMs: 0 };
 }
 
 /**

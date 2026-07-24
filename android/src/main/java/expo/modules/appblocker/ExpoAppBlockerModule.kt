@@ -155,6 +155,8 @@ class ExpoAppBlockerModule : Module() {
 
     Function("clearScheduleConfiguration") {
       ScheduleStore.clear(context)
+      // #572: tearing down the schedule drops any escape ticket so it can't outlive the blocks.
+      AppBlockerPrefs.clearSuppression(context)
       AlarmReceiver.cancel(context)
       Log.d(TAG, "clearScheduleConfiguration")
     }
@@ -189,6 +191,28 @@ class ExpoAppBlockerModule : Module() {
 
     Function("getRemainingUnlockTimeAndroid") {
       TemporaryUnlockController.remainingSeconds(context)
+    }
+
+    // #572 escape ticket: suppress ALL blocking (immediate + schedule) until untilMillis (epoch ms),
+    // independent of the lock layers. The service tick honors it; the boundary alarm re-blocks at T
+    // even if the service was killed. Epoch ms arrives as a Double (overflows Int), like
+    // setBlockExpiryAndroid.
+    Function("suppressBlocksAndroid") { untilMillis: Double ->
+      AppBlockerPrefs.setSuppressionUntil(context, untilMillis.toLong())
+      AlarmReceiver.scheduleNext(context)
+      AppBlockerService.start(context)
+      Log.d(TAG, "suppressBlocksAndroid: $untilMillis")
+    }
+
+    // #572: current escape-ticket state (remaining ms) for the door card '열림 · 타이머 N분' display.
+    Function("getSuppressionStateAndroid") {
+      val until = AppBlockerPrefs.getSuppressionUntil(context)
+      val remaining = (until - System.currentTimeMillis()).coerceAtLeast(0L)
+      mapOf(
+        "active" to (remaining > 0L),
+        "untilMillis" to until.toDouble(),
+        "remainingMs" to remaining.toDouble(),
+      )
     }
 
     // Last-resort recovery for an unrecoverable native state (observed:

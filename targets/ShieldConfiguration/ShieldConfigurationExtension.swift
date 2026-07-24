@@ -65,6 +65,11 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   private func scheduleShieldConfig() -> ShieldConfiguration? {
     guard let variant = scheduleShieldVariant() else { return nil }
     let bedtime = variant == "bedtime"
+    // #572: the escape ticket is the ONLY way out of an out-of-window schedule lock, so the weekday
+    // shield offers the same "지금 필요해" secondary button as the default/focus shield (when the app
+    // configured it; "none"/empty hides it — back-compat). Bedtime stays button-less (pure time
+    // promise, auto-release at the window's end).
+    let hasSecondary = !shieldSecondaryButtonLabel.isEmpty && shieldSecondaryButtonLabel != "none"
     return ShieldConfiguration(
       backgroundBlurStyle: shieldBlurStyle,
       backgroundColor: shieldBackgroundColor,
@@ -74,7 +79,7 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
       // Bedtime: no buttons (time promise, auto-release at window end). Weekday: redirect button.
       primaryButtonLabel: bedtime ? nil : ShieldConfiguration.Label(text: shieldPrimaryButtonLabel, color: .white),
       primaryButtonBackgroundColor: bedtime ? nil : shieldPrimaryButtonColor,
-      secondaryButtonLabel: nil
+      secondaryButtonLabel: (!bedtime && hasSecondary) ? ShieldConfiguration.Label(text: shieldSecondaryButtonLabel, color: shieldSubtitleColor) : nil
     )
   }
 

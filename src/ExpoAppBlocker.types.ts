@@ -138,6 +138,16 @@ export interface RelockResult {
   locked: boolean;
 }
 
+/**
+ * #572 escape ticket state. `untilMillis` is the wall-clock end (epoch ms); `remainingMs` is
+ * milliseconds left (0 once expired). `active` is `remainingMs > 0`.
+ */
+export interface SuppressionState {
+  active: boolean;
+  untilMillis: number;
+  remainingMs: number;
+}
+
 export interface FamilyActivityPickerSelectionEvent {
   /** Selected apps, categories, and web domains (pass to setBlockConfiguration) */
   items: IOSBlockedItem[];

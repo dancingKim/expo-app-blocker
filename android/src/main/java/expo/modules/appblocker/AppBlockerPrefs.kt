@@ -20,6 +20,10 @@ object AppBlockerPrefs {
   const val MODE_ALLOW = "allow"
   const val MODE_BLOCK = "block"
   private const val KEY_BLOCK_EXPIRES_AT = "block_expires_at_millis"
+  // #572 escape ticket: a wall-clock instant until which ALL blocking (immediate + schedule) is
+  // suppressed, independent of the lock layers. 0 = no ticket. The service tick honors it; the
+  // boundary alarm wakes the service at this instant to re-block even if the service had been killed.
+  private const val KEY_SUPPRESSION_UNTIL = "suppression_until_millis"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
   private const val KEY_OVERLAY_BG_COLOR = "overlay_bg_color"
@@ -129,6 +133,28 @@ object AppBlockerPrefs {
     get(context).edit()
       .putLong(KEY_BLOCK_EXPIRES_AT, if (expiresAtMillis > 0L) expiresAtMillis else 0L)
       .apply()
+  }
+
+  /** #572: the escape-ticket end instant (epoch millis); 0 means no ticket. */
+  fun getSuppressionUntil(context: Context): Long =
+    get(context).getLong(KEY_SUPPRESSION_UNTIL, 0L)
+
+  /** #572: plant/clear the escape-ticket end instant. Any value <= 0 clears it (no ticket). */
+  fun setSuppressionUntil(context: Context, untilMillis: Long) {
+    get(context).edit()
+      .putLong(KEY_SUPPRESSION_UNTIL, if (untilMillis > 0L) untilMillis else 0L)
+      .apply()
+  }
+
+  /** #572: drop the escape ticket. */
+  fun clearSuppression(context: Context) {
+    get(context).edit().remove(KEY_SUPPRESSION_UNTIL).apply()
+  }
+
+  /** #572: true while an escape ticket is live (`now < suppressionUntil`). */
+  fun isSuppressed(context: Context): Boolean {
+    val until = getSuppressionUntil(context)
+    return until > 0L && System.currentTimeMillis() < until
   }
 
   /**
