@@ -46,13 +46,11 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   private let shieldTitleColor = UIColor(red: SHIELD_TITLE_R_PLACEHOLDER, green: SHIELD_TITLE_G_PLACEHOLDER, blue: SHIELD_TITLE_B_PLACEHOLDER, alpha: 1.0)
   private let shieldSubtitleColor = UIColor(red: SHIELD_SUBTITLE_R_PLACEHOLDER, green: SHIELD_SUBTITLE_G_PLACEHOLDER, blue: SHIELD_SUBTITLE_B_PLACEHOLDER, alpha: 1.0)
   // #525 schedule-window shield copy — hand-synced with guardianCopy.ts schedule.*ShieldTitle/
-  // Subtitle. Weekday: keeps the "하러 가기" redirect button (NOT an unlock — the schedule store
-  // survives the unlock path, so the button only returns to the app). Bedtime: sleepy, no
-  // buttons, auto-releases at the window's end (pure time promise).
+  // Subtitle. Keeps the "하러 가기" redirect button (NOT an unlock — the schedule store survives the
+  // unlock path, so the button only returns to the app). (#588: the bedtime preset was removed by
+  // #570's free-window inversion, so there is only the one weekday shield now.)
   private let scheduleWeekdayTitle = "지금은 나랑 있자."
   private let scheduleWeekdaySubtitle = "문은 이따 열려."
-  private let scheduleBedtimeTitle = "지금은 잘 시간이야."
-  private let scheduleBedtimeSubtitle = "내일 또 하자."
 
   private var mascotIcon: UIImage? {
     let bundle = Bundle(for: type(of: self))
@@ -77,9 +75,10 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     return value
   }
 
-  // #525: the active schedule window's variant ("bedtime" | "schedule"), written by the
-  // DeviceActivity monitor (the SSOT for which window is active). nil = not inside a window,
-  // so the default/focus shield path renders instead.
+  // #525: whether a schedule window is currently active — the DeviceActivity monitor writes
+  // "schedule" while out of every free window, and removes the key while inside one (or unarmed).
+  // nil = not shielded by the schedule, so the default/focus shield path renders instead.
+  // (#588: the value is always "schedule" now — #570 removed the bedtime preset.)
   private func scheduleShieldVariant() -> String? {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return nil }
     guard let value = defaults.string(forKey: "appBlocker.scheduleShieldVariant.v1"), !value.isEmpty else { return nil }
@@ -87,23 +86,20 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   }
 
   private func scheduleShieldConfig() -> ShieldConfiguration? {
-    guard let variant = scheduleShieldVariant() else { return nil }
-    let bedtime = variant == "bedtime"
-    // #572: the escape ticket is the ONLY way out of an out-of-window schedule lock, so the weekday
+    guard scheduleShieldVariant() != nil else { return nil }
+    // #572: the escape ticket is the ONLY way out of an out-of-window schedule lock, so the schedule
     // shield offers the same "지금 필요해" secondary button as the default/focus shield (when the app
-    // configured it; "none"/empty hides it — back-compat). Bedtime stays button-less (pure time
-    // promise, auto-release at the window's end).
+    // configured it; "none"/empty hides it — back-compat).
     let hasSecondary = !shieldSecondaryButtonLabel.isEmpty && shieldSecondaryButtonLabel != "none"
     return ShieldConfiguration(
       backgroundBlurStyle: shieldBlurStyle,
       backgroundColor: shieldBackgroundColor,
       icon: mascotIcon,
-      title: ShieldConfiguration.Label(text: bedtime ? scheduleBedtimeTitle : scheduleWeekdayTitle, color: shieldTitleColor),
-      subtitle: ShieldConfiguration.Label(text: bedtime ? scheduleBedtimeSubtitle : scheduleWeekdaySubtitle, color: shieldSubtitleColor),
-      // Bedtime: no buttons (time promise, auto-release at window end). Weekday: redirect button.
-      primaryButtonLabel: bedtime ? nil : ShieldConfiguration.Label(text: shieldPrimaryButtonLabel, color: .white),
-      primaryButtonBackgroundColor: bedtime ? nil : shieldPrimaryButtonColor,
-      secondaryButtonLabel: (!bedtime && hasSecondary) ? ShieldConfiguration.Label(text: shieldSecondaryButtonLabel, color: shieldSubtitleColor) : nil
+      title: ShieldConfiguration.Label(text: scheduleWeekdayTitle, color: shieldTitleColor),
+      subtitle: ShieldConfiguration.Label(text: scheduleWeekdaySubtitle, color: shieldSubtitleColor),
+      primaryButtonLabel: ShieldConfiguration.Label(text: shieldPrimaryButtonLabel, color: .white),
+      primaryButtonBackgroundColor: shieldPrimaryButtonColor,
+      secondaryButtonLabel: hasSecondary ? ShieldConfiguration.Label(text: shieldSecondaryButtonLabel, color: shieldSubtitleColor) : nil
     )
   }
 
@@ -171,9 +167,8 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     // (debounced) for the app to drain.
     recordIntercept(appName: appName)
 
-    // #525: inside a schedule window → render the sleepy (bedtime) / weekday variant. The
-    // monitor's variant key is the SSOT; outside every window it's absent → fall through to
-    // the default/focus shield below.
+    // #525: out of every free window → render the weekday schedule shield. The monitor's variant key
+    // is the SSOT; inside a window (or unarmed) it's absent → fall through to the default/focus shield.
     if let scheduleConfig = scheduleShieldConfig() {
       return scheduleConfig
     }

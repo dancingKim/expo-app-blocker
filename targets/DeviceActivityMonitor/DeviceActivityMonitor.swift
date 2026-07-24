@@ -27,11 +27,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // with `store` and independent of the temporary-unlock logic.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
-  // #525: the shield variant of the currently-active schedule window ("bedtime" | "schedule").
-  // The monitor is the SSOT for which window is active, so it records the variant here on shield
-  // apply; ShieldConfiguration reads it to render the sleepy (bedtime) vs weekday shield. Removed
-  // when no window is active. The per-window "variant" tag rides in the App Group schedule config
-  // (the module persists the raw config dict, so JS-supplied fields survive).
+  // #525: whether the schedule (gap) shield is up. The monitor is the SSOT for window state, so it
+  // records "schedule" here while out of every free window and removes the key while inside one (or
+  // unarmed); ShieldConfiguration reads it to render the weekday schedule shield. (#588: always
+  // "schedule" now — #570 removed the bedtime preset, so there is only one schedule shield.)
   private let scheduleShieldVariantKey = "appBlocker.scheduleShieldVariant.v1"
   // #535: the immediate-block wall-clock expiry DeviceActivity. Its interval STARTS at the expiry
   // instant, so intervalDidStart (below) is the kill-proof point to lift the immediate shield.
@@ -272,7 +271,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else { return "no-schedule-config" }
     let windows = parseScheduleWindows(dict)
     if windows.isEmpty { return "schedule-not-armed" }
-    if activeScheduleVariant(windows: windows, at: Date()) != nil { return "schedule-open-window" }
+    if isInsideAnyScheduleWindow(windows: windows, at: Date()) { return "schedule-open-window" }
     return "reapplied-schedule-shield"
   }
 
@@ -374,14 +373,14 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       defaults.removeObject(forKey: scheduleShieldVariantKey)
       return
     }
-    if activeScheduleVariant(windows: windows, at: Date()) != nil {
+    if isInsideAnyScheduleWindow(windows: windows, at: Date()) {
       // Inside a free window → fully open.
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
     } else {
       // Outside all free windows → shield everything but the allowed apps (minus the escaped app for
-      // a targeted ticket). The gap shield always records the "schedule" (weekday, redirect-button)
-      // variant; the per-window bedtime/schedule tag no longer selects the shield.
+      // a targeted ticket). The gap shield always records the "schedule" variant (weekday shield,
+      // redirect + escape buttons) — the only schedule shield since #570.
       applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode, exempt: exempt)
       defaults.set("schedule", forKey: scheduleShieldVariantKey)
     }
@@ -395,10 +394,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         return nil
       }
       let weekdays = (window["weekdays"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
-      // #525: variant tag rides in the JS-supplied window ("bedtime" for the sleep preset,
-      // "schedule" for weekday windows). Missing → treat as a plain weekday window.
-      let variant = (window["variant"] as? String) ?? "schedule"
-      return MonitorScheduleWindow(startMinute: start, endMinute: end, weekdays: Set(weekdays), variant: variant)
+      // #588: the JS-supplied per-window `variant` is ignored now (the bedtime preset was removed).
+      return MonitorScheduleWindow(startMinute: start, endMinute: end, weekdays: Set(weekdays))
     }
   }
 
@@ -414,21 +411,19 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return false
   }
 
-  /// #525: the shield variant of the currently-active window, or nil if none is active. A
-  /// weekday ("schedule") window takes precedence over "bedtime" when both overlap — the
-  /// weekday shield keeps its redirect button, so an overlap never traps the user behind the
-  /// button-less sleepy shield.
-  private func activeScheduleVariant(windows: [MonitorScheduleWindow], at date: Date) -> String? {
+  /// #588: true if any free window currently covers `date` (minute-of-day + weekday). #570's
+  /// free-window inversion means "inside a window" = fully open, so this is the only distinction the
+  /// shield state needs (the old per-window bedtime/weekday variant was removed — it never rendered).
+  private func isInsideAnyScheduleWindow(windows: [MonitorScheduleWindow], at date: Date) -> Bool {
     let comps = Calendar.current.dateComponents([.hour, .minute, .weekday], from: date)
     let nowMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
     let todayIso = isoWeekday(fromGregorian: comps.weekday ?? 1)
     let yesterdayIso = todayIso == 1 ? 7 : todayIso - 1
 
-    var bedtimeActive = false
     for window in windows where isWindowActive(window, nowMinute: nowMinute, todayIso: todayIso, yesterdayIso: yesterdayIso) {
-      if window.variant == "bedtime" { bedtimeActive = true } else { return "schedule" }
+      return true
     }
-    return bedtimeActive ? "bedtime" : nil
+    return false
   }
 
   /// Convert a Gregorian weekday (1 = Sunday … 7 = Saturday) to ISO (1 = Monday … 7 = Sunday).
@@ -682,6 +677,4 @@ struct MonitorScheduleWindow {
   let startMinute: Int
   let endMinute: Int
   let weekdays: Set<Int>
-  // #525: "bedtime" (sleepy shield, no button) | "schedule" (weekday shield, redirect button).
-  let variant: String
 }

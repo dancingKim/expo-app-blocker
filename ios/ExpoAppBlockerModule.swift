@@ -43,10 +43,11 @@ public class ExpoAppBlockerModule: Module {
   // `unlockActivityName`.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
-  // #525: which schedule-shield variant is currently active ("bedtime" | "schedule"), read by
-  // ShieldConfiguration to pick the rendered shield. The monitor is the usual writer; the module
-  // also writes it when it re-applies the schedule (gap) shield itself — see
-  // `reevaluateScheduleShieldFromPersisted` (#601). Absent = no schedule shield → default shield.
+  // #525: whether the schedule shield is currently up — set to "schedule" while out of every free
+  // window, absent otherwise. Read by ShieldConfiguration to pick the rendered shield. The monitor is
+  // the usual writer; the module also writes it when it re-applies the schedule (gap) shield itself —
+  // see `reevaluateScheduleShieldFromPersisted` (#601). (#588: the value is always "schedule" now —
+  // #570 removed the bedtime preset.) Absent = no schedule shield → default shield.
   private let scheduleShieldVariantKey = "appBlocker.scheduleShieldVariant.v1"
   // Immediate-block wall-clock expiry (#535). When `setBlockConfiguration` carries
   // `expiresAtMillis`, one DeviceActivity fires at that instant and the monitor extension lifts
