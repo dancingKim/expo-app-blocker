@@ -56,6 +56,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // reaped before cfprefsd commits. Write it primarily to the App Group container file (atomic), same
   // as ShieldConfiguration's lastShielded, and keep the UserDefaults key as a best-effort mirror.
   private let suppressionExpiryProbeFileName = "suppressionExpiryProbe.json"
+  // #614: same fired-outcome probe for the immediate (gate/focus) wall-clock expiry.
+  private let immediateExpiryProbeKey = "appBlocker.immediateExpiryProbe.v1"
+  private let immediateExpiryProbeFileName = "immediateExpiryProbe.json"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -169,13 +172,18 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let dict = defaults.dictionary(forKey: blockConfigStorageKey),
           let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue, expiry > 0 else {
+      writeImmediateExpiryProbe(decision: "no-immediate-expiry")
       return
     }
-    guard Date().timeIntervalSince1970 * 1000.0 >= expiry else { return }
+    guard Date().timeIntervalSince1970 * 1000.0 >= expiry else {
+      writeImmediateExpiryProbe(decision: "not-due")
+      return
+    }
     store.shield.applications = nil
     store.shield.applicationCategories = nil
     store.shield.webDomains = nil
     defaults.removeObject(forKey: blockConfigStorageKey)
+    writeImmediateExpiryProbe(decision: "released")
   }
 
   // MARK: - Escape Ticket Suppression (#572)
@@ -221,11 +229,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// #601: record how the suppression-expiry backstop resolved the SCHEDULE shield, so the next
   /// real-device round can tell "native restored it" from "app-side config orphan" at a glance.
   /// Derives the decision from the same persisted config `reevaluateScheduleShield` reads.
-  private func writeSuppressionExpiryProbe(decision: String) {
+  /// #607/#614: record a FIRED expiry outcome. "fired" distinguishes the monitor's callback from the
+  /// module's "registered" write to the same record — an inspection still showing phase "registered"
+  /// means iOS never fired the callback.
+  private func writeExpiryProbe(fileName: String, udKey: String, decision: String) {
     let defaults = sharedDefaults ?? UserDefaults.standard
     let probe: [String: Any] = [
-      // #607: "fired" distinguishes the monitor's callback from the module's "registered" write to
-      // the same record — an inspection still showing phase "registered" means iOS never fired.
       "phase": "fired",
       "firedAt": Int64(Date().timeIntervalSince1970 * 1000.0),
       "decision": decision,
@@ -234,13 +243,21 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: probe) else { return }
     // Primary: atomic file write (durable even if the monitor is torn down before cfprefsd commits).
-    if let fileURL = appGroupFileURL(suppressionExpiryProbeFileName) {
+    if let fileURL = appGroupFileURL(fileName) {
       try? data.write(to: fileURL, options: .atomic)
     }
     // Best-effort UserDefaults mirror.
     if let json = String(data: data, encoding: .utf8) {
-      defaults.set(json, forKey: suppressionExpiryProbeKey)
+      defaults.set(json, forKey: udKey)
     }
+  }
+
+  private func writeSuppressionExpiryProbe(decision: String) {
+    writeExpiryProbe(fileName: suppressionExpiryProbeFileName, udKey: suppressionExpiryProbeKey, decision: decision)
+  }
+
+  private func writeImmediateExpiryProbe(decision: String) {
+    writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: immediateExpiryProbeKey, decision: decision)
   }
 
   private func appGroupFileURL(_ name: String) -> URL? {

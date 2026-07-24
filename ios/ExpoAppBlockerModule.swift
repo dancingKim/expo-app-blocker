@@ -67,6 +67,8 @@ public class ExpoAppBlockerModule: Module {
   // inspection: still "registered" = iOS never fired the callback; a "fired" phase = it fired. Written
   // to the App Group container file (durable) — see writeSuppressionExpiryProbe.
   private let suppressionExpiryProbeFileName = "suppressionExpiryProbe.json"
+  // #614: same registered/fired probe for the immediate (gate/focus) wall-clock expiry.
+  private let immediateExpiryProbeFileName = "immediateExpiryProbe.json"
   // #598 targeted escape ticket. The ShieldAction records the ApplicationToken the user pressed
   // "지금 필요해" on into `escapeTargetTokenKey` (+ a timestamp for freshness). `suppressBlocks`
   // consumes it and, when fresh, promotes it to `suppressionTargetTokenKey` — the ONE app that stays
@@ -933,15 +935,21 @@ public class ExpoAppBlockerModule: Module {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
 
-    let startComps = Calendar.current.dateComponents([.hour, .minute, .second], from: expiresAt)
-    let startMinute = (startComps.hour ?? 0) * 60 + (startComps.minute ?? 0)
+    // #614: DeviceActivity is minute-granular, so an intervalStart carrying seconds makes iOS fire
+    // intervalDidStart at the minute FLOOR — before the true expiry — and expireImmediateBlockIfDue
+    // then rejects it (now < expiry) with the one-shot never firing again (same not-due silence #607
+    // fixed for suppression-expiry). Round the start UP to the minute at/after expiry.
+    let comps = Calendar.current.dateComponents([.hour, .minute, .second], from: expiresAt)
+    let expiryMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    let startMinute = (comps.second ?? 0) > 0 ? expiryMinute + 1 : expiryMinute
     let endMinute = startMinute + minScheduleIntervalMinutes + 1
-    guard endMinute <= 23 * 60 + 59 else {
+    guard startMinute <= 23 * 60 + 59, endMinute <= 23 * 60 + 59 else {
       print("[AppBlocker] immediate-expiry within ~16m of midnight — relying on foreground clear")
+      writeImmediateExpiryProbe(["phase": "register-skipped-midnight", "startMinute": startMinute])
       return
     }
     let schedule = DeviceActivitySchedule(
-      intervalStart: startComps,
+      intervalStart: scheduleTimeComponents(minuteOfDay: startMinute),
       intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
       repeats: false
     )
@@ -951,8 +959,15 @@ public class ExpoAppBlockerModule: Module {
         during: schedule,
         events: [:]
       )
+      writeImmediateExpiryProbe([
+        "phase": "registered",
+        "startMinute": startMinute,
+        "endMinute": endMinute,
+        "untilMs": Int64(expiresAt.timeIntervalSince1970 * 1000.0)
+      ])
     } catch {
       print("[AppBlocker] immediate-expiry startMonitoring failed: \(error.localizedDescription)")
+      writeImmediateExpiryProbe(["phase": "register-failed", "error": "\(error)"])
     }
   }
 
@@ -1086,19 +1101,27 @@ public class ExpoAppBlockerModule: Module {
     }
   }
 
-  /// #607: record the suppression-expiry REGISTRATION outcome (phase + schedule params) to the App
-  /// Group container file (+ a best-effort UserDefaults mirror). The monitor overwrites this file with
-  /// the FIRED outcome, so an inspection still showing "registered" proves iOS never fired the callback.
-  private func writeSuppressionExpiryProbe(_ fields: [String: Any]) {
+  /// #607/#614: record an expiry REGISTRATION outcome (phase + schedule params) to the App Group
+  /// container file (+ a best-effort UserDefaults mirror). The monitor overwrites the file with the
+  /// FIRED outcome, so an inspection still showing "registered" proves iOS never fired the callback.
+  private func writeExpiryProbe(fileName: String, udKey: String, _ fields: [String: Any]) {
     var probe = fields
     probe["at"] = Int64(Date().timeIntervalSince1970 * 1000.0)
     guard let data = try? JSONSerialization.data(withJSONObject: probe) else { return }
     if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
-      try? data.write(to: container.appendingPathComponent(suppressionExpiryProbeFileName), options: .atomic)
+      try? data.write(to: container.appendingPathComponent(fileName), options: .atomic)
     }
     if let json = String(data: data, encoding: .utf8) {
-      sharedDefaults?.set(json, forKey: "appBlocker.suppressionExpiryProbe.v1")
+      sharedDefaults?.set(json, forKey: udKey)
     }
+  }
+
+  private func writeSuppressionExpiryProbe(_ fields: [String: Any]) {
+    writeExpiryProbe(fileName: suppressionExpiryProbeFileName, udKey: "appBlocker.suppressionExpiryProbe.v1", fields)
+  }
+
+  private func writeImmediateExpiryProbe(_ fields: [String: Any]) {
+    writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: "appBlocker.immediateExpiryProbe.v1", fields)
   }
 
   private func cancelSuppressionExpiryActivity() {
