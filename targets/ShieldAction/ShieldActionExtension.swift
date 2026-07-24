@@ -35,6 +35,11 @@ class ShieldActionExtension: ShieldActionDelegate {
   // attribute the miss on a real device. Cheap and permanent.
   private let shieldActionProbeKey = "appBlocker.shieldActionProbe.v1"
   private let probeLog = Logger(subsystem: "expo.appblocker", category: "ShieldAction")
+  // Serializes the probe's read-modify-write. The authorization-status probe now
+  // runs in parallel with add()'s completion (see schedulePendingUnlockNotification),
+  // and UNUserNotificationCenter delivers completion handlers on arbitrary
+  // queues, so two writeProbe calls can otherwise race and drop a field.
+  private let probeLock = NSLock()
   // Notification copy + behavior — configurable via plugin options so apps
   // can localize without forking. Defaults preserve the original English
   // copy and the icon attachment.
@@ -103,6 +108,8 @@ class ShieldActionExtension: ShieldActionDelegate {
   /// Merge fields into the single App Group probe JSON (last-attempt snapshot).
   private func writeProbe(_ fields: [String: Any]) {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    probeLock.lock()
+    defer { probeLock.unlock() }
     var probe: [String: Any] = [:]
     if let json = defaults.string(forKey: shieldActionProbeKey),
        let data = json.data(using: .utf8),
@@ -114,7 +121,17 @@ class ShieldActionExtension: ShieldActionDelegate {
        let json = String(data: data, encoding: .utf8) {
       defaults.set(json, forKey: shieldActionProbeKey)
     }
-    defaults.synchronize()
+  }
+
+  /// Best-effort authorization-status probe (#583). `getNotificationSettings` is
+  /// a system XPC that is documented to stall for seconds, so it is fired in
+  /// parallel with the notification post and its result is merged into the probe
+  /// only if it returns before this short-lived extension is torn down. It never
+  /// gates the shield response — that is what kept the shield UI frozen.
+  private func recordAuthorizationStatusProbe(via center: UNUserNotificationCenter) {
+    center.getNotificationSettings { settings in
+      self.writeProbe(["authorizationStatus": settings.authorizationStatus.rawValue])
+    }
   }
 
   /// Record that primaryButtonPressed actually fired, with a provisional
@@ -128,7 +145,6 @@ class ShieldActionExtension: ShieldActionDelegate {
   private func setPendingUnlockFlag() {
     guard let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
     sharedDefaults.set(true, forKey: pendingUnlockKey)
-    sharedDefaults.synchronize()
 
     let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
     CFNotificationCenterPostNotification(
@@ -161,11 +177,9 @@ class ShieldActionExtension: ShieldActionDelegate {
     // is kept for back-compat. `itemId` is included only when the app armed the
     // block for a known task.
     var userInfo: [String: Any] = ["kind": "guardian", "link": "/unlock"]
-    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
-      sharedDefaults.synchronize()
-      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
-        userInfo["itemId"] = guardedItemId
-      }
+    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier),
+       let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
+      userInfo["itemId"] = guardedItemId
     }
     content.userInfo = userInfo
 
@@ -184,22 +198,24 @@ class ShieldActionExtension: ShieldActionDelegate {
       trigger: nil
     )
 
-    // #583 diagnostics: capture the authorization status the extension sees —
-    // a .denied / .notDetermined app can add() successfully yet show nothing.
-    center.getNotificationSettings { settings in
-      let authStatus = settings.authorizationStatus.rawValue
-      center.removePendingNotificationRequests(withIdentifiers: [self.pendingUnlockNotificationIdentifier])
-      center.add(request) { error in
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
-        let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
-        self.writeProbe([
-          "addResult": addResult,
-          "addAt": nowMs,
-          "authorizationStatus": authStatus,
-        ])
-        self.probeLog.log("ShieldAction add() \(addResult, privacy: .public) authStatus=\(authStatus, privacy: .public)")
-        completion(error == nil)
-      }
+    // Latency fix: the shield UI stays locked until `completion` → the
+    // completionHandler fires, and this extension is torn down right after
+    // (async work started after the response is not guaranteed to run), so the
+    // notification post must finish *before* we signal. add() is therefore the
+    // single gating XPC. The authorization-status probe used to wrap add() and
+    // serialized a second, slow XPC ahead of it; it now runs in parallel and
+    // never gates the response.
+    recordAuthorizationStatusProbe(via: center)
+    center.removePendingNotificationRequests(withIdentifiers: [pendingUnlockNotificationIdentifier])
+    center.add(request) { error in
+      let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+      let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
+      self.writeProbe([
+        "addResult": addResult,
+        "addAt": nowMs,
+      ])
+      self.probeLog.log("ShieldAction add() \(addResult, privacy: .public)")
+      completion(error == nil)
     }
   }
 
@@ -227,11 +243,9 @@ class ShieldActionExtension: ShieldActionDelegate {
     content.interruptionLevel = .timeSensitive
 
     var userInfo: [String: Any] = ["kind": "guardian_escape"]
-    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier) {
-      sharedDefaults.synchronize()
-      if let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
-        userInfo["itemId"] = guardedItemId
-      }
+    if let sharedDefaults = UserDefaults(suiteName: appGroupIdentifier),
+       let guardedItemId = sharedDefaults.string(forKey: guardedItemIdKey), !guardedItemId.isEmpty {
+      userInfo["itemId"] = guardedItemId
     }
     content.userInfo = userInfo
 
@@ -247,20 +261,19 @@ class ShieldActionExtension: ShieldActionDelegate {
       trigger: nil
     )
 
-    center.getNotificationSettings { settings in
-      let authStatus = settings.authorizationStatus.rawValue
-      center.removePendingNotificationRequests(withIdentifiers: [self.guardianEscapeNotificationIdentifier])
-      center.add(request) { error in
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
-        let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
-        self.writeProbe([
-          "escapeAddResult": addResult,
-          "escapeAddAt": nowMs,
-          "authorizationStatus": authStatus,
-        ])
-        self.probeLog.log("ShieldAction escape add() \(addResult, privacy: .public) authStatus=\(authStatus, privacy: .public)")
-        completion(error == nil)
-      }
+    // Same latency fix as the primary landing: add() is the single gating XPC,
+    // the authorization-status probe runs in parallel and does not gate.
+    recordAuthorizationStatusProbe(via: center)
+    center.removePendingNotificationRequests(withIdentifiers: [guardianEscapeNotificationIdentifier])
+    center.add(request) { error in
+      let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+      let addResult = error.map { "add-error: \($0.localizedDescription)" } ?? "add-ok"
+      self.writeProbe([
+        "escapeAddResult": addResult,
+        "escapeAddAt": nowMs,
+      ])
+      self.probeLog.log("ShieldAction escape add() \(addResult, privacy: .public)")
+      completion(error == nil)
     }
   }
 
@@ -268,7 +281,6 @@ class ShieldActionExtension: ShieldActionDelegate {
   /// for the app to drain into `blocker_intercepts`.
   private func recordIntercept() {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
-    defaults.synchronize()
 
     let nowMs = Date().timeIntervalSince1970 * 1000.0
     let lastMs = defaults.double(forKey: lastInterceptTsKey)
@@ -289,7 +301,6 @@ class ShieldActionExtension: ShieldActionDelegate {
       defaults.set(json, forKey: pendingInterceptsKey)
     }
     defaults.set(nowMs, forKey: lastInterceptTsKey)
-    defaults.synchronize()
   }
 
   private func iconFileURL() -> URL? {
