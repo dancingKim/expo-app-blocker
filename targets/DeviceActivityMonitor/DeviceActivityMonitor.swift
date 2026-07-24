@@ -224,6 +224,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   private func writeSuppressionExpiryProbe(decision: String) {
     let defaults = sharedDefaults ?? UserDefaults.standard
     let probe: [String: Any] = [
+      // #607: "fired" distinguishes the monitor's callback from the module's "registered" write to
+      // the same record — an inspection still showing phase "registered" means iOS never fired.
+      "phase": "fired",
       "firedAt": Int64(Date().timeIntervalSince1970 * 1000.0),
       "decision": decision,
       "scheduleConfigPresent": defaults.dictionary(forKey: scheduleConfigStorageKey) != nil,
