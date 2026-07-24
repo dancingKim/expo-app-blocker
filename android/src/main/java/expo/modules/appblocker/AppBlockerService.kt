@@ -359,14 +359,14 @@ class AppBlockerService : Service() {
     }
   }
 
-  // #526: the always-on foreground-service notification is owned here (not injectable via
-  // configureAndroid, which only reaches the block/overlay copy). Copy SSOT lives in the app at
-  // guardianCopy.awareness.androidForegroundNotification; kept voice-compliant (no 3rd person,
-  // no "~하는 중").
+  // #526: the always-on foreground-service notification. Copy SSOT lives in the app at
+  // guardianCopy.awareness.androidForegroundNotification and is injected via configureAndroid
+  // (foregroundNotificationTitle/Text); the baked-in Korean defaults keep back-compat. Voice-compliant
+  // (no 3rd person, no "~하는 중").
   private fun buildNotification(): Notification =
     NotificationCompat.Builder(this, CHANNEL_ID)
-      .setContentTitle("앱 잠금 켜짐")
-      .setContentText("허용한 앱만 열려.")
+      .setContentTitle(AppBlockerPrefs.getForegroundNotificationTitle(this))
+      .setContentText(AppBlockerPrefs.getForegroundNotificationText(this))
       .setSmallIcon(applicationInfo.icon)
       .setOngoing(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)

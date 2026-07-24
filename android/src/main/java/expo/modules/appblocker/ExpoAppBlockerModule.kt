@@ -95,6 +95,11 @@ class ExpoAppBlockerModule : Module() {
         overlaySpinnerColor = config["overlaySpinnerColor"] as? String,
         overlayPrimaryButtonText = config["overlayPrimaryButtonText"] as? String,
         overlaySecondaryButtonText = config["overlaySecondaryButtonText"] as? String,
+        overlayPrimaryButtonColor = config["overlayPrimaryButtonColor"] as? String,
+        overlayPrimaryButtonTextColor = config["overlayPrimaryButtonTextColor"] as? String,
+        overlaySecondaryButtonTextColor = config["overlaySecondaryButtonTextColor"] as? String,
+        foregroundNotificationTitle = config["foregroundNotificationTitle"] as? String,
+        foregroundNotificationText = config["foregroundNotificationText"] as? String,
         notificationTitle = config["notificationTitle"] as? String,
         notificationText = config["notificationText"] as? String,
       )

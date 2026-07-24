@@ -131,6 +131,20 @@ class OverlayManager(private val context: Context) {
       AppBlockerPrefs.getOverlayTextColor(context),
       Color.parseColor("#737373"),
     )
+    // Button colors — default to the title (primary bg) / white (primary text) / text (secondary)
+    // colors so the current look is unchanged unless the app injects overrides.
+    val primaryButtonColor = parseColorOrDefault(
+      AppBlockerPrefs.getOverlayPrimaryButtonColor(context) ?: "",
+      titleColor,
+    )
+    val primaryButtonTextColor = parseColorOrDefault(
+      AppBlockerPrefs.getOverlayPrimaryButtonTextColor(context) ?: "",
+      Color.WHITE,
+    )
+    val secondaryButtonTextColor = parseColorOrDefault(
+      AppBlockerPrefs.getOverlaySecondaryButtonTextColor(context) ?: "",
+      textColor,
+    )
     val titleFontSize = AppBlockerPrefs.getOverlayTitleFontSize(context)
     val textFontSize = AppBlockerPrefs.getOverlayTextFontSize(context)
     val titleBold = AppBlockerPrefs.getOverlayTitleBold(context)
@@ -186,8 +200,8 @@ class OverlayManager(private val context: Context) {
       addView(Button(context).apply {
         text = AppBlockerPrefs.getOverlayPrimaryButtonText(context)
         isAllCaps = false
-        setTextColor(Color.WHITE)
-        setBackgroundColor(titleColor)
+        setTextColor(primaryButtonTextColor)
+        setBackgroundColor(primaryButtonColor)
         setPadding(dp(24f), dp(12f), dp(24f), dp(12f))
         layoutParams = LinearLayout.LayoutParams(
           LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -199,7 +213,7 @@ class OverlayManager(private val context: Context) {
         addView(Button(context).apply {
           text = secondaryLabel
           isAllCaps = false
-          setTextColor(textColor)
+          setTextColor(secondaryButtonTextColor)
           setBackgroundColor(Color.TRANSPARENT)
           setPadding(dp(24f), dp(12f), dp(24f), dp(12f))
           layoutParams = LinearLayout.LayoutParams(

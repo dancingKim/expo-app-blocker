@@ -298,6 +298,19 @@ export interface AndroidConfig {
    * offered). Default: "I need it now".
    */
   overlaySecondaryButtonText?: string;
+  /** Hex fill color of the overlay's primary button. Default: the overlay title color. */
+  overlayPrimaryButtonColor?: string;
+  /** Hex text color of the overlay's primary button. Default: white. */
+  overlayPrimaryButtonTextColor?: string;
+  /** Hex text color of the overlay's (transparent) secondary button. Default: the overlay body text color. */
+  overlaySecondaryButtonTextColor?: string;
+  /**
+   * Title of the always-on foreground-service notification (the ongoing "guardian is running" one,
+   * distinct from the per-block alert). Default: the baked-in Korean copy.
+   */
+  foregroundNotificationTitle?: string;
+  /** Text of the always-on foreground-service notification. Default: the baked-in Korean copy. */
+  foregroundNotificationText?: string;
   /** Notification title when app is blocked. Use {appName} as placeholder. Default: "App Blocked" */
   notificationTitle?: string;
   /** Notification text when app is blocked. Use {appName} as placeholder. */

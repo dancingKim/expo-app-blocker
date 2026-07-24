@@ -42,6 +42,14 @@ object AppBlockerPrefs {
   // no Korean hardcoded in the fork). Primary = "하러 가기" landing, secondary = "지금 필요해" escape.
   private const val KEY_OVERLAY_PRIMARY_BUTTON = "overlay_primary_button"
   private const val KEY_OVERLAY_SECONDARY_BUTTON = "overlay_secondary_button"
+  // Overlay button colors (hex). Absent → fall back to the existing title/text colors, so the
+  // current look is unchanged unless the app injects them.
+  private const val KEY_OVERLAY_PRIMARY_BUTTON_COLOR = "overlay_primary_button_color"
+  private const val KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR = "overlay_primary_button_text_color"
+  private const val KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR = "overlay_secondary_button_text_color"
+  // Always-on foreground-service notification copy. Absent → the baked-in Korean default (back-compat).
+  private const val KEY_FG_NOTIFICATION_TITLE = "fg_notification_title"
+  private const val KEY_FG_NOTIFICATION_TEXT = "fg_notification_text"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
   private const val KEY_OVERLAY_BG_COLOR = "overlay_bg_color"
@@ -321,6 +329,11 @@ object AppBlockerPrefs {
     overlaySpinnerColor: String?,
     overlayPrimaryButtonText: String?,
     overlaySecondaryButtonText: String?,
+    overlayPrimaryButtonColor: String?,
+    overlayPrimaryButtonTextColor: String?,
+    overlaySecondaryButtonTextColor: String?,
+    foregroundNotificationTitle: String?,
+    foregroundNotificationText: String?,
     notificationTitle: String?,
     notificationText: String?,
   ) {
@@ -329,6 +342,11 @@ object AppBlockerPrefs {
       .putString(KEY_OVERLAY_TEXT, overlayText)
       .putString(KEY_OVERLAY_PRIMARY_BUTTON, overlayPrimaryButtonText)
       .putString(KEY_OVERLAY_SECONDARY_BUTTON, overlaySecondaryButtonText)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON_COLOR, overlayPrimaryButtonColor)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR, overlayPrimaryButtonTextColor)
+      .putString(KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR, overlaySecondaryButtonTextColor)
+      .putString(KEY_FG_NOTIFICATION_TITLE, foregroundNotificationTitle)
+      .putString(KEY_FG_NOTIFICATION_TEXT, foregroundNotificationText)
       .putString(KEY_OVERLAY_BG_COLOR, overlayBackgroundColor)
       .putString(KEY_OVERLAY_TITLE_COLOR, overlayTitleColor)
       .putString(KEY_OVERLAY_TEXT_COLOR, overlayTextColor)
@@ -372,6 +390,25 @@ object AppBlockerPrefs {
     val value = get(context).getString(KEY_OVERLAY_SECONDARY_BUTTON, null) ?: "I need it now"
     return if (value.isEmpty() || value == "none") null else value
   }
+
+  // Overlay button colors (hex) — null lets OverlayManager fall back to the title/text colors, so the
+  // current look is unchanged unless the app injects them.
+  fun getOverlayPrimaryButtonColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON_COLOR, null)
+
+  fun getOverlayPrimaryButtonTextColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR, null)
+
+  fun getOverlaySecondaryButtonTextColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR, null)
+
+  // Always-on foreground-service notification copy — SSOT in the app (guardianCopy.awareness.*);
+  // baked-in Korean defaults keep back-compat when the app doesn't inject.
+  fun getForegroundNotificationTitle(context: Context): String =
+    get(context).getString(KEY_FG_NOTIFICATION_TITLE, null) ?: "앱 잠금 켜짐"
+
+  fun getForegroundNotificationText(context: Context): String =
+    get(context).getString(KEY_FG_NOTIFICATION_TEXT, null) ?: "허용한 앱만 열려."
 
   fun getOverlayBackgroundColor(context: Context): String =
     get(context).getString(KEY_OVERLAY_BG_COLOR, null) ?: "#FFFFFF"
