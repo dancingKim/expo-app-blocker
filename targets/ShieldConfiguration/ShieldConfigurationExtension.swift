@@ -5,6 +5,18 @@ import UIKit
 class ShieldConfigurationExtension: ShieldConfigurationDataSource {
 
   private let appGroupIdentifier = "APP_GROUP_PLACEHOLDER"
+  // #598: the app this data source LAST rendered a shield for. The guardian locks via
+  // `.all(except:)` (a category shield), so the escape ShieldAction almost always arrives on the
+  // CATEGORY overload — which carries no ApplicationToken, leaving it unable to tell which app the
+  // user pressed "지금 필요해" on (the observed bug: the ticket opened everything). This data source's
+  // app-carrying overloads DO receive the specific `Application` even in category mode, so we record
+  // its token here on every render (always overwrite = the latest render is the shield on screen),
+  // and the ShieldAction reads the freshest one as the escape target.
+  // ⚠️ Known limitation: iOS caches shield configs and can render shields for BACKGROUND apps
+  // (app-switcher previews), so a stale or different-app token can occasionally win. The
+  // ShieldAction's freshness gate + full-open fallback are the safety net.
+  private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
+  private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
 
   // All values below are replaced by the config plugin at prebuild time
   private let shieldTitle = "SHIELD_TITLE_PLACEHOLDER"
@@ -176,12 +188,25 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     )
   }
 
+  /// #598: record the app currently being shielded (App Group) so the escape ShieldAction — which on
+  /// the category overload has no ApplicationToken — can target it. Both app-carrying overloads pass
+  /// through here; `application.token` is the specific app even inside a category shield.
+  private func recordLastShieldedApplication(_ application: Application) {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier),
+          let token = application.token,
+          let data = try? JSONEncoder().encode(token) else { return }
+    defaults.set(data.base64EncodedString(), forKey: lastShieldedTokenKey)
+    defaults.set(Int64(Date().timeIntervalSince1970 * 1000.0), forKey: lastShieldedTokenTsKey)
+  }
+
   override func configuration(shielding application: Application) -> ShieldConfiguration {
-    makeConfig(appName: application.localizedDisplayName ?? "This app")
+    recordLastShieldedApplication(application)
+    return makeConfig(appName: application.localizedDisplayName ?? "This app")
   }
 
   override func configuration(shielding application: Application, in category: ActivityCategory) -> ShieldConfiguration {
-    makeConfig(appName: category.localizedDisplayName ?? "This category")
+    recordLastShieldedApplication(application)
+    return makeConfig(appName: category.localizedDisplayName ?? "This category")
   }
 
   override func configuration(shielding webDomain: WebDomain) -> ShieldConfiguration {

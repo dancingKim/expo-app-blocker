@@ -30,6 +30,13 @@ class ShieldActionExtension: ShieldActionDelegate {
   // app shielded. Web/category shields (no app token) clear it so the ticket falls back to full open.
   private let escapeTargetTokenKey = "appBlocker.escapeTargetToken.v1"
   private let escapeTargetTokenTsKey = "appBlocker.escapeTargetTokenTs.v1"
+  // #598: the guardian locks by category (`.all(except:)`), so escape almost always arrives on the
+  // category overload with NO ApplicationToken. ShieldConfiguration records the app it last rendered a
+  // shield for here; we read the freshest one as the target. See the ShieldConfiguration comment for
+  // the caching / background-render caveat that the freshness gate + full-open fallback guard against.
+  private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
+  private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
+  private let lastShieldedTokenMaxAgeMs: Double = 5 * 60 * 1000
   // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
   // gives no API to open the container app from a ShieldAction, so the primary
   // button posts a local notification whose tap deep-links home). When that
@@ -237,20 +244,47 @@ class ShieldActionExtension: ShieldActionDelegate {
     probeLog.log("ShieldAction secondaryButtonPressed handler fired @\(nowMs, privacy: .public)")
   }
 
-  /// #598: record (or clear) the app the user pressed "지금 필요해" on, so the container app's
-  /// suppressBlocks can open ONLY that app for the ticket. A nil token (web/category shield) clears
-  /// any stale candidate so the ticket falls back to full open instead of exempting a prior app.
-  /// ApplicationToken is Codable; the container decodes the same base64 back into its allow-except set.
+  /// #598: record the app the user pressed "지금 필요해" on, so the container app's suppressBlocks can
+  /// open ONLY that app for the ticket. Three sources, in order:
+  ///   1. `handler` — the app-token overload carried it directly (rare: the guardian locks by
+  ///      category, so escape usually arrives on the category overload with no token).
+  ///   2. `lastShielded` — no token here → the app ShieldConfiguration last rendered a shield for
+  ///      (App Group), if fresh. This is the guardian's normal path.
+  ///   3. `fallback-full` — no usable token → clear the candidate so the ticket opens everything
+  ///      (the original safe behavior). Reason recorded for the real-device probe.
+  /// The chosen source + reason are written into the shieldAction probe so the next device round can
+  /// attribute the outcome immediately. ApplicationToken is Codable; the container decodes the same
+  /// base64 back into its allow-except set.
   private func recordEscapeTargetToken(_ application: ApplicationToken?) {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
-    guard let application = application,
-          let data = try? JSONEncoder().encode(application) else {
-      defaults.removeObject(forKey: escapeTargetTokenKey)
-      defaults.removeObject(forKey: escapeTargetTokenTsKey)
+    let nowMs = Date().timeIntervalSince1970 * 1000.0
+
+    if let application = application, let data = try? JSONEncoder().encode(application) {
+      defaults.set(data.base64EncodedString(), forKey: escapeTargetTokenKey)
+      defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
+      writeProbe(["escapeTargetSource": "handler"])
       return
     }
-    defaults.set(data.base64EncodedString(), forKey: escapeTargetTokenKey)
-    defaults.set(Int64(Date().timeIntervalSince1970 * 1000.0), forKey: escapeTargetTokenTsKey)
+
+    // Refresh the suite so ShieldConfiguration's (separate process) write is visible here.
+    defaults.synchronize()
+    if let encoded = defaults.string(forKey: lastShieldedTokenKey), !encoded.isEmpty {
+      let ts = (defaults.object(forKey: lastShieldedTokenTsKey) as? NSNumber)?.doubleValue ?? 0
+      if ts > 0, nowMs - ts <= lastShieldedTokenMaxAgeMs {
+        defaults.set(encoded, forKey: escapeTargetTokenKey)
+        defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
+        writeProbe(["escapeTargetSource": "lastShielded"])
+        return
+      }
+      defaults.removeObject(forKey: escapeTargetTokenKey)
+      defaults.removeObject(forKey: escapeTargetTokenTsKey)
+      writeProbe(["escapeTargetSource": "fallback-full", "escapeTargetReason": "stale-last-shielded"])
+      return
+    }
+
+    defaults.removeObject(forKey: escapeTargetTokenKey)
+    defaults.removeObject(forKey: escapeTargetTokenTsKey)
+    writeProbe(["escapeTargetSource": "fallback-full", "escapeTargetReason": "no-last-shielded"])
   }
 
   /// Post the escape landing notification. Reuses the app-configured landing copy (the banner is just
