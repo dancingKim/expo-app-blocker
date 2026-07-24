@@ -478,6 +478,14 @@ if (Platform.OS === "ios") {
   } catch {}
 }
 
+/**
+ * #602: fixed height (pt) of each row in {@link BlockedAppsNativeList}. The native list is a
+ * non-scrolling, fixed-height VStack (native views don't report an intrinsic size to RN), so the
+ * component sizes its frame deterministically as `BLOCKED_APPS_ROW_HEIGHT × items.length`. Wrap it in
+ * your own ScrollView for scrolling; use this constant if you need to compute the container height.
+ */
+export const BLOCKED_APPS_ROW_HEIGHT = 56;
+
 export function BlockedAppsNativeList({
   items,
   selectionData,
@@ -492,7 +500,9 @@ export function BlockedAppsNativeList({
     .map((item) => ({ token: item.token, type: item.type }));
 
   return React.createElement(NativeBlockedAppsView, {
-    selectionData: selectionData || "",
+    // Only pass selectionData when it carries data — the native view treats "" as a no-op, but
+    // omitting it avoids the prop setter firing at all (tokens is the source of truth for this list).
+    ...(selectionData ? { selectionData } : {}),
     tokens,
     ...(removable !== undefined ? { removable } : {}),
     // #602: the native view emits { index, token, type }; unwrap nativeEvent for the caller. The view
@@ -500,7 +510,9 @@ export function BlockedAppsNativeList({
     onRemoveItem: onRemoveItem
       ? (e: { nativeEvent: BlockedAppsRemoveEvent }) => onRemoveItem(e.nativeEvent)
       : undefined,
-    style: [{ minHeight: 50 }, style],
+    // Deterministic frame: exactly one BLOCKED_APPS_ROW_HEIGHT per rendered row (a caller-supplied
+    // height in `style` still overrides this).
+    style: [{ height: BLOCKED_APPS_ROW_HEIGHT * tokens.length }, style],
   });
 }
 

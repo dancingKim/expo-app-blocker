@@ -118,14 +118,15 @@ public class ExpoAppBlockerModule: Module {
       // preserves the exact base64 tokenId RN passed, so RN can match the removed item precisely.
       Events("onRemoveItem")
 
+      // `tokens` is the primary data source; `selectionData` is a legacy alternative. Expo applies
+      // the two prop setters in a non-deterministic order, so an EMPTY selectionData must be a no-op —
+      // clearing here would clobber the tokens the other setter just wrote (the observed intermittent
+      // empty list, since the registry always passes selectionData="" alongside tokens).
       Prop("selectionData") { (view: BlockedAppsView, selectionBase64: String) in
         guard !selectionBase64.isEmpty,
               let data = Data(base64Encoded: selectionBase64),
               let selection = try? JSONDecoder().decode(FamilyActivitySelection.self, from: data)
-        else {
-          view.viewModel.items = []
-          return
-        }
+        else { return }
         view.setItemsFromSelection(selection)
       }
 
@@ -1673,22 +1674,28 @@ class BlockedAppsView: ExpoView {
   }
 }
 
+// #602: fixed per-row height for the registered-apps list. Native views don't propagate an intrinsic
+// content size to the RN frame, so instead of an internal ScrollView the list is a NON-scrolling,
+// fixed-height VStack and RN sizes the frame deterministically as `rowHeight × items.length` (outer
+// scrolling is RN's job). Kept in sync with the TS export `BLOCKED_APPS_ROW_HEIGHT`.
+let BlockedAppsRowHeight: CGFloat = 56
+
 struct BlockedAppsContentView: View {
   @ObservedObject var viewModel: BlockedAppsViewModel
   // #602: invoked with the tapped row + its index; the view emits, RN removes.
   var onRemove: (BlockedAppRenderItem, Int) -> Void
 
   // Grandmizer design system colors
-  private let cardBg = Color(red: 1.0, green: 1.0, blue: 1.0)           // #ffffff
   private let borderColor = Color(red: 0.91, green: 0.91, blue: 0.91)   // #e8e8e8
   private let labelColor = Color(red: 0.067, green: 0.067, blue: 0.067) // #111111
-  private let subtitleColor = Color(red: 0.73, green: 0.73, blue: 0.73) // #bbbbbb
   private let greenBadgeBg = Color(red: 0.94, green: 0.96, blue: 0.91)  // #f0f6e8
   private let greenText = Color(red: 0.24, green: 0.31, blue: 0.0)      // #3d5000
   private let removeColor = Color(red: 0.73, green: 0.73, blue: 0.73)   // #bbbbbb
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
+    // spacing 0 + a fixed height per row = total height is exactly rowHeight × count, matching the RN
+    // frame. Pin to the top so rows never center-clip if the frame is a touch taller than the content.
+    VStack(alignment: .leading, spacing: 0) {
       ForEach(Array(viewModel.items.enumerated()), id: \.element.id) { index, item in
         HStack(spacing: 12) {
           if let appToken = item.appToken {
@@ -1697,12 +1704,14 @@ struct BlockedAppsContentView: View {
               .font(.system(size: 16, weight: .semibold))
               .tint(labelColor)
               .foregroundStyle(labelColor)
+              .lineLimit(1)
           } else if let categoryToken = item.categoryToken {
             Label(categoryToken)
               .labelStyle(.titleAndIcon)
               .font(.system(size: 16, weight: .semibold))
               .tint(labelColor)
               .foregroundStyle(labelColor)
+              .lineLimit(1)
           }
           Spacer()
           if viewModel.removable {
@@ -1724,24 +1733,15 @@ struct BlockedAppsContentView: View {
               .cornerRadius(100)
           }
         }
-        .padding(.vertical, 10)
         .padding(.horizontal, 14)
-        .background(cardBg)
-        .cornerRadius(16)
-        .overlay(
-          RoundedRectangle(cornerRadius: 16)
-            .stroke(borderColor, lineWidth: 1)
-        )
-      }
-
-      if viewModel.items.isEmpty {
-        Text("No apps blocked")
-          .foregroundColor(subtitleColor)
-          .font(.system(size: 14))
-          .frame(maxWidth: .infinity, alignment: .center)
-          .padding(.vertical, 16)
+        .frame(height: BlockedAppsRowHeight)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) {
+          Rectangle().fill(borderColor).frame(height: 1)
+        }
       }
     }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     .environment(\.colorScheme, .light)
   }
 }
