@@ -37,6 +37,9 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
   private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
   private let lastShieldedTokenMaxAgeMs: Double = 5 * 60 * 1000
+  // #598 durability: ShieldConfiguration writes the last-shielded app to this App Group container file
+  // (its UserDefaults write is reaped before commit). Read it file-first here, UserDefaults fallback.
+  private let lastShieldedFileName = "lastShielded.json"
   // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
   // gives no API to open the container app from a ShieldAction, so the primary
   // button posts a local notification whose tap deep-links home). When that
@@ -266,12 +269,11 @@ class ShieldActionExtension: ShieldActionDelegate {
       return
     }
 
-    // Refresh the suite so ShieldConfiguration's (separate process) write is visible here.
-    defaults.synchronize()
-    if let encoded = defaults.string(forKey: lastShieldedTokenKey), !encoded.isEmpty {
-      let ts = (defaults.object(forKey: lastShieldedTokenTsKey) as? NSNumber)?.doubleValue ?? 0
-      if ts > 0, nowMs - ts <= lastShieldedTokenMaxAgeMs {
-        defaults.set(encoded, forKey: escapeTargetTokenKey)
+    // No token here → fall back to the app ShieldConfiguration last rendered a shield for (#598),
+    // read file-first (durable) then the legacy UserDefaults mirror.
+    if let last = readLastShieldedToken() {
+      if last.ts > 0, nowMs - last.ts <= lastShieldedTokenMaxAgeMs {
+        defaults.set(last.encoded, forKey: escapeTargetTokenKey)
         defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
         writeProbe(["escapeTargetSource": "lastShielded"])
         return
@@ -285,6 +287,31 @@ class ShieldActionExtension: ShieldActionDelegate {
     defaults.removeObject(forKey: escapeTargetTokenKey)
     defaults.removeObject(forKey: escapeTargetTokenTsKey)
     writeProbe(["escapeTargetSource": "fallback-full", "escapeTargetReason": "no-last-shielded"])
+  }
+
+  /// #598: read the last-shielded app record, file first (durable across ShieldConfiguration's instant
+  /// teardown) then the legacy UserDefaults mirror. Returns (base64 token, epoch-ms timestamp) or nil.
+  private func readLastShieldedToken() -> (encoded: String, ts: Double)? {
+    if let fileURL = appGroupFileURL(lastShieldedFileName),
+       let data = try? Data(contentsOf: fileURL),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let encoded = obj["token"] as? String, !encoded.isEmpty {
+      let ts = (obj["ts"] as? NSNumber)?.doubleValue ?? 0
+      return (encoded, ts)
+    }
+    if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
+      defaults.synchronize()
+      if let encoded = defaults.string(forKey: lastShieldedTokenKey), !encoded.isEmpty {
+        let ts = (defaults.object(forKey: lastShieldedTokenTsKey) as? NSNumber)?.doubleValue ?? 0
+        return (encoded, ts)
+      }
+    }
+    return nil
+  }
+
+  private func appGroupFileURL(_ name: String) -> URL? {
+    FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
+      .appendingPathComponent(name)
   }
 
   /// Post the escape landing notification. Reuses the app-configured landing copy (the banner is just

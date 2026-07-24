@@ -52,6 +52,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // no-schedule-config | not-due. "no-schedule-config" at expiry = the app-side orphan the JS heal
   // targets; anything else means the native backstop resolved the schedule shield correctly.
   private let suppressionExpiryProbeKey = "appBlocker.suppressionExpiryProbe.v1"
+  // #598 durability: this probe did not persist on device — a monitor UserDefaults write can also be
+  // reaped before cfprefsd commits. Write it primarily to the App Group container file (atomic), same
+  // as ShieldConfiguration's lastShielded, and keep the UserDefaults key as a best-effort mirror.
+  private let suppressionExpiryProbeFileName = "suppressionExpiryProbe.json"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -225,10 +229,20 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       "scheduleConfigPresent": defaults.dictionary(forKey: scheduleConfigStorageKey) != nil,
       "immediateConfigPresent": defaults.dictionary(forKey: blockConfigStorageKey) != nil
     ]
-    if let data = try? JSONSerialization.data(withJSONObject: probe),
-       let json = String(data: data, encoding: .utf8) {
+    guard let data = try? JSONSerialization.data(withJSONObject: probe) else { return }
+    // Primary: atomic file write (durable even if the monitor is torn down before cfprefsd commits).
+    if let fileURL = appGroupFileURL(suppressionExpiryProbeFileName) {
+      try? data.write(to: fileURL, options: .atomic)
+    }
+    // Best-effort UserDefaults mirror.
+    if let json = String(data: data, encoding: .utf8) {
       defaults.set(json, forKey: suppressionExpiryProbeKey)
     }
+  }
+
+  private func appGroupFileURL(_ name: String) -> URL? {
+    FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
+      .appendingPathComponent(name)
   }
 
   /// The schedule-shield outcome `reevaluateScheduleShield` will produce for the current wall clock —

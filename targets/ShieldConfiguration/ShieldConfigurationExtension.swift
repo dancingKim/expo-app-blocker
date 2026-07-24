@@ -17,6 +17,12 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   // ShieldAction's freshness gate + full-open fallback are the safety net.
   private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
   private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
+  // #598 durability: this extension is torn down the instant it returns a shield config, so a
+  // UserDefaults write is frequently reaped by cfprefsd before it commits and silently vanishes (the
+  // observed no-last-shielded bug). The App Group CONTAINER FILE, written with Data.write(.atomic)
+  // (temp + rename, flushed to disk synchronously), survives the instant death. This is the primary
+  // store; the UserDefaults mirror is kept best-effort for the ShieldAction's legacy fallback read.
+  private let lastShieldedFileName = "lastShielded.json"
 
   // All values below are replaced by the config plugin at prebuild time
   private let shieldTitle = "SHIELD_TITLE_PLACEHOLDER"
@@ -192,11 +198,27 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   /// the category overload has no ApplicationToken — can target it. Both app-carrying overloads pass
   /// through here; `application.token` is the specific app even inside a category shield.
   private func recordLastShieldedApplication(_ application: Application) {
-    guard let defaults = UserDefaults(suiteName: appGroupIdentifier),
-          let token = application.token,
-          let data = try? JSONEncoder().encode(token) else { return }
-    defaults.set(data.base64EncodedString(), forKey: lastShieldedTokenKey)
-    defaults.set(Int64(Date().timeIntervalSince1970 * 1000.0), forKey: lastShieldedTokenTsKey)
+    guard let token = application.token,
+          let tokenData = try? JSONEncoder().encode(token) else { return }
+    let encoded = tokenData.base64EncodedString()
+    let tsMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+
+    // Primary: atomic file write to the App Group container (durable across this extension's instant
+    // teardown — see lastShieldedFileName).
+    if let fileURL = appGroupFileURL(lastShieldedFileName),
+       let json = try? JSONSerialization.data(withJSONObject: ["token": encoded, "ts": tsMs]) {
+      try? json.write(to: fileURL, options: .atomic)
+    }
+    // Best-effort UserDefaults mirror (usually reaped with this process; kept for the legacy fallback).
+    if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
+      defaults.set(encoded, forKey: lastShieldedTokenKey)
+      defaults.set(tsMs, forKey: lastShieldedTokenTsKey)
+    }
+  }
+
+  private func appGroupFileURL(_ name: String) -> URL? {
+    FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
+      .appendingPathComponent(name)
   }
 
   override func configuration(shielding application: Application) -> ShieldConfiguration {
