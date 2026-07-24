@@ -93,6 +93,8 @@ class ExpoAppBlockerModule : Module() {
         overlaySpinnerSize = numberOrNull("overlaySpinnerSize"),
         overlaySpinnerTopMargin = numberOrNull("overlaySpinnerTopMargin"),
         overlaySpinnerColor = config["overlaySpinnerColor"] as? String,
+        overlayPrimaryButtonText = config["overlayPrimaryButtonText"] as? String,
+        overlaySecondaryButtonText = config["overlaySecondaryButtonText"] as? String,
         notificationTitle = config["notificationTitle"] as? String,
         notificationText = config["notificationText"] as? String,
       )
@@ -142,6 +144,13 @@ class ExpoAppBlockerModule : Module() {
     // land on the guarded task — analogous to the home widget's consumePendingLaunchAction.
     Function("consumePendingGuardedLaunch") {
       AppBlockerPrefs.consumePendingGuardedLaunch(context)
+    }
+
+    // #596: drain the one-shot "지금 필요해 tapped" escape flag. Returns { itemId, guardType } when a
+    // fresh escape landing is pending, else null. The JS router lands on the reason screen
+    // (guardian_escape), mirroring the iOS ShieldAction escape notification payload.
+    Function("consumePendingGuardedEscape") {
+      AppBlockerPrefs.consumePendingGuardedEscape(context)
     }
 
     Function("setScheduleConfiguration") { config: Map<String, Any?> ->
@@ -199,6 +208,9 @@ class ExpoAppBlockerModule : Module() {
     // setBlockExpiryAndroid.
     Function("suppressBlocksAndroid") { untilMillis: Double ->
       AppBlockerPrefs.setSuppressionUntil(context, untilMillis.toLong())
+      // #598: promote the overlay-captured escaped package (if fresh) to this ticket's target — only
+      // that app stays open, every other blocked app keeps its shield. Absent/stale → full open.
+      AppBlockerPrefs.setSuppressionTargetPackage(context, AppBlockerPrefs.consumeEscapeTargetPackage(context))
       AlarmReceiver.scheduleNext(context)
       AppBlockerService.start(context)
       Log.d(TAG, "suppressBlocksAndroid: $untilMillis")

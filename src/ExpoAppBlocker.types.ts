@@ -265,6 +265,17 @@ export interface AndroidConfig {
   overlaySpinnerTopMargin?: number;
   /** Hex color (e.g. "#7cb518") tinting the spinner. Default: system primary. */
   overlaySpinnerColor?: string;
+  /**
+   * #596: label for the overlay's primary "go do it" button, which lands the user on the guarded
+   * task. Default: "Go do it".
+   */
+  overlayPrimaryButtonText?: string;
+  /**
+   * #596: label for the overlay's secondary "escape" button, which routes to the reason screen
+   * (guardian_escape) and issues a ticket. Pass "none" or an empty string to hide it (no escape
+   * offered). Default: "I need it now".
+   */
+  overlaySecondaryButtonText?: string;
   /** Notification title when app is blocked. Use {appName} as placeholder. Default: "App Blocked" */
   notificationTitle?: string;
   /** Notification text when app is blocked. Use {appName} as placeholder. */

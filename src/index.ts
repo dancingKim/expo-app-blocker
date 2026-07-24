@@ -227,6 +227,18 @@ export function consumePendingGuardedLaunch(): string | null {
 }
 
 /**
+ * #596 Android-only: drain the one-shot "지금 필요해 was tapped on the overlay" escape flag. Returns
+ * `{ itemId, guardType }` when a fresh escape landing is pending (`itemId` may be an empty string when
+ * no task was armed), else `null`. The app drains this on resume and routes to the reason screen
+ * (guardian_escape) — the Android analogue of the iOS ShieldAction escape notification payload.
+ * Always `null` off Android (iOS routes via the notification payload instead).
+ */
+export function consumePendingGuardedEscape(): { itemId: string; guardType: string } | null {
+  if (Platform.OS !== "android") return null;
+  return NativeModule.consumePendingGuardedEscape() ?? null;
+}
+
+/**
  * Whether THIS native binary actually bundles the guardian enforcement code — the iOS Family
  * Controls extensions (shield/monitor `.appex`) or the Android blocker — independent of the JS/OTA
  * bundle. iOS reads the app bundle's PlugIns dir; Android is always `true` (the blocker is compiled

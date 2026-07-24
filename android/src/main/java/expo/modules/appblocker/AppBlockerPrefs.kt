@@ -24,6 +24,24 @@ object AppBlockerPrefs {
   // suppressed, independent of the lock layers. 0 = no ticket. The service tick honors it; the
   // boundary alarm wakes the service at this instant to re-block even if the service had been killed.
   private const val KEY_SUPPRESSION_UNTIL = "suppression_until_millis"
+  // #598 targeted escape ticket: while a ticket is live and this is set, only this ONE package is
+  // exempt (opens) — every other blocked package stays blocked. Absent → full suppression (all open).
+  // Promoted from the escape-target candidate the overlay records when "지금 필요해" is tapped.
+  private const val KEY_SUPPRESSION_TARGET_PACKAGE = "suppression_target_package"
+  // #598: the package the user pressed "지금 필요해" on, recorded by the overlay (+ freshness ts).
+  // suppressBlocksAndroid consumes it and promotes it to KEY_SUPPRESSION_TARGET_PACKAGE.
+  private const val KEY_ESCAPE_TARGET_PACKAGE = "escape_target_package"
+  private const val KEY_ESCAPE_TARGET_PACKAGE_TS = "escape_target_package_ts"
+  // #596 escape landing: the one-shot "지금 필요해 was tapped" flag — the escape variant of
+  // KEY_PENDING_GUARDED_LAUNCH. Carries the guarded task id + guardType so the JS router lands on the
+  // reason screen (guardian_escape) instead of the task. Same freshness window as the normal launch.
+  private const val KEY_PENDING_GUARDED_ESCAPE = "pending_guarded_escape"
+  private const val KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE = "pending_guarded_escape_guard_type"
+  private const val KEY_PENDING_GUARDED_ESCAPE_TS = "pending_guarded_escape_ts"
+  // #596: overlay button labels (injected by the app via configureAndroid, English fallbacks here —
+  // no Korean hardcoded in the fork). Primary = "하러 가기" landing, secondary = "지금 필요해" escape.
+  private const val KEY_OVERLAY_PRIMARY_BUTTON = "overlay_primary_button"
+  private const val KEY_OVERLAY_SECONDARY_BUTTON = "overlay_secondary_button"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
   private const val KEY_OVERLAY_BG_COLOR = "overlay_bg_color"
@@ -146,15 +164,93 @@ object AppBlockerPrefs {
       .apply()
   }
 
-  /** #572: drop the escape ticket. */
+  /** #572: drop the escape ticket. #598: and its targeted package, so a later ticket starts clean. */
   fun clearSuppression(context: Context) {
-    get(context).edit().remove(KEY_SUPPRESSION_UNTIL).apply()
+    get(context).edit()
+      .remove(KEY_SUPPRESSION_UNTIL)
+      .remove(KEY_SUPPRESSION_TARGET_PACKAGE)
+      .apply()
   }
 
   /** #572: true while an escape ticket is live (`now < suppressionUntil`). */
   fun isSuppressed(context: Context): Boolean {
     val until = getSuppressionUntil(context)
     return until > 0L && System.currentTimeMillis() < until
+  }
+
+  /**
+   * #598: the ONE package a live targeted escape ticket keeps open (every other blocked package stays
+   * blocked), or null for a full-suppression ticket (all open). Set by [setSuppressionTargetPackage].
+   */
+  fun getSuppressionTargetPackage(context: Context): String? =
+    get(context).getString(KEY_SUPPRESSION_TARGET_PACKAGE, null)
+
+  /** #598: plant/clear the targeted-ticket package. null/empty clears it (→ full suppression). */
+  fun setSuppressionTargetPackage(context: Context, packageName: String?) {
+    val editor = get(context).edit()
+    if (packageName.isNullOrEmpty()) editor.remove(KEY_SUPPRESSION_TARGET_PACKAGE)
+    else editor.putString(KEY_SUPPRESSION_TARGET_PACKAGE, packageName)
+    editor.apply()
+  }
+
+  /** #598: the overlay records the package the user pressed "지금 필요해" on (candidate + freshness). */
+  fun recordEscapeTargetPackage(context: Context, packageName: String, atMillis: Long) {
+    get(context).edit()
+      .putString(KEY_ESCAPE_TARGET_PACKAGE, packageName)
+      .putLong(KEY_ESCAPE_TARGET_PACKAGE_TS, atMillis)
+      .apply()
+  }
+
+  /**
+   * #598: return and clear the escape-target candidate iff fresh (same window as the guarded launch),
+   * for suppressBlocksAndroid to promote to the ticket's target. Stale/absent → null → full open.
+   */
+  fun consumeEscapeTargetPackage(context: Context): String? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_ESCAPE_TARGET_PACKAGE_TS, 0L)
+    val pkg = prefs.getString(KEY_ESCAPE_TARGET_PACKAGE, null)
+    if (ts > 0L || pkg != null) {
+      prefs.edit().remove(KEY_ESCAPE_TARGET_PACKAGE).remove(KEY_ESCAPE_TARGET_PACKAGE_TS).apply()
+    }
+    if (ts <= 0L || pkg.isNullOrEmpty()) return null
+    return if (System.currentTimeMillis() - ts <= MAX_PENDING_GUARDED_LAUNCH_AGE_MS) pkg else null
+  }
+
+  /**
+   * #596: record the one-shot escape flag ("지금 필요해" tapped) — the escape variant of
+   * [recordPendingGuardedLaunch]. Stamps the currently-armed guarded task id + the guardType, and
+   * clears any normal pending-launch flag so a single overlay tap routes to exactly one place.
+   */
+  fun recordPendingGuardedEscape(context: Context, guardType: String, atMillis: Long) {
+    val prefs = get(context)
+    val itemId = prefs.getString(KEY_GUARDED_ITEM_ID, "") ?: ""
+    prefs.edit()
+      .putString(KEY_PENDING_GUARDED_ESCAPE, itemId)
+      .putString(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE, guardType)
+      .putLong(KEY_PENDING_GUARDED_ESCAPE_TS, atMillis)
+      .remove(KEY_PENDING_GUARDED_LAUNCH)
+      .remove(KEY_PENDING_GUARDED_LAUNCH_TS)
+      .apply()
+  }
+
+  /**
+   * #596: return and clear the pending escape flag as { itemId, guardType } when a fresh escape tap is
+   * pending, else null. The JS router drains it on resume and lands on the reason screen
+   * (guardian_escape), mirroring the iOS ShieldAction escape notification payload.
+   */
+  fun consumePendingGuardedEscape(context: Context): Map<String, String>? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_PENDING_GUARDED_ESCAPE_TS, 0L)
+    if (ts <= 0L) return null
+    val itemId = prefs.getString(KEY_PENDING_GUARDED_ESCAPE, "") ?: ""
+    val guardType = prefs.getString(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE, "") ?: ""
+    prefs.edit()
+      .remove(KEY_PENDING_GUARDED_ESCAPE)
+      .remove(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE)
+      .remove(KEY_PENDING_GUARDED_ESCAPE_TS)
+      .apply()
+    if (System.currentTimeMillis() - ts > MAX_PENDING_GUARDED_LAUNCH_AGE_MS) return null
+    return mapOf("itemId" to itemId, "guardType" to guardType)
   }
 
   /**
@@ -223,12 +319,16 @@ object AppBlockerPrefs {
     overlaySpinnerSize: Float?,
     overlaySpinnerTopMargin: Float?,
     overlaySpinnerColor: String?,
+    overlayPrimaryButtonText: String?,
+    overlaySecondaryButtonText: String?,
     notificationTitle: String?,
     notificationText: String?,
   ) {
     val editor = get(context).edit()
       .putString(KEY_OVERLAY_TITLE, overlayTitle)
       .putString(KEY_OVERLAY_TEXT, overlayText)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON, overlayPrimaryButtonText)
+      .putString(KEY_OVERLAY_SECONDARY_BUTTON, overlaySecondaryButtonText)
       .putString(KEY_OVERLAY_BG_COLOR, overlayBackgroundColor)
       .putString(KEY_OVERLAY_TITLE_COLOR, overlayTitleColor)
       .putString(KEY_OVERLAY_TEXT_COLOR, overlayTextColor)
@@ -261,6 +361,17 @@ object AppBlockerPrefs {
 
   fun getOverlayText(context: Context): String =
     get(context).getString(KEY_OVERLAY_TEXT, null) ?: "{appName} is blocked."
+
+  // #596 overlay buttons. Primary = "하러 가기" landing (always shown). Secondary = "지금 필요해"
+  // escape (shown unless the app disables it by passing "none"/empty). English fallbacks only —
+  // the app injects the Korean copy via configureAndroid.
+  fun getOverlayPrimaryButtonText(context: Context): String =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON, null) ?: "Go do it"
+
+  fun getOverlaySecondaryButtonText(context: Context): String? {
+    val value = get(context).getString(KEY_OVERLAY_SECONDARY_BUTTON, null) ?: "I need it now"
+    return if (value.isEmpty() || value == "none") null else value
+  }
 
   fun getOverlayBackgroundColor(context: Context): String =
     get(context).getString(KEY_OVERLAY_BG_COLOR, null) ?: "#FFFFFF"

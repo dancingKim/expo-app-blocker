@@ -48,12 +48,23 @@ class AppBlockerService : Service() {
     getCurrentForegroundPackage()?.let { currentForeground = it }
     val foreground = currentForeground
 
-    // #572 escape ticket: a valid ticket suppresses ALL blocking (immediate + schedule), independent
-    // of the lock layers — keep every app open while it is live. On the first tick after it expires
-    // (maybeExpireSuppression cleared the pref above) this is false, so the block re-applies then.
+    // #572/#598 escape ticket: a valid ticket suppresses blocking, independent of the lock layers.
+    // A FULL ticket (no target) keeps every app open; a TARGETED ticket (#598) exempts only the
+    // escaped package — a DIFFERENT blocked app in the foreground stays blocked. On the first tick
+    // after it expires (maybeExpireSuppression cleared the pref above) this is false, so blocks
+    // re-apply then.
     if (AppBlockerPrefs.isSuppressed(this)) {
       consumingSinceMs = 0L
-      clearBlock()
+      val target = AppBlockerPrefs.getSuppressionTargetPackage(this)
+      if (target != null && foreground != null && foreground != target && isBlocked(foreground)) {
+        // Targeted ticket, and a blocked app OTHER than the escaped one is up → keep it blocked.
+        if (!blocking || foreground != lastForegroundPackage) {
+          enforceBlock(foreground, BlockReason.OPENED)
+        }
+      } else {
+        // Full ticket, the exempted app itself, or a non-blocked app → open.
+        clearBlock()
+      }
       lastForegroundPackage = foreground
       return
     }
@@ -193,7 +204,10 @@ class AppBlockerService : Service() {
   private fun isSystemEssential(packageName: String): Boolean = packageName in essentialApps
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
-    overlayManager.show(packageName)
+    // #596: tell the overlay which layer blocked this so the escape flag it stamps carries the
+    // guardType for the JS router.
+    val guardType = if (isScheduleBlocked(packageName)) OverlayManager.GUARD_TYPE_SCHEDULE else OverlayManager.GUARD_TYPE_GATE
+    overlayManager.show(packageName, guardType)
     showBlockedNotification(packageName, reason)
     recordIntercept(packageName)
     // #535: the block just redirected the user to the app — stamp the consumable guarded-launch
