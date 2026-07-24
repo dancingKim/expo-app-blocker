@@ -4,9 +4,13 @@ import ManagedSettings
 import DeviceActivity
 import SwiftUI
 import Foundation
+import os
 
 public class ExpoAppBlockerModule: Module {
   private let appGroupIdentifier = ExpoAppBlockerConfig.appGroupIdentifier
+  // #609: one-line boot log of the RESOLVED app group, so idevicesyslog confirms the module now
+  // shares the extensions' real container (not the historical group.<bundleId> ghost).
+  private let diagLog = Logger(subsystem: "com.worthyi.chapchu.guardian", category: "module")
 
   private let authCenter = AuthorizationCenter.shared
   private let store = ManagedSettingsStore()
@@ -143,6 +147,10 @@ public class ExpoAppBlockerModule: Module {
 
     OnCreate {
       self.sharedDefaults = UserDefaults(suiteName: self.appGroupIdentifier)
+      // #609: confirm module ↔ extension container alignment on the next device round. containerNil=true
+      // means the resolved group is not entitled (still the ghost) — file handoffs would be no-ops.
+      let containerNil = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: self.appGroupIdentifier) == nil
+      self.diagLog.log("boot appGroup=\(self.appGroupIdentifier, privacy: .public) containerNil=\(containerNil, privacy: .public)")
       self.setupUnlockNotificationObserver()
 
       self.stateQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in

@@ -236,6 +236,11 @@ function withAppBlockerIOS(config, pluginConfig) {
     config.modResults.BGTaskSchedulerPermittedIdentifiers = [
       `${config.ios?.bundleIdentifier || "expo.app-blocker"}.relock`,
     ];
+    // #609: expose the app group to the MODULE at runtime. The module's Swift (ExpoAppBlockerConfig)
+    // is not placeholder-substituted like the extension templates, so without this it fell back to a
+    // ghost group.<bundleId> distinct from the extensions' real group — breaking every App-Group
+    // handoff. Same `appGroup` the entitlement + extension placeholders use, so all four stay aligned.
+    config.modResults.ExpoAppBlockerAppGroup = appGroup;
     return config;
   });
 
