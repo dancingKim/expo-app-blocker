@@ -103,6 +103,17 @@ function withAppBlockerAndroid(config, pluginConfig) {
           "android:exported": "false",
           "android:foregroundServiceType": "specialUse",
         },
+        // Android 14+ (API 34) / Play requirement: a specialUse FGS must declare its subtype here so
+        // Play review can see the use case (the guardian's always-on usage poll = app blocking /
+        // digital wellbeing).
+        property: [
+          {
+            $: {
+              "android:name": "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE",
+              "android:value": "app_blocking_digital_wellbeing",
+            },
+          },
+        ],
       });
     }
 
