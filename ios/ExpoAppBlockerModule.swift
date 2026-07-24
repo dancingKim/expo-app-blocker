@@ -39,6 +39,11 @@ public class ExpoAppBlockerModule: Module {
   // `unlockActivityName`.
   private let scheduleConfigStorageKey = "appBlocker.scheduleConfiguration.v1"
   private let scheduleActivityPrefix = "appBlocker.scheduleWindow."
+  // #525: which schedule-shield variant is currently active ("bedtime" | "schedule"), read by
+  // ShieldConfiguration to pick the rendered shield. The monitor is the usual writer; the module
+  // also writes it when it re-applies the schedule (gap) shield itself — see
+  // `reevaluateScheduleShieldFromPersisted` (#601). Absent = no schedule shield → default shield.
+  private let scheduleShieldVariantKey = "appBlocker.scheduleShieldVariant.v1"
   // Immediate-block wall-clock expiry (#535). When `setBlockConfiguration` carries
   // `expiresAtMillis`, one DeviceActivity fires at that instant and the monitor extension lifts
   // the immediate shield — a kill-proof release guarantee mirroring Android's `expiresAtMillis`.
@@ -242,12 +247,25 @@ public class ExpoAppBlockerModule: Module {
       return self.serializeBlockConfig(config)
     }
 
+    // Tear down the IMMEDIATE (gate/focus) block — the immediate `store` shield and its persisted
+    // config only. This is the JS `releaseLock('gate'|'focus')` native path; the schedule store and
+    // its config are a separate layer with their own teardown (`clearScheduleConfiguration`).
+    //
+    // #601 ticket-restore leak: the escape ticket (suppression) is layer-agnostic — it also lowered
+    // the SCHEDULE shield. Blindly `clearSuppressionState()` here cancels the suppression-expiry
+    // DeviceActivity (the kill-proof backstop that re-applies the schedule shield at ticket expiry)
+    // and orphans the schedule shield DOWN even though we are outside every free window. So branch:
+    //   · ticket still live → preserve the ticket, its expiry activity, and the schedule config; the
+    //     backstop restores the schedule shield when the ticket ends (respect the ticket's lifetime).
+    //   · no live ticket → drop any stale ticket and recompute the schedule shield from the persisted
+    //     config by wall-clock now (restore it if we are outside every free window).
+    // In BOTH branches the immediate config is removed, so a suppression-expiry recompute never
+    // re-arms a gate whose session already ended (satisfied) — it only restores the schedule.
     Function("clearAllBlocks") {
       self.stateQueue.async {
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
         self.cancelImmediateExpiryActivity()  // #535: drop any pending wall-clock expiry
-        self.clearSuppressionState()          // #572: tearing down blocks drops any escape ticket
         self.store.shield.applications = nil
         self.store.shield.applicationCategories = nil
         self.store.shield.webDomains = nil
@@ -255,6 +273,15 @@ public class ExpoAppBlockerModule: Module {
         self.userDefaults.removeObject(forKey: self.blockConfigStorageKey)
         self.sharedDefaults?.removeObject(forKey: self.blockConfigStorageKey)
         self.clearUnlockState()
+
+        if self.isSuppressedInternal() {
+          // Ticket still live — leave suppression state + its expiry DeviceActivity + the persisted
+          // schedule config untouched. The monitor's suppression-expiry backstop re-applies the
+          // schedule shield from config when the ticket ends. (Do NOT clearSuppressionState here.)
+        } else {
+          self.clearSuppressionState()
+          self.reevaluateScheduleShieldFromPersisted()
+        }
       }
     }
 
@@ -1165,6 +1192,40 @@ public class ExpoAppBlockerModule: Module {
     scheduleStore.shield.applications = nil
     scheduleStore.shield.applicationCategories = nil
     scheduleStore.shield.webDomains = nil
+  }
+
+  /// #601: recompute the SCHEDULE shield from the persisted config by wall-clock — the module-side
+  /// equivalent of the monitor's `reevaluateScheduleShield`. Used when tearing down the immediate
+  /// block (`clearAllBlocks`) so a schedule shield an escape ticket had lowered is restored NOW if we
+  /// are outside every free window, instead of waiting orphaned for the next window boundary. Only
+  /// ever touches the dedicated `scheduleStore` (never the immediate `store`, so a satisfied gate is
+  /// not re-armed) and the App-Group variant key ShieldConfiguration reads. Callers must run this only
+  /// when no live ticket exists; a live ticket keeps the schedule shield down (defensive re-check).
+  private func reevaluateScheduleShieldFromPersisted() {
+    if isSuppressedInternal() {
+      clearScheduleShield()
+      sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
+      return
+    }
+    guard let dict = userDefaults.dictionary(forKey: scheduleConfigStorageKey)
+      ?? sharedDefaults?.dictionary(forKey: scheduleConfigStorageKey) else {
+      clearScheduleShield()
+      sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
+      return
+    }
+    let windows = parseScheduleWindows(dict)
+    let mode = scheduleMode(dict)
+    let items = makeBlockedItems(from: scheduleItemsRaw(dict, mode: mode))
+    if windows.isEmpty || isAnyScheduleWindowActive(windows: windows, at: Date()) {
+      // Not armed, or inside a free window → fully open.
+      clearScheduleShield()
+      sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
+    } else {
+      // Outside every free window → restore the gap shield. Mirrors the monitor: the gap shield
+      // always records the "schedule" variant (weekday shield, keeps its redirect + escape buttons).
+      applyScheduleShield(items, mode: mode)
+      sharedDefaults?.set("schedule", forKey: scheduleShieldVariantKey)
+    }
   }
 
   private func parseScheduleWindows(_ config: [String: Any]) -> [ScheduleWindowInfo] {
