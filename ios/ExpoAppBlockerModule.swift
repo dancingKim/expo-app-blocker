@@ -108,35 +108,30 @@ public class ExpoAppBlockerModule: Module {
 
     // Native view that renders blocked app tokens with real names and icons
     View(BlockedAppsView.self) {
+      // #602: a row's minus button emits { index, token, type } for RN to remove from its SSOT — the
+      // view never mutates registration itself (JS owns the allowed-apps list). The `tokens` path
+      // preserves the exact base64 tokenId RN passed, so RN can match the removed item precisely.
+      Events("onRemoveItem")
+
       Prop("selectionData") { (view: BlockedAppsView, selectionBase64: String) in
         guard !selectionBase64.isEmpty,
               let data = Data(base64Encoded: selectionBase64),
               let selection = try? JSONDecoder().decode(FamilyActivitySelection.self, from: data)
-        else { return }
-        view.viewModel.selection = selection
+        else {
+          view.viewModel.items = []
+          return
+        }
+        view.setItemsFromSelection(selection)
       }
 
       Prop("tokens") { (view: BlockedAppsView, tokens: [[String: String]]) in
-        var appTokens: Set<ApplicationToken> = []
-        var categoryTokens: Set<ActivityCategoryToken> = []
+        view.setItemsFromTokens(tokens)
+      }
 
-        for tokenInfo in tokens {
-          guard let tokenString = tokenInfo["token"], let type = tokenInfo["type"] else { continue }
-          if type == "app" {
-            if let token = Self.decodeApplicationTokenStatic(from: tokenString) {
-              appTokens.insert(token)
-            }
-          } else if type == "category" {
-            if let token = Self.decodeCategoryTokenStatic(from: tokenString) {
-              categoryTokens.insert(token)
-            }
-          }
-        }
-
-        var selection = FamilyActivitySelection()
-        selection.applicationTokens = appTokens
-        selection.categoryTokens = categoryTokens
-        view.viewModel.selection = selection
+      // #602: render a per-row remove (minus) button. Default false keeps the render-only look for
+      // any caller that just wants the labelled list.
+      Prop("removable") { (view: BlockedAppsView, removable: Bool) in
+        view.viewModel.removable = removable
       }
     }
 
@@ -1560,18 +1555,33 @@ public class ExpoAppBlockerModule: Module {
 
 // MARK: - Native View for rendering blocked app tokens with real names/icons
 
+/// #602: one rendered registered-app row. `id` is the exact base64 tokenId RN passed (stable ForEach
+/// identity + the identifier echoed back in `onRemoveItem`), so RN can match the removed row precisely.
+struct BlockedAppRenderItem: Identifiable {
+  let id: String
+  let type: String   // "app" | "category"
+  let appToken: ApplicationToken?
+  let categoryToken: ActivityCategoryToken?
+}
+
 class BlockedAppsViewModel: ObservableObject {
-  @Published var selection = FamilyActivitySelection()
+  // Ordered so ForEach keeps the caller's order and the remove index is meaningful.
+  @Published var items: [BlockedAppRenderItem] = []
+  @Published var removable: Bool = false
 }
 
 class BlockedAppsView: ExpoView {
   let viewModel = BlockedAppsViewModel()
+  // #602: fired when the user taps a row's remove button. Payload { index, token, type }.
+  let onRemoveItem = EventDispatcher()
   private var hostingController: UIHostingController<BlockedAppsContentView>?
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
     clipsToBounds = true
-    let contentView = BlockedAppsContentView(viewModel: viewModel)
+    let contentView = BlockedAppsContentView(viewModel: viewModel) { [weak self] item, index in
+      self?.handleRemove(item: item, index: index)
+    }
     let hc = UIHostingController(rootView: contentView)
     hc.view.backgroundColor = .clear
     addSubview(hc.view)
@@ -1582,10 +1592,57 @@ class BlockedAppsView: ExpoView {
     super.layoutSubviews()
     hostingController?.view.frame = bounds
   }
+
+  /// Build the ordered render list from the RN `tokens` prop, preserving each item's exact base64
+  /// tokenId (the identifier RN can match on) and the caller's order.
+  func setItemsFromTokens(_ tokens: [[String: String]]) {
+    var items: [BlockedAppRenderItem] = []
+    for tokenInfo in tokens {
+      guard let tokenString = tokenInfo["token"], let type = tokenInfo["type"] else { continue }
+      if type == "app" {
+        if let token = ExpoAppBlockerModule.decodeApplicationTokenStatic(from: tokenString) {
+          items.append(BlockedAppRenderItem(id: tokenString, type: "app", appToken: token, categoryToken: nil))
+        }
+      } else if type == "category" {
+        if let token = ExpoAppBlockerModule.decodeCategoryTokenStatic(from: tokenString) {
+          items.append(BlockedAppRenderItem(id: tokenString, type: "category", appToken: nil, categoryToken: token))
+        }
+      }
+    }
+    viewModel.items = items
+  }
+
+  /// Fallback path (a full FamilyActivitySelection). Token order isn't preserved by the Set, and the
+  /// tokenId is re-encoded (deterministic, matching serializeBlockConfig), so RN callers that need
+  /// exact identity should prefer the `tokens` prop.
+  func setItemsFromSelection(_ selection: FamilyActivitySelection) {
+    var items: [BlockedAppRenderItem] = []
+    for token in selection.applicationTokens {
+      if let data = try? JSONEncoder().encode(token) {
+        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "app", appToken: token, categoryToken: nil))
+      }
+    }
+    for token in selection.categoryTokens {
+      if let data = try? JSONEncoder().encode(token) {
+        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "category", appToken: nil, categoryToken: token))
+      }
+    }
+    viewModel.items = items
+  }
+
+  private func handleRemove(item: BlockedAppRenderItem, index: Int) {
+    onRemoveItem([
+      "index": index,
+      "token": item.id,
+      "type": item.type
+    ])
+  }
 }
 
 struct BlockedAppsContentView: View {
   @ObservedObject var viewModel: BlockedAppsViewModel
+  // #602: invoked with the tapped row + its index; the view emits, RN removes.
+  var onRemove: (BlockedAppRenderItem, Int) -> Void
 
   // Grandmizer design system colors
   private let cardBg = Color(red: 1.0, green: 1.0, blue: 1.0)           // #ffffff
@@ -1594,24 +1651,44 @@ struct BlockedAppsContentView: View {
   private let subtitleColor = Color(red: 0.73, green: 0.73, blue: 0.73) // #bbbbbb
   private let greenBadgeBg = Color(red: 0.94, green: 0.96, blue: 0.91)  // #f0f6e8
   private let greenText = Color(red: 0.24, green: 0.31, blue: 0.0)      // #3d5000
+  private let removeColor = Color(red: 0.73, green: 0.73, blue: 0.73)   // #bbbbbb
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
-      ForEach(Array(viewModel.selection.applicationTokens), id: \.self) { token in
+      ForEach(Array(viewModel.items.enumerated()), id: \.element.id) { index, item in
         HStack(spacing: 12) {
-          Label(token)
-            .labelStyle(.titleAndIcon)
-            .font(.system(size: 16, weight: .semibold))
-            .tint(labelColor)
-            .foregroundStyle(labelColor)
+          if let appToken = item.appToken {
+            Label(appToken)
+              .labelStyle(.titleAndIcon)
+              .font(.system(size: 16, weight: .semibold))
+              .tint(labelColor)
+              .foregroundStyle(labelColor)
+          } else if let categoryToken = item.categoryToken {
+            Label(categoryToken)
+              .labelStyle(.titleAndIcon)
+              .font(.system(size: 16, weight: .semibold))
+              .tint(labelColor)
+              .foregroundStyle(labelColor)
+          }
           Spacer()
-          Text("App")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(greenText)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(greenBadgeBg)
-            .cornerRadius(100)
+          if viewModel.removable {
+            Button {
+              onRemove(item, index)
+            } label: {
+              Image(systemName: "minus.circle.fill")
+                .font(.system(size: 22))
+                .foregroundColor(removeColor)
+            }
+            .buttonStyle(.plain)
+          } else {
+            Text(item.type == "category" ? "Category" : "App")
+              .font(.system(size: 11, weight: .semibold))
+              .foregroundColor(greenText)
+              .padding(.horizontal, 10)
+              .padding(.vertical, 4)
+              .background(greenBadgeBg)
+              .cornerRadius(100)
+          }
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 14)
@@ -1623,33 +1700,7 @@ struct BlockedAppsContentView: View {
         )
       }
 
-      ForEach(Array(viewModel.selection.categoryTokens), id: \.self) { token in
-        HStack(spacing: 12) {
-          Label(token)
-            .labelStyle(.titleAndIcon)
-            .font(.system(size: 16, weight: .semibold))
-            .tint(labelColor)
-            .foregroundStyle(labelColor)
-          Spacer()
-          Text("Category")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(greenText)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(greenBadgeBg)
-            .cornerRadius(100)
-        }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 14)
-        .background(cardBg)
-        .cornerRadius(16)
-        .overlay(
-          RoundedRectangle(cornerRadius: 16)
-            .stroke(borderColor, lineWidth: 1)
-        )
-      }
-
-      if viewModel.selection.applicationTokens.isEmpty && viewModel.selection.categoryTokens.isEmpty {
+      if viewModel.items.isEmpty {
         Text("No apps blocked")
           .foregroundColor(subtitleColor)
           .font(.system(size: 14))

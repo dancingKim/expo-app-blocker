@@ -174,11 +174,33 @@ export interface FamilyActivityPickerViewProps {
   style?: any;
 }
 
+/**
+ * #602: emitted when the user taps a row's remove button. Identifies the removed row by both its
+ * position (`index`) and its exact base64 token string (`token` — the same value passed in via
+ * `items[].token`), so the JS owner can drop it from its registration SSOT. The native view does NOT
+ * mutate anything itself — registration state lives in JS.
+ */
+export interface BlockedAppsRemoveEvent {
+  /** Position of the removed row in the `items` array. */
+  index: number;
+  /** Base64 token string of the removed item (matches `items[].token`). */
+  token: string;
+  /** "app" | "category" */
+  type: string;
+}
+
 export interface BlockedAppsNativeListProps {
   /** Array of blocked items from picker */
   items: IOSBlockedItem[];
   /** Base64-encoded FamilyActivitySelection for accurate rendering */
   selectionData?: string;
+  /**
+   * #602: render a per-row remove (minus) button. Default false keeps the plain labelled list.
+   * Requires `onRemoveItem` to be useful.
+   */
+  removable?: boolean;
+  /** #602: called when a row's remove button is tapped. See {@link BlockedAppsRemoveEvent}. */
+  onRemoveItem?: (event: BlockedAppsRemoveEvent) => void;
   /** Standard React Native style */
   style?: any;
 }

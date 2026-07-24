@@ -21,6 +21,7 @@ import type {
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
+  BlockedAppsRemoveEvent,
 } from "./ExpoAppBlocker.types";
 
 export type {
@@ -44,6 +45,7 @@ export type {
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
+  BlockedAppsRemoveEvent,
 } from "./ExpoAppBlocker.types";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -479,6 +481,8 @@ if (Platform.OS === "ios") {
 export function BlockedAppsNativeList({
   items,
   selectionData,
+  removable,
+  onRemoveItem,
   style,
 }: BlockedAppsNativeListProps) {
   if (!NativeBlockedAppsView || Platform.OS !== "ios") return null;
@@ -490,6 +494,12 @@ export function BlockedAppsNativeList({
   return React.createElement(NativeBlockedAppsView, {
     selectionData: selectionData || "",
     tokens,
+    ...(removable !== undefined ? { removable } : {}),
+    // #602: the native view emits { index, token, type }; unwrap nativeEvent for the caller. The view
+    // never mutates registration — the JS owner drops the item from its SSOT.
+    onRemoveItem: onRemoveItem
+      ? (e: { nativeEvent: BlockedAppsRemoveEvent }) => onRemoveItem(e.nativeEvent)
+      : undefined,
     style: [{ minHeight: 50 }, style],
   });
 }
