@@ -46,6 +46,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // keeping every shield fully down — so a schedule boundary or stray usage step mid-ticket does not
   // re-block the escaped app. Absent → full suppression (every shield stays down). Set by the module.
   private let suppressionTargetTokenKey = "appBlocker.suppressionTargetToken.v1"
+  // #601 diagnostics: the monitor's kill-proof suppression-expiry re-lock decision, for the next
+  // real-device round. JSON { firedAt, decision, scheduleConfigPresent, immediateConfigPresent }.
+  // decision ∈ reapplied-schedule-shield | schedule-open-window | schedule-not-armed |
+  // no-schedule-config | not-due. "no-schedule-config" at expiry = the app-side orphan the JS heal
+  // targets; anything else means the native backstop resolved the schedule shield correctly.
+  private let suppressionExpiryProbeKey = "appBlocker.suppressionExpiryProbe.v1"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -197,11 +203,43 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
       return
     }
-    guard Date().timeIntervalSince1970 * 1000.0 >= until else { return }
+    guard Date().timeIntervalSince1970 * 1000.0 >= until else {
+      // Spurious/early boundary fire — ticket not actually over yet; nothing re-locked.
+      writeSuppressionExpiryProbe(decision: "not-due")
+      return
+    }
     defaults.removeObject(forKey: suppressionUntilKey)
     // #598: drop the ticket's target too so the recompute re-shields the previously-exempt app.
     defaults.removeObject(forKey: suppressionTargetTokenKey)
     recomputeShieldsAfterSuppression()
+  }
+
+  /// #601: record how the suppression-expiry backstop resolved the SCHEDULE shield, so the next
+  /// real-device round can tell "native restored it" from "app-side config orphan" at a glance.
+  /// Derives the decision from the same persisted config `reevaluateScheduleShield` reads.
+  private func writeSuppressionExpiryProbe(decision: String) {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    let probe: [String: Any] = [
+      "firedAt": Int64(Date().timeIntervalSince1970 * 1000.0),
+      "decision": decision,
+      "scheduleConfigPresent": defaults.dictionary(forKey: scheduleConfigStorageKey) != nil,
+      "immediateConfigPresent": defaults.dictionary(forKey: blockConfigStorageKey) != nil
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: probe),
+       let json = String(data: data, encoding: .utf8) {
+      defaults.set(json, forKey: suppressionExpiryProbeKey)
+    }
+  }
+
+  /// The schedule-shield outcome `reevaluateScheduleShield` will produce for the current wall clock —
+  /// computed with the same persisted config + window logic, purely for the expiry probe label.
+  private func scheduleReapplyDecision() -> String {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else { return "no-schedule-config" }
+    let windows = parseScheduleWindows(dict)
+    if windows.isEmpty { return "schedule-not-armed" }
+    if activeScheduleVariant(windows: windows, at: Date()) != nil { return "schedule-open-window" }
+    return "reapplied-schedule-shield"
   }
 
   /// Re-apply the immediate shield from the persisted config (unless its OWN wall-clock expiry has
@@ -225,6 +263,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       store.shield.webDomains = nil
     }
     reevaluateScheduleShield()
+    // #601: record whether the persisted schedule config was present and re-shielded, or absent
+    // (the app-side orphan the JS heal covers). Suppression is already cleared here, so
+    // reevaluateScheduleShield restored the schedule shield iff we're outside every free window.
+    writeSuppressionExpiryProbe(decision: scheduleReapplyDecision())
   }
 
   /// Extract the threshold seconds from an event name like `appBlocker.usageStep.90`;
