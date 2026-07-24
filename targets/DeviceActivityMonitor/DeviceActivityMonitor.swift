@@ -41,6 +41,11 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // intervalDidStart is the kill-proof point to recompute the shields from the persisted config.
   private let suppressionUntilKey = "appBlocker.suppressionUntil.v1"
   private let suppressionExpiryActivityName = "appBlocker.suppressionExpiry"
+  // #598 targeted escape ticket: the base64 ApplicationToken the ticket opens. When present the
+  // monitor re-applies each shield with that one app exempt (via the allow-except set) instead of
+  // keeping every shield fully down — so a schedule boundary or stray usage step mid-ticket does not
+  // re-block the escaped app. Absent → full suppression (every shield stays down). Set by the module.
+  private let suppressionTargetTokenKey = "appBlocker.suppressionTargetToken.v1"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -175,6 +180,16 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return Date().timeIntervalSince1970 * 1000.0 < until
   }
 
+  /// #598: the one app a live TARGETED escape ticket keeps open — exempt from every shield the
+  /// monitor re-applies. nil for a full-suppression ticket or when no ticket is live. Mirrors the
+  /// app module's identical gate (App Group is the shared source of truth).
+  private func escapeExemptToken() -> ApplicationToken? {
+    guard isSuppressed() else { return nil }
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let encoded = defaults.string(forKey: suppressionTargetTokenKey), !encoded.isEmpty else { return nil }
+    return decodeApplicationToken(from: encoded)
+  }
+
   /// #572: the escape-ticket window has passed. Drop the persisted ticket and recompute both shields
   /// from the stored config (kill-proof re-application). Guards a spurious/early boundary fire.
   private func expireSuppressionIfDue() {
@@ -184,6 +199,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
     guard Date().timeIntervalSince1970 * 1000.0 >= until else { return }
     defaults.removeObject(forKey: suppressionUntilKey)
+    // #598: drop the ticket's target too so the recompute re-shields the previously-exempt app.
+    defaults.removeObject(forKey: suppressionTargetTokenKey)
     recomputeShieldsAfterSuppression()
   }
 
@@ -226,9 +243,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   private func reapplyBlockConfiguration() {
-    // #572: a live escape ticket keeps the shield down — never re-block while it is valid (e.g. a
-    // stray usage-step boundary). The monitor re-applies from this same path once the ticket expires.
-    if isSuppressed() { return }
+    // #572/#598: a live FULL escape ticket keeps the shield down — never re-block while it is valid
+    // (e.g. a stray usage-step boundary). A TARGETED ticket (#598) instead re-applies the shield with
+    // just the escaped app exempt. Either way the monitor re-applies from this same path once the
+    // ticket expires.
+    let exempt = escapeExemptToken()
+    if isSuppressed() && exempt == nil { return }
 
     let userDefaults = sharedDefaults ?? UserDefaults.standard
 
@@ -243,7 +263,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    applyBlocks(blockConfig)
+    applyBlocks(blockConfig, exempt: exempt)
   }
 
   // MARK: - Schedule-Window Blocking
@@ -253,8 +273,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// `store` (immediate blocks) and the temporary-unlock state.
   private func reevaluateScheduleShield() {
     let defaults = sharedDefaults ?? UserDefaults.standard
-    // #572: a live escape ticket also suppresses the schedule shield — keep it down while valid.
-    if isSuppressed() {
+    // #572/#598: a live FULL escape ticket also suppresses the schedule shield — keep it down while
+    // valid. A TARGETED ticket instead exempts just the escaped app and keeps the gap shield up.
+    let exempt = escapeExemptToken()
+    if isSuppressed() && exempt == nil {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -281,10 +303,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
     } else {
-      // Outside all free windows → shield everything but the allowed apps. The gap shield always
-      // records the "schedule" (weekday, redirect-button) variant; the per-window bedtime/schedule
-      // tag no longer selects the shield (it was the in-window shield of the old lock model).
-      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode)
+      // Outside all free windows → shield everything but the allowed apps (minus the escaped app for
+      // a targeted ticket). The gap shield always records the "schedule" (weekday, redirect-button)
+      // variant; the per-window bedtime/schedule tag no longer selects the shield.
+      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode, exempt: exempt)
       defaults.set("schedule", forKey: scheduleShieldVariantKey)
     }
   }
@@ -363,13 +385,14 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
   }
 
-  private func applyScheduleShield(_ items: [MonitorBlockedItemInfo], mode: BlockMode) {
+  private func applyScheduleShield(_ items: [MonitorBlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
-      applyAllowlistShield(scheduleStore, allowed: items)
+      applyAllowlistShield(scheduleStore, allowed: items, exempt: exempt)
       return
     }
-    let apps = items.compactMap { $0.appToken }
+    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let apps = items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
     if apps.isEmpty {
@@ -393,14 +416,18 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// `ShieldSettings.ActivityCategoryPolicy.all(except:)`. Only ApplicationTokens can go in the
   /// except-set (the app layer refuses non-app selections). Empty allowed set → no shield (the app
   /// gates 0 allowed apps as "lock not possible", so empty is never a real block-all here).
-  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo]) {
-    let allowedAppTokens = Set(items.compactMap { $0.appToken })
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo], exempt: ApplicationToken? = nil) {
+    var allowedAppTokens = Set(items.compactMap { $0.appToken })
     if allowedAppTokens.isEmpty {
+      // Empty allow set = no shield on this store; a targeted-ticket exempt must not turn that into
+      // a block-everything-except-one shield.
       managedStore.shield.applications = nil
       managedStore.shield.applicationCategories = nil
       managedStore.shield.webDomains = nil
       return
     }
+    // #598: the escaped app joins the allow (except) set for the ticket.
+    if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
@@ -462,7 +489,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return MonitorBlockConfig(items: items, isActive: isActive, mode: mode)
   }
 
-  private func applyBlocks(_ config: MonitorBlockConfig) {
+  private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil) {
     guard config.isActive else {
       store.shield.applications = nil
       store.shield.applicationCategories = nil
@@ -473,11 +500,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // #563 allowlist: shield every app except the kept ones (whether iOS also exempts
     // system-essential/controlling apps is pending real-device verification).
     if config.mode == .allow {
-      applyAllowlistShield(store, allowed: config.items)
+      applyAllowlistShield(store, allowed: config.items, exempt: exempt)
       return
     }
 
-    let validAppTokens = config.items.compactMap { $0.appToken }
+    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let validAppTokens = config.items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let validCategoryTokens = config.items.compactMap { $0.categoryToken }
     let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
 

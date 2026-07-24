@@ -58,6 +58,16 @@ public class ExpoAppBlockerModule: Module {
   // monitor extension can read it. Absent key = never suppressed = original behavior (back-compat).
   private let suppressionUntilKey = "appBlocker.suppressionUntil.v1"
   private let suppressionExpiryActivityName = "appBlocker.suppressionExpiry"
+  // #598 targeted escape ticket. The ShieldAction records the ApplicationToken the user pressed
+  // "지금 필요해" on into `escapeTargetTokenKey` (+ a timestamp for freshness). `suppressBlocks`
+  // consumes it and, when fresh, promotes it to `suppressionTargetTokenKey` — the ONE app that stays
+  // open for the ticket while every other blocked app remains shielded (added to each store's
+  // allow-except set). Absent/stale capture (web/category shield) → the ticket lowers everything
+  // (the original full-suppression behavior), so back-compat is preserved.
+  private let escapeTargetTokenKey = "appBlocker.escapeTargetToken.v1"
+  private let escapeTargetTokenTsKey = "appBlocker.escapeTargetTokenTs.v1"
+  private let suppressionTargetTokenKey = "appBlocker.suppressionTargetToken.v1"
+  private let escapeTargetTokenMaxAgeMs: Double = 5 * 60 * 1000
   // DeviceActivity requires a monitored interval to be at least ~15 minutes. A
   // cross-midnight split fragment shorter than this is skipped (the evaluator still
   // corrects the shield at the next boundary that fires).
@@ -419,15 +429,27 @@ public class ExpoAppBlockerModule: Module {
         self.sharedDefaults?.set(untilMillis, forKey: self.suppressionUntilKey)
         self.userDefaults.set(untilMillis, forKey: self.suppressionUntilKey)
 
-        // Lower both shields now — the ticket is layer-agnostic suppression.
-        DispatchQueue.main.async {
+        // #598: promote the ShieldAction-captured app (if fresh) to this ticket's target. Present →
+        // targeted ticket (open only that app); absent/stale → full-suppression ticket (open all).
+        if let encoded = self.consumeFreshEscapeTargetTokenEncoded() {
+          self.sharedDefaults?.set(encoded, forKey: self.suppressionTargetTokenKey)
+          self.userDefaults.set(encoded, forKey: self.suppressionTargetTokenKey)
+        } else {
+          self.sharedDefaults?.removeObject(forKey: self.suppressionTargetTokenKey)
+          self.userDefaults.removeObject(forKey: self.suppressionTargetTokenKey)
+        }
+
+        // Re-apply both shields for the new ticket state. `escapeExemptToken()` now reflects the
+        // target (targeted → keep every store's shield up minus that one app) or nil (full → the
+        // gates in applyBlocks / reevaluateScheduleShieldFromPersisted lower both stores).
+        if let config = self.currentBlockConfig {
+          try? self.applyBlocks(config)
+        } else {
           self.store.shield.applications = nil
           self.store.shield.applicationCategories = nil
           self.store.shield.webDomains = nil
-          self.scheduleStore.shield.applications = nil
-          self.scheduleStore.shield.applicationCategories = nil
-          self.scheduleStore.shield.webDomains = nil
         }
+        self.reevaluateScheduleShieldFromPersisted()
 
         // Kill-proof re-application: a one-shot DeviceActivity fires at the expiry instant and the
         // monitor recomputes the shields from the persisted config (RN timers must not re-lock).
@@ -712,9 +734,11 @@ public class ExpoAppBlockerModule: Module {
       return
     }
 
-    // #572: a live escape ticket suppresses the immediate shield (layer-agnostic). Keep it down;
-    // the monitor re-applies from this same config when the ticket expires.
-    if isSuppressedInternal() {
+    // #572/#598: a live escape ticket suppresses the immediate shield (layer-agnostic). A plain
+    // (full) ticket keeps it fully down; a TARGETED ticket (#598) instead exempts just the one
+    // escaped app below and leaves the rest shielded, so it does NOT take the full-lower path.
+    let exempt = escapeExemptToken()
+    if isSuppressedInternal() && exempt == nil {
       store.shield.applications = nil
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
@@ -726,11 +750,12 @@ public class ExpoAppBlockerModule: Module {
     // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
     // PR's manual-check list), so no explicit exception list is added here.
     if config.mode == .allow {
-      applyAllowlistShield(store, allowed: config.items)
+      applyAllowlistShield(store, allowed: config.items, exempt: exempt)
       return
     }
 
-    let validAppTokens = config.items.compactMap { $0.appToken }
+    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let validAppTokens = config.items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let validCategoryTokens = config.items.compactMap { $0.categoryToken }
     let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
 
@@ -952,11 +977,43 @@ public class ExpoAppBlockerModule: Module {
     return Date().timeIntervalSince1970 * 1000.0 < until
   }
 
+  /// #598: the app the current TARGETED escape ticket opens — the ONE app exempt from every shield
+  /// while the ticket is live. nil for a full-suppression ticket (no target) or when no ticket is
+  /// live. Shared via the App Group with the monitor's identical gate so both processes exempt the
+  /// same app when they re-apply a shield.
+  private func escapeExemptToken() -> ApplicationToken? {
+    guard isSuppressedInternal() else { return nil }
+    guard let encoded = sharedDefaults?.string(forKey: suppressionTargetTokenKey)
+      ?? userDefaults.string(forKey: suppressionTargetTokenKey), !encoded.isEmpty else { return nil }
+    return decodeApplicationToken(from: encoded)
+  }
+
+  /// #598: consume the ShieldAction-captured escape target (base64 ApplicationToken) iff it is fresh,
+  /// returning the encoded string for `suppressBlocks` to promote to this ticket's target. Clears the
+  /// one-shot candidate either way. A stale/absent/corrupt candidate → nil → the ticket opens all.
+  private func consumeFreshEscapeTargetTokenEncoded() -> String? {
+    defer {
+      sharedDefaults?.removeObject(forKey: escapeTargetTokenKey)
+      sharedDefaults?.removeObject(forKey: escapeTargetTokenTsKey)
+    }
+    // Refresh the suite so the (separate) ShieldAction process's write is visible here.
+    sharedDefaults?.synchronize()
+    guard let encoded = sharedDefaults?.string(forKey: escapeTargetTokenKey), !encoded.isEmpty else { return nil }
+    let ts = (sharedDefaults?.object(forKey: escapeTargetTokenTsKey) as? NSNumber)?.doubleValue ?? 0
+    let nowMs = Date().timeIntervalSince1970 * 1000.0
+    guard ts > 0, nowMs - ts <= escapeTargetTokenMaxAgeMs else { return nil }
+    guard decodeApplicationToken(from: encoded) != nil else { return nil }
+    return encoded
+  }
+
   /// Drop the persisted ticket and cancel its expiry DeviceActivity. Called on block teardown so a
   /// dangling ticket / orphan activity can't outlive the blocks it suppressed.
   private func clearSuppressionState() {
     sharedDefaults?.removeObject(forKey: suppressionUntilKey)
     userDefaults.removeObject(forKey: suppressionUntilKey)
+    // #598: drop the ticket's target app too so a later full ticket never inherits a stale exemption.
+    sharedDefaults?.removeObject(forKey: suppressionTargetTokenKey)
+    userDefaults.removeObject(forKey: suppressionTargetTokenKey)
     cancelSuppressionExpiryActivity()
   }
 
@@ -1077,14 +1134,18 @@ public class ExpoAppBlockerModule: Module {
     // DeviceActivity only fires at interval boundaries, so seed the initial state here.
     // 0 windows = not armed (JS clears the config in that case) — clear defensively so an
     // empty window set can never become a 24h lockdown (#570 S2 regression guard).
-    // #572: a live escape ticket also suppresses the schedule shield (the ticket is the only escape
-    // for an out-of-window schedule lock). Keep it down; the monitor re-evaluates on ticket expiry.
-    if isSuppressedInternal() || windows.isEmpty {
+    // #572/#598: a live escape ticket also suppresses the schedule shield (the ticket is the only
+    // escape for an out-of-window schedule lock). A full ticket keeps it down; a targeted ticket
+    // (#598) instead exempts just the escaped app and leaves the gap shield up for the rest.
+    let exempt = escapeExemptToken()
+    if windows.isEmpty {
+      clearScheduleShield()
+    } else if isSuppressedInternal() && exempt == nil {
       clearScheduleShield()
     } else if isAnyScheduleWindowActive(windows: windows, at: Date()) {
       clearScheduleShield()
     } else {
-      applyScheduleShield(items, mode: mode)
+      applyScheduleShield(items, mode: mode, exempt: exempt)
     }
   }
 
@@ -1141,13 +1202,14 @@ public class ExpoAppBlockerModule: Module {
     sharedDefaults?.set(config, forKey: scheduleConfigStorageKey)
   }
 
-  private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode) {
+  private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
-      applyAllowlistShield(scheduleStore, allowed: items)
+      applyAllowlistShield(scheduleStore, allowed: items, exempt: exempt)
       return
     }
-    let apps = items.compactMap { $0.appToken }
+    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let apps = items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let categories = items.compactMap { $0.categoryToken }
     let webDomains = items.compactMap { $0.webDomainToken }
     if apps.isEmpty {
@@ -1175,14 +1237,19 @@ public class ExpoAppBlockerModule: Module {
   /// everything" — the app never arms a lock with 0 allowed apps (0 = lock not possible), so we
   /// treat empty defensively as "no shield" rather than a block-all footgun. Whether iOS implicitly
   /// exempts the controlling app / system-essential apps is pending real-device verification.
-  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo]) {
-    let allowedAppTokens = Set(items.compactMap { $0.appToken })
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo], exempt: ApplicationToken? = nil) {
+    var allowedAppTokens = Set(items.compactMap { $0.appToken })
     if allowedAppTokens.isEmpty {
+      // Empty allow set = no shield on this store (0 allowed is "lock not possible", never block-all).
+      // Do NOT let a targeted-ticket exempt token turn that into a block-everything-except-one shield.
       managedStore.shield.applications = nil
       managedStore.shield.applicationCategories = nil
       managedStore.shield.webDomains = nil
       return
     }
+    // #598: the escaped app joins the allow (except) set for the ticket, so it is the only extra app
+    // that opens while everything else stays shielded.
+    if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
@@ -1202,7 +1269,10 @@ public class ExpoAppBlockerModule: Module {
   /// not re-armed) and the App-Group variant key ShieldConfiguration reads. Callers must run this only
   /// when no live ticket exists; a live ticket keeps the schedule shield down (defensive re-check).
   private func reevaluateScheduleShieldFromPersisted() {
-    if isSuppressedInternal() {
+    // #598: a targeted ticket exempts one app but keeps the gap shield up for the rest; a full ticket
+    // keeps the whole schedule shield down.
+    let exempt = escapeExemptToken()
+    if isSuppressedInternal() && exempt == nil {
       clearScheduleShield()
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -1221,9 +1291,10 @@ public class ExpoAppBlockerModule: Module {
       clearScheduleShield()
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
     } else {
-      // Outside every free window → restore the gap shield. Mirrors the monitor: the gap shield
-      // always records the "schedule" variant (weekday shield, keeps its redirect + escape buttons).
-      applyScheduleShield(items, mode: mode)
+      // Outside every free window → restore the gap shield (minus the escaped app for a targeted
+      // ticket). Mirrors the monitor: the gap shield always records the "schedule" variant (weekday
+      // shield, keeps its redirect + escape buttons).
+      applyScheduleShield(items, mode: mode, exempt: exempt)
       sharedDefaults?.set("schedule", forKey: scheduleShieldVariantKey)
     }
   }

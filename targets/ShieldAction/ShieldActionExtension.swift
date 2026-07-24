@@ -24,6 +24,12 @@ class ShieldActionExtension: ShieldActionDelegate {
   // the two never replace each other. Payload contract (agreed with the mobile slice):
   //   { kind: "guardian_escape", itemId?: <App Group guardedItemId, when armed> }
   private let guardianEscapeNotificationIdentifier = "expo.appblocker.guardianEscape.local"
+  // #598 targeted escape ticket: on "지금 필요해" (secondary) this records the ApplicationToken the
+  // user pressed on (+ a timestamp for freshness) into the App Group. The container app's
+  // suppressBlocks consumes it and opens ONLY that app for the ticket, keeping every other blocked
+  // app shielded. Web/category shields (no app token) clear it so the ticket falls back to full open.
+  private let escapeTargetTokenKey = "appBlocker.escapeTargetToken.v1"
+  private let escapeTargetTokenTsKey = "appBlocker.escapeTargetTokenTs.v1"
   // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
   // gives no API to open the container app from a ShieldAction, so the primary
   // button posts a local notification whose tap deep-links home). When that
@@ -48,18 +54,19 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let notificationAttachIcon = NOTIFICATION_ATTACH_ICON_PLACEHOLDER
 
   override func handle(action: ShieldAction, for application: ApplicationToken, completionHandler: @escaping (ShieldActionResponse) -> Void) {
-    handleAction(action, completionHandler: completionHandler)
+    // #598: only the app-token overload carries the pressed app, so only it can target the ticket.
+    handleAction(action, application: application, completionHandler: completionHandler)
   }
 
   override func handle(action: ShieldAction, for webDomain: WebDomainToken, completionHandler: @escaping (ShieldActionResponse) -> Void) {
-    handleAction(action, completionHandler: completionHandler)
+    handleAction(action, application: nil, completionHandler: completionHandler)
   }
 
   override func handle(action: ShieldAction, for category: ActivityCategoryToken, completionHandler: @escaping (ShieldActionResponse) -> Void) {
-    handleAction(action, completionHandler: completionHandler)
+    handleAction(action, application: nil, completionHandler: completionHandler)
   }
 
-  private func handleAction(_ action: ShieldAction, completionHandler: @escaping (ShieldActionResponse) -> Void) {
+  private func handleAction(_ action: ShieldAction, application: ApplicationToken?, completionHandler: @escaping (ShieldActionResponse) -> Void) {
     // Any interaction with the shield is a confirmed block event. The
     // ShieldConfiguration data source is cached by the system and not
     // re-invoked per open, so this — the action handler, which fires every
@@ -82,6 +89,7 @@ class ShieldActionExtension: ShieldActionDelegate {
       // the OS gives no API to open the container app from a ShieldAction). Routes to the reason
       // screen via the payload's kind; does NOT set the pendingUnlock flag (that is the earn path).
       recordProbeEscapeHandlerFired()
+      recordEscapeTargetToken(application)  // #598: capture the pressed app for a targeted ticket
       scheduleEscapeNotification { didSchedule in
         let response: ShieldActionResponse = didSchedule ? .none : .defer
         self.complete(on: response, completionHandler: completionHandler)
@@ -227,6 +235,22 @@ class ShieldActionExtension: ShieldActionDelegate {
     let nowMs = Int64(Date().timeIntervalSince1970 * 1000.0)
     writeProbe(["escapeHandlerFiredAt": nowMs, "escapeAddResult": "pending"])
     probeLog.log("ShieldAction secondaryButtonPressed handler fired @\(nowMs, privacy: .public)")
+  }
+
+  /// #598: record (or clear) the app the user pressed "지금 필요해" on, so the container app's
+  /// suppressBlocks can open ONLY that app for the ticket. A nil token (web/category shield) clears
+  /// any stale candidate so the ticket falls back to full open instead of exempting a prior app.
+  /// ApplicationToken is Codable; the container decodes the same base64 back into its allow-except set.
+  private func recordEscapeTargetToken(_ application: ApplicationToken?) {
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    guard let application = application,
+          let data = try? JSONEncoder().encode(application) else {
+      defaults.removeObject(forKey: escapeTargetTokenKey)
+      defaults.removeObject(forKey: escapeTargetTokenTsKey)
+      return
+    }
+    defaults.set(data.base64EncodedString(), forKey: escapeTargetTokenKey)
+    defaults.set(Int64(Date().timeIntervalSince1970 * 1000.0), forKey: escapeTargetTokenTsKey)
   }
 
   /// Post the escape landing notification. Reuses the app-configured landing copy (the banner is just
