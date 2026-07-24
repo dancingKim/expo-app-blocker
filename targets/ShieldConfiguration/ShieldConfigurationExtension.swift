@@ -1,10 +1,16 @@
 import ManagedSettingsUI
 import ManagedSettings
 import UIKit
+import os
 
 class ShieldConfigurationExtension: ShieldConfigurationDataSource {
 
   private let appGroupIdentifier = "APP_GROUP_PLACEHOLDER"
+  // #598 diagnosis: idevicesyslog-observable trace of every lastShielded write attempt — whether the
+  // data source was called, which overload, whether iOS gave an ApplicationToken (hypothesis A: it
+  // withholds it in category context), and whether the App Group file write succeeded (hypothesis B:
+  // the ShieldConfiguration sandbox blocks it). Filter: subsystem com.worthyi.chapchu.guardian.
+  private let diagLog = Logger(subsystem: "com.worthyi.chapchu.guardian", category: "shieldconfig")
   // #598: the app this data source LAST rendered a shield for. The guardian locks via
   // `.all(except:)` (a category shield), so the escape ShieldAction almost always arrives on the
   // CATEGORY overload — which carries no ApplicationToken, leaving it unable to tell which app the
@@ -194,40 +200,64 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     )
   }
 
-  /// #598: record the app currently being shielded (App Group) so the escape ShieldAction — which on
-  /// the category overload has no ApplicationToken — can target it. Both app-carrying overloads pass
-  /// through here; `application.token` is the specific app even inside a category shield.
-  private func recordLastShieldedApplication(_ application: Application) {
-    guard let token = application.token,
-          let tokenData = try? JSONEncoder().encode(token) else { return }
-    let encoded = tokenData.base64EncodedString()
+  /// #598 diagnosis: record the app being shielded so the escape ShieldAction (which on the category
+  /// overload has no ApplicationToken) can target it. ALWAYS writes the file — even when iOS withholds
+  /// the token — so the real-device probe separates hypothesis A (token nil in category context) from
+  /// B (the sandbox blocks the write). os_log traces every step for idevicesyslog.
+  private func recordLastShieldedApplication(_ application: Application, overload: String) {
+    let token = application.token
+    let displayName = application.localizedDisplayName
     let tsMs = Int64(Date().timeIntervalSince1970 * 1000.0)
+    diagLog.log("recordLastShielded called overload=\(overload, privacy: .public) tokenNil=\(token == nil, privacy: .public) hasDisplayName=\(displayName?.isEmpty == false, privacy: .public)")
 
-    // Primary: atomic file write to the App Group container (durable across this extension's instant
-    // teardown — see lastShieldedFileName).
-    if let fileURL = appGroupFileURL(lastShieldedFileName),
-       let json = try? JSONSerialization.data(withJSONObject: ["token": encoded, "ts": tsMs]) {
-      try? json.write(to: fileURL, options: .atomic)
+    var payload: [String: Any] = ["ts": tsMs, "overload": overload]
+    var encoded: String? = nil
+    if let token = token, let tokenData = try? JSONEncoder().encode(token) {
+      let enc = tokenData.base64EncodedString()
+      encoded = enc
+      payload["token"] = enc
+      payload["tokenNil"] = false
+    } else {
+      payload["tokenNil"] = true
+      payload["hasDisplayName"] = (displayName?.isEmpty == false)
     }
-    // Best-effort UserDefaults mirror (usually reaped with this process; kept for the legacy fallback).
-    if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
-      defaults.set(encoded, forKey: lastShieldedTokenKey)
-      defaults.set(tsMs, forKey: lastShieldedTokenTsKey)
+
+    // Primary: atomic file write to the App Group container. Resolve the container inline so a nil
+    // (missing entitlement / wrong app group) logs distinctly from a write failure (sandbox = B).
+    guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+      diagLog.error("recordLastShielded: App Group container URL nil (entitlement/appGroup id?)")
+      mirrorLastShieldedToUserDefaults(encoded: encoded, tsMs: tsMs)
+      return
     }
+    let fileURL = container.appendingPathComponent(lastShieldedFileName)
+    if let json = try? JSONSerialization.data(withJSONObject: payload) {
+      do {
+        try json.write(to: fileURL, options: .atomic)
+        diagLog.log("recordLastShielded: file write OK tokenNil=\(token == nil, privacy: .public)")
+      } catch {
+        diagLog.error("recordLastShielded: file write FAILED: \(error.localizedDescription, privacy: .public)")
+      }
+    }
+
+    // Best-effort UserDefaults mirror (kept for the ShieldAction fallback read; usually reaped).
+    mirrorLastShieldedToUserDefaults(encoded: encoded, tsMs: tsMs)
   }
 
-  private func appGroupFileURL(_ name: String) -> URL? {
-    FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
-      .appendingPathComponent(name)
+  /// UserDefaults mirror of the last-shielded token (only when a token exists), for ShieldAction's
+  /// fallback read. Best-effort — this extension's UserDefaults writes are frequently reaped.
+  private func mirrorLastShieldedToUserDefaults(encoded: String?, tsMs: Int64) {
+    guard let encoded = encoded, let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    defaults.set(encoded, forKey: lastShieldedTokenKey)
+    defaults.set(tsMs, forKey: lastShieldedTokenTsKey)
   }
 
   override func configuration(shielding application: Application) -> ShieldConfiguration {
-    recordLastShieldedApplication(application)
+    recordLastShieldedApplication(application, overload: "application")
     return makeConfig(appName: application.localizedDisplayName ?? "This app")
   }
 
   override func configuration(shielding application: Application, in category: ActivityCategory) -> ShieldConfiguration {
-    recordLastShieldedApplication(application)
+    recordLastShieldedApplication(application, overload: "application-in-category")
     return makeConfig(appName: category.localizedDisplayName ?? "This category")
   }
 
