@@ -111,10 +111,16 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
 
   // Block-event queue, drained by the app into `blocker_intercepts` to power
   // the "blocks" counter. The system re-renders the shield often (app
-  // switcher previews, re-foreground), so a short global debounce collapses
-  // those bursts into one logical block event.
+  // switcher previews, re-foreground), so a short debounce collapses those
+  // bursts into one logical block event. The debounce timestamp is PER
+  // EXTENSION: this data source (exposure) and ShieldAction (tap) used to
+  // share one `appBlocker.lastInterceptTs.v1` key, so a render within 2s of
+  // a tap — or, the common case, a tap right after the render that produced
+  // the shield — was silently swallowed and the two could never both be
+  // recorded. Each entry now also carries `kind` ("impression" here,
+  // "action" in ShieldAction) so the drain side can tell them apart.
   private let pendingInterceptsKey = "appBlocker.pendingIntercepts.v1"
-  private let lastInterceptTsKey = "appBlocker.lastInterceptTs.v1"
+  private let lastImpressionTsKey = "appBlocker.lastImpressionTs.v1"
   private let interceptDebounceMs: Double = 2_000
   private let maxPendingIntercepts = 200
 
@@ -122,13 +128,14 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   // does NOT reliably re-invoke this data source per open, so the action
   // handler (ShieldAction) is the primary recorder; this is a bonus path
   // for the cases the system does re-invoke. Writes share the same App
-  // Group JSON queue + debounce as ShieldAction.
+  // Group JSON queue as ShieldAction but debounce on their own key, so an
+  // exposure never swallows the tap that follows it (and vice versa).
   private func recordIntercept(appName: String) {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
     defaults.synchronize()
 
     let nowMs = Date().timeIntervalSince1970 * 1000.0
-    let lastMs = defaults.double(forKey: lastInterceptTsKey)
+    let lastMs = defaults.double(forKey: lastImpressionTsKey)
     if lastMs > 0, (nowMs - lastMs) < interceptDebounceMs { return }
 
     var queue: [[String: Any]] = []
@@ -137,7 +144,7 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
        let parsed = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
       queue = parsed
     }
-    queue.append(["appName": appName, "interceptedAt": nowMs])
+    queue.append(["appName": appName, "interceptedAt": nowMs, "kind": "impression"])
     if queue.count > maxPendingIntercepts {
       queue = Array(queue.suffix(maxPendingIntercepts))
     }
@@ -145,7 +152,7 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
        let json = String(data: data, encoding: .utf8) {
       defaults.set(json, forKey: pendingInterceptsKey)
     }
-    defaults.set(nowMs, forKey: lastInterceptTsKey)
+    defaults.set(nowMs, forKey: lastImpressionTsKey)
     defaults.synchronize()
   }
 

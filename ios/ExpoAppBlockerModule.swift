@@ -317,6 +317,10 @@ public class ExpoAppBlockerModule: Module {
       return hasPending
     }
 
+    // Entries carry `kind` since the per-extension debounce split: "impression" =
+    // ShieldConfiguration rendered a shield, "action" = a ShieldAction button tap. Entries queued by
+    // an older binary have no `kind`; they are passed through unchanged — the JS/server side treats
+    // `kind` as nullable, so the old format stays valid (back-compat).
     Function("drainPendingIntercepts") { () -> [[String: Any]] in
       guard let defaults = self.sharedDefaults else { return [] }
       // Refresh the cached suite so writes made by the (separate) shield

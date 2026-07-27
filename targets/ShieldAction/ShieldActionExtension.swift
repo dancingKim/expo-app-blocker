@@ -8,7 +8,13 @@ class ShieldActionExtension: ShieldActionDelegate {
   private let appGroupIdentifier = "APP_GROUP_PLACEHOLDER"
   private let pendingUnlockKey = "appBlocker.pendingUnlock.v1"
   private let pendingInterceptsKey = "appBlocker.pendingIntercepts.v1"
-  private let lastInterceptTsKey = "appBlocker.lastInterceptTs.v1"
+  // Debounce timestamp for TAP (action) events only. This used to be the
+  // `appBlocker.lastInterceptTs.v1` key shared with ShieldConfiguration, so the
+  // shield render that had just preceded a tap swallowed the tap inside the 2s
+  // window — exposure and tap were indistinguishable. Each extension now
+  // debounces on its own key and stamps its entries with `kind` ("action" here,
+  // "impression" in ShieldConfiguration).
+  private let lastActionTsKey = "appBlocker.lastActionTs.v1"
   // #522: the guarded task id the app wrote into the App Group when it armed the
   // block. Carried into the "하러 가기" notification payload so the JS
   // notification-response router can land on that specific task (home tab +
@@ -362,13 +368,15 @@ class ShieldActionExtension: ShieldActionDelegate {
     }
   }
 
-  /// Queue a block event (JSON-string queue in the App Group), debounced,
-  /// for the app to drain into `blocker_intercepts`.
+  /// Queue a block event (JSON-string queue in the App Group), debounced on the
+  /// action-only key, for the app to drain into `blocker_intercepts`. `kind:
+  /// "action"` marks this as a confirmed shield-button tap (vs the data source's
+  /// "impression" = the shield merely rendered).
   private func recordIntercept() {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
 
     let nowMs = Date().timeIntervalSince1970 * 1000.0
-    let lastMs = defaults.double(forKey: lastInterceptTsKey)
+    let lastMs = defaults.double(forKey: lastActionTsKey)
     if lastMs > 0, (nowMs - lastMs) < interceptDebounceMs { return }
 
     var queue: [[String: Any]] = []
@@ -377,7 +385,7 @@ class ShieldActionExtension: ShieldActionDelegate {
        let parsed = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
       queue = parsed
     }
-    queue.append(["appName": NSNull(), "interceptedAt": nowMs])
+    queue.append(["appName": NSNull(), "interceptedAt": nowMs, "kind": "action"])
     if queue.count > maxPendingIntercepts {
       queue = Array(queue.suffix(maxPendingIntercepts))
     }
@@ -385,7 +393,7 @@ class ShieldActionExtension: ShieldActionDelegate {
        let json = String(data: data, encoding: .utf8) {
       defaults.set(json, forKey: pendingInterceptsKey)
     }
-    defaults.set(nowMs, forKey: lastInterceptTsKey)
+    defaults.set(nowMs, forKey: lastActionTsKey)
   }
 
   private func iconFileURL() -> URL? {

@@ -446,6 +446,13 @@ export function restartAppForRecovery(deepLink?: string): void {
 export interface PendingIntercept {
   appName: string | null;
   interceptedAt: number;
+  /**
+   * iOS shield event kind: `"impression"` = the shield rendered (ShieldConfiguration data source),
+   * `"action"` = a shield button was tapped (ShieldAction handler). The two are debounced on
+   * separate keys, so an exposure and the tap that follows it are both recorded. Absent on entries
+   * queued by an older native binary and on Android — treat it as nullable end-to-end.
+   */
+  kind?: "impression" | "action";
 }
 
 /**
