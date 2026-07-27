@@ -60,7 +60,11 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
 
   private func getBlockedAppCount() -> Int {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return 0 }
-    guard let config = defaults.dictionary(forKey: "appBlocker.blockConfiguration.v1") else { return 0 }
+    // Focus-store split: the immediate config may live in the gate (legacy) slot or the focus slot.
+    // Prefer the gate slot; fall back to focus so a focus-only lock still shows a count. (A render
+    // can't tell which store shielded it, so this stays a best-effort label.)
+    guard let config = defaults.dictionary(forKey: "appBlocker.blockConfiguration.v1")
+      ?? defaults.dictionary(forKey: "appBlocker.blockConfiguration.focus.v1") else { return 0 }
     if let items = config["blockedItems"] as? [[String: Any]] {
       return items.count
     }

@@ -22,6 +22,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // Usage-step event-name prefix; the suffix is the threshold in seconds.
   private let usageStepEventPrefix = "appBlocker.usageStep."
   private let blockConfigStorageKey = "appBlocker.blockConfiguration.v1"
+  // Focus-slot twin (focus-store split): a config armed with guardType "focus" persists here and
+  // shields via the dedicated focus store; the legacy key remains the gate slot. Kept in sync with
+  // ExpoAppBlockerModule.swift.
+  private let focusBlockConfigStorageKey = "appBlocker.blockConfiguration.focus.v1"
   // Schedule-window blocking. Config is mirrored here by the module; each window is a
   // DeviceActivity named "<prefix><index>". Shields live in a dedicated store, unioned
   // with `store` and independent of the temporary-unlock logic.
@@ -35,6 +39,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // #535: the immediate-block wall-clock expiry DeviceActivity. Its interval STARTS at the expiry
   // instant, so intervalDidStart (below) is the kill-proof point to lift the immediate shield.
   private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
+  // Focus twin of the immediate-expiry one-shot (focus-store split) — separate name so each layer's
+  // expiry lifts only its own store.
+  private let focusImmediateExpiryActivityName = "appBlocker.immediateExpiry.focus"
   // #572 escape ticket: while `now < suppressionUntil` both shields stay down (the ticket is
   // layer-agnostic). The suppression-expiry DeviceActivity's interval STARTS at that instant, so
   // intervalDidStart is the kill-proof point to recompute the shields from the persisted config.
@@ -62,6 +69,9 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
   private let scheduleStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.schedule"))
+  // Dedicated focus store (focus-store split); must match ExpoAppBlockerModule.swift. The default
+  // `store` is the gate layer; the three stores union at the OS level.
+  private let focusStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.focus"))
   private var sharedDefaults: UserDefaults?
 
   override init() {
@@ -142,9 +152,14 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
     // #535: the immediate-block wall-clock expiry fired (interval starts at the expiry instant).
     // Lift the immediate shield if the persisted expiry has actually passed. Kill-proof: runs even
-    // when the host app was force-quit.
+    // when the host app was force-quit. Focus-store split: each layer's one-shot lifts only its own
+    // store/config slot.
     if activity.rawValue == immediateExpiryActivityName {
-      expireImmediateBlockIfDue()
+      expireImmediateBlockIfDue(configKey: blockConfigStorageKey, target: store, layer: "gate")
+      return
+    }
+    if activity.rawValue == focusImmediateExpiryActivityName {
+      expireImmediateBlockIfDue(configKey: focusBlockConfigStorageKey, target: focusStore, layer: "focus")
       return
     }
 
@@ -163,26 +178,27 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
   }
 
-  /// #535: lift the immediate-block shield once its persisted wall-clock expiry passes. Guards
+  /// #535: lift an immediate-block shield once its persisted wall-clock expiry passes. Guards
   /// against a spurious/early boundary fire (only releases when now >= expiry) and drops the App
   /// Group config copy so the shield doesn't re-render; the host clears its userDefaults.standard
-  /// copy on next foreground (the module's applyBlocks expiry gate).
-  private func expireImmediateBlockIfDue() {
+  /// copy on next foreground (the module's applyBlocks expiry gate). Focus-store split: the caller
+  /// passes the layer's config key + store, so gate and focus expire independently.
+  private func expireImmediateBlockIfDue(configKey: String, target: ManagedSettingsStore, layer: String) {
     let defaults = sharedDefaults ?? UserDefaults.standard
-    guard let dict = defaults.dictionary(forKey: blockConfigStorageKey),
+    guard let dict = defaults.dictionary(forKey: configKey),
           let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue, expiry > 0 else {
-      writeImmediateExpiryProbe(decision: "no-immediate-expiry")
+      writeImmediateExpiryProbe(decision: "no-immediate-expiry", extra: ["guardType": layer])
       return
     }
     guard Date().timeIntervalSince1970 * 1000.0 >= expiry else {
-      writeImmediateExpiryProbe(decision: "not-due")
+      writeImmediateExpiryProbe(decision: "not-due", extra: ["guardType": layer])
       return
     }
-    store.shield.applications = nil
-    store.shield.applicationCategories = nil
-    store.shield.webDomains = nil
-    defaults.removeObject(forKey: blockConfigStorageKey)
-    writeImmediateExpiryProbe(decision: "released")
+    target.shield.applications = nil
+    target.shield.applicationCategories = nil
+    target.shield.webDomains = nil
+    defaults.removeObject(forKey: configKey)
+    writeImmediateExpiryProbe(decision: "released", extra: ["guardType": layer])
   }
 
   // MARK: - Escape Ticket Suppression (#572)
@@ -231,15 +247,16 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// #607/#614: record a FIRED expiry outcome. "fired" distinguishes the monitor's callback from the
   /// module's "registered" write to the same record — an inspection still showing phase "registered"
   /// means iOS never fired the callback.
-  private func writeExpiryProbe(fileName: String, udKey: String, decision: String) {
+  private func writeExpiryProbe(fileName: String, udKey: String, decision: String, extra: [String: Any] = [:]) {
     let defaults = sharedDefaults ?? UserDefaults.standard
-    let probe: [String: Any] = [
+    var probe: [String: Any] = [
       "phase": "fired",
       "firedAt": Int64(Date().timeIntervalSince1970 * 1000.0),
       "decision": decision,
       "scheduleConfigPresent": defaults.dictionary(forKey: scheduleConfigStorageKey) != nil,
       "immediateConfigPresent": defaults.dictionary(forKey: blockConfigStorageKey) != nil
     ]
+    for (key, value) in extra { probe[key] = value }
     guard let data = try? JSONSerialization.data(withJSONObject: probe) else { return }
     // Primary: atomic file write (durable even if the monitor is torn down before cfprefsd commits).
     if let fileURL = appGroupFileURL(fileName) {
@@ -255,8 +272,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     writeExpiryProbe(fileName: suppressionExpiryProbeFileName, udKey: suppressionExpiryProbeKey, decision: decision)
   }
 
-  private func writeImmediateExpiryProbe(decision: String) {
-    writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: immediateExpiryProbeKey, decision: decision)
+  private func writeImmediateExpiryProbe(decision: String, extra: [String: Any] = [:]) {
+    writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: immediateExpiryProbeKey, decision: decision, extra: extra)
   }
 
   private func appGroupFileURL(_ name: String) -> URL? {
@@ -275,9 +292,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return "reapplied-schedule-shield"
   }
 
-  /// Re-apply the immediate shield from the persisted config (unless its OWN wall-clock expiry has
-  /// passed → drop it) and re-evaluate the schedule window state. Runs only after the ticket flag is
-  /// cleared, so the gates in `reapplyBlockConfiguration` / `reevaluateScheduleShield` don't skip.
+  /// Re-apply the immediate shields from the persisted configs (unless a layer's OWN wall-clock
+  /// expiry has passed → drop it) and re-evaluate the schedule window state. Runs only after the
+  /// ticket flag is cleared, so the gates in `reapplyBlockConfiguration` / `reevaluateScheduleShield`
+  /// don't skip. Focus-store split: the gate and focus layers recompute independently.
   private func recomputeShieldsAfterSuppression() {
     let defaults = sharedDefaults ?? UserDefaults.standard
     if let dict = defaults.dictionary(forKey: blockConfigStorageKey) {
@@ -295,6 +313,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
     }
+    reapplyFocusConfiguration()
     reevaluateScheduleShield()
     // #601: record whether the persisted schedule config was present and re-shielded, or absent
     // (the app-side orphan the JS heal covers). Suppression is already cleared here, so
@@ -338,7 +357,34 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    applyBlocks(blockConfig, exempt: exempt)
+    applyBlocks(blockConfig, exempt: exempt, target: store)
+  }
+
+  /// Focus-layer twin of `recomputeShieldsAfterSuppression`'s gate path (focus-store split):
+  /// re-apply the persisted focus config to the dedicated focus store, drop it if its own wall-clock
+  /// expiry has passed, or clear the store when no focus config is armed. A live FULL ticket keeps
+  /// it down (same gate as `reapplyBlockConfiguration`); a targeted ticket exempts just the one app.
+  private func reapplyFocusConfiguration() {
+    let exempt = escapeExemptToken()
+    if isSuppressed() && exempt == nil { return }
+
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    guard let dict = defaults.dictionary(forKey: focusBlockConfigStorageKey) else {
+      focusStore.shield.applications = nil
+      focusStore.shield.applicationCategories = nil
+      focusStore.shield.webDomains = nil
+      return
+    }
+    let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue ?? 0
+    if expiry > 0, Date().timeIntervalSince1970 * 1000.0 >= expiry {
+      focusStore.shield.applications = nil
+      focusStore.shield.applicationCategories = nil
+      focusStore.shield.webDomains = nil
+      defaults.removeObject(forKey: focusBlockConfigStorageKey)
+      return
+    }
+    guard let blockConfig = parseBlockConfig(dict) else { return }
+    applyBlocks(blockConfig, exempt: exempt, target: focusStore)
   }
 
   // MARK: - Schedule-Window Blocking
@@ -560,18 +606,20 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return MonitorBlockConfig(items: items, isActive: isActive, mode: mode)
   }
 
-  private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil) {
+  /// Focus-store split: `target` is the layer's own store (gate = default `store`, focus =
+  /// `focusStore`), so a recompute for one layer never rewrites the other's shield.
+  private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil, target: ManagedSettingsStore) {
     guard config.isActive else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      target.shield.applications = nil
+      target.shield.applicationCategories = nil
+      target.shield.webDomains = nil
       return
     }
 
     // #563 allowlist: shield every app except the kept ones (whether iOS also exempts
     // system-essential/controlling apps is pending real-device verification).
     if config.mode == .allow {
-      applyAllowlistShield(store, allowed: config.items, exempt: exempt)
+      applyAllowlistShield(target, allowed: config.items, exempt: exempt)
       return
     }
 
@@ -581,28 +629,28 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
 
     guard !validAppTokens.isEmpty || !validCategoryTokens.isEmpty || !validWebDomainTokens.isEmpty else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      target.shield.applications = nil
+      target.shield.applicationCategories = nil
+      target.shield.webDomains = nil
       return
     }
 
     if !validAppTokens.isEmpty {
-      store.shield.applications = Set(validAppTokens)
+      target.shield.applications = Set(validAppTokens)
     } else {
-      store.shield.applications = nil
+      target.shield.applications = nil
     }
 
     if !validCategoryTokens.isEmpty {
-      store.shield.applicationCategories = .specific(Set(validCategoryTokens))
+      target.shield.applicationCategories = .specific(Set(validCategoryTokens))
     } else {
-      store.shield.applicationCategories = nil
+      target.shield.applicationCategories = nil
     }
 
     if !validWebDomainTokens.isEmpty {
-      store.shield.webDomains = Set(validWebDomainTokens)
+      target.shield.webDomains = Set(validWebDomainTokens)
     } else {
-      store.shield.webDomains = nil
+      target.shield.webDomains = nil
     }
   }
 

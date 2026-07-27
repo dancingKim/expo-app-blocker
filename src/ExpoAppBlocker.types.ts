@@ -55,6 +55,15 @@ export type BlockMode = "block" | "allow";
 export interface IOSBlockConfiguration {
   /** #563: `"allow"` reinterprets the item set (in `allowedItems`) as the apps to KEEP open. */
   mode?: BlockMode;
+  /**
+   * Which immediate layer this configuration arms (focus-store split). `"focus"` shields via a
+   * dedicated `appBlocker.focus` ManagedSettingsStore and its own persisted slot, so the gate's
+   * shield/config survive focus arm/release (and vice versa) — the three layers (gate / focus /
+   * schedule) each own a store and the OS unions them. `"gate"` or omitted uses the default store
+   * and the legacy slot: the exact single-slot behavior old JS bundles rely on. On a native binary
+   * that predates the split this field is ignored (everything lands in the shared default store).
+   */
+  guardType?: "gate" | "focus";
   /** Denylist items (mode "block"). Optional in allow mode. */
   blockedItems?: IOSBlockedItem[];
   /** #563: allowlist — the apps to keep open (mode "allow"). Everything else is shielded. */

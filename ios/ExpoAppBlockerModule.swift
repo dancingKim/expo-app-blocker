@@ -19,10 +19,23 @@ public class ExpoAppBlockerModule: Module {
   // (`ManagedSettingsStore.Name` is ExpressibleByStringLiteral). The monitor extension
   // uses the identical name so both processes write the same store.
   private let scheduleStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.schedule"))
+  // Dedicated store for FOCUS sessions (focus-store split). The immediate layer used to share the
+  // default `store` between the gate and focus, so arming one silently replaced the other's shield
+  // and releasing one tore both down — the "zombie gate" the JS re-arm choreography (#640/PR 642)
+  // papers over. With three stores — default (gate), this one (focus), `appBlocker.schedule` — each
+  // layer owns its shield and the OS unions them; clearing one never clears another. A config routes
+  // here iff it carries `guardType: "focus"`; absent guardType (old JS bundles) keeps the default
+  // store, i.e. the exact legacy single-slot behavior.
+  private let focusStore = ManagedSettingsStore(named: ManagedSettingsStore.Name("appBlocker.focus"))
   private let activityCenter = DeviceActivityCenter()
   private var sharedDefaults: UserDefaults?
   private let userDefaults = UserDefaults.standard
   private let blockConfigStorageKey = "appBlocker.blockConfiguration.v1"
+  // Focus-slot twin of `blockConfigStorageKey`. The legacy key stays the GATE slot (an old JS bundle
+  // that sends no `guardType` keeps landing there — unchanged behavior); a config armed with
+  // `guardType: "focus"` persists here, so the two immediate layers survive each other's arm/release
+  // and both can be re-applied independently (relaunch, expiry, ticket recompute).
+  private let focusBlockConfigStorageKey = "appBlocker.blockConfiguration.focus.v1"
   // Stores the granted earned-time budget in **seconds** (Int). Presence with a
   // value > 0 means a temporary unlock is active. Enforcement is usage-based: the
   // shield is re-applied by the DeviceActivityMonitor once cumulative foreground
@@ -55,6 +68,10 @@ public class ExpoAppBlockerModule: Module {
   // The interval's START is the expiry instant (intervalDidStart), so short blocks work despite
   // DeviceActivity's ~15-minute minimum interval length (only the start boundary matters).
   private let immediateExpiryActivityName = "appBlocker.immediateExpiry"
+  // Focus twin of the immediate-expiry one-shot (focus-store split). A separate DeviceActivity name
+  // so (re)arming one layer's wall-clock expiry can never cancel/replace the other's — the single
+  // shared activity was another zombie vector: arming focus dropped the gate's kill-proof backstop.
+  private let focusImmediateExpiryActivityName = "appBlocker.immediateExpiry.focus"
   // G5 escape ticket (#572). A wall-clock suppression window independent of EVERY lock layer
   // (immediate / schedule / focus / earn): while `now < suppressionUntil`, both shields stay down —
   // "차단됨 = 잠금 AND NOT 유효티켓" in the door-state formula. At the instant a one-shot
@@ -101,6 +118,8 @@ public class ExpoAppBlockerModule: Module {
   private var didLoadPersistedConfig = false
 
   private var currentBlockConfig: BlockConfig?
+  // Focus-slot twin of `currentBlockConfig` (which remains the gate/legacy slot).
+  private var focusBlockConfig: BlockConfig?
   private let stateQueue = DispatchQueue(label: "expo.appblocker.state", qos: .userInitiated)
   private let scheduleLock = NSLock()
   private var isProcessingUnlockState = false
@@ -243,9 +262,16 @@ public class ExpoAppBlockerModule: Module {
         do {
           self.ensureLoadedPersistedConfig()
           let blockConfig = try self.parseBlockConfig(config)
-          self.currentBlockConfig = blockConfig
+          // Focus-store split: `guardType: "focus"` arms the focus slot/store; absent (old JS
+          // bundles) or anything else arms the gate slot/store — the legacy behavior. Arming one
+          // layer no longer replaces the other's config or shield.
+          if self.isFocus(blockConfig) {
+            self.focusBlockConfig = blockConfig
+          } else {
+            self.currentBlockConfig = blockConfig
+          }
           try self.applyBlocks(blockConfig)
-          self.persistBlockConfiguration(config)
+          self.persistBlockConfiguration(config, guardType: blockConfig.guardType)
           // #535: (re)arm or cancel the wall-clock expiry DeviceActivity for this config.
           self.updateImmediateExpiryMonitoring(blockConfig)
 
@@ -263,7 +289,10 @@ public class ExpoAppBlockerModule: Module {
     Function("getBlockConfiguration") { () -> [String: Any]? in
       self.ensureLoadedPersistedConfig()
 
-      guard let config = self.currentBlockConfig else {
+      // Legacy view: the gate slot first (an old JS bundle only ever populates that one, so its
+      // read-back is unchanged), else the focus slot — "is anything immediate armed?" stays
+      // truthful. The returned dict carries `guardType` for the focus slot.
+      guard let config = self.currentBlockConfig ?? self.focusBlockConfig else {
         return nil
       }
       return self.serializeBlockConfig(config)
@@ -287,19 +316,63 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
-        self.cancelImmediateExpiryActivity()  // #535: drop any pending wall-clock expiry
-        self.store.shield.applications = nil
-        self.store.shield.applicationCategories = nil
-        self.store.shield.webDomains = nil
+        // #535: drop any pending wall-clock expiry — BOTH layers' one-shots (legacy zero-arg
+        // contract: everything immediate goes down, exactly what an old JS bundle expects).
+        self.cancelImmediateExpiryActivity(guardType: nil)
+        self.cancelImmediateExpiryActivity(guardType: "focus")
+        self.clearImmediateStore(self.store)
+        self.clearImmediateStore(self.focusStore)
         self.currentBlockConfig = nil
+        self.focusBlockConfig = nil
         self.userDefaults.removeObject(forKey: self.blockConfigStorageKey)
         self.sharedDefaults?.removeObject(forKey: self.blockConfigStorageKey)
+        self.userDefaults.removeObject(forKey: self.focusBlockConfigStorageKey)
+        self.sharedDefaults?.removeObject(forKey: self.focusBlockConfigStorageKey)
         self.clearUnlockState()
 
         if self.isSuppressedInternal() {
           // Ticket still live — leave suppression state + its expiry DeviceActivity + the persisted
           // schedule config untouched. The monitor's suppression-expiry backstop re-applies the
           // schedule shield from config when the ticket ends. (Do NOT clearSuppressionState here.)
+        } else {
+          self.clearSuppressionState()
+          self.reevaluateScheduleShieldFromPersisted()
+        }
+      }
+    }
+
+    // Focus-store split: tear down ONE immediate layer, leaving the other armed. A separate
+    // function (instead of an optional parameter on `clearAllBlocks`) so an old JS bundle's
+    // zero-arg call can never hit an argument-arity mismatch — `clearAllBlocks` keeps its legacy
+    // "both layers down" contract byte-for-byte. "focus" clears the focus store/slot; any other
+    // value clears the gate store/slot (matching parseBlockConfig's routing) plus the earn budget,
+    // which belongs to the gate layer.
+    Function("clearBlocksForGuardType") { (guardType: String) in
+      self.stateQueue.async {
+        self.ensureLoadedPersistedConfig()
+        if guardType == "focus" {
+          self.cancelImmediateExpiryActivity(guardType: "focus")
+          self.clearImmediateStore(self.focusStore)
+          self.focusBlockConfig = nil
+          self.userDefaults.removeObject(forKey: self.focusBlockConfigStorageKey)
+          self.sharedDefaults?.removeObject(forKey: self.focusBlockConfigStorageKey)
+        } else {
+          self.cancelRelockActivity()
+          self.cancelImmediateExpiryActivity(guardType: nil)
+          self.clearImmediateStore(self.store)
+          self.currentBlockConfig = nil
+          self.userDefaults.removeObject(forKey: self.blockConfigStorageKey)
+          self.sharedDefaults?.removeObject(forKey: self.blockConfigStorageKey)
+          self.clearUnlockState()
+        }
+
+        // Same ticket-aware tail as clearAllBlocks (#601): a live escape ticket, its expiry
+        // DeviceActivity, and the persisted schedule config must survive a layer teardown (the
+        // backstop restores the schedule shield at ticket end); with no live ticket, drop stale
+        // ticket state and recompute the schedule shield now. Both branches are layer-independent,
+        // so running them on a scoped clear is safe even while the other layer stays armed.
+        if self.isSuppressedInternal() {
+          // Ticket still live — preserve it (see clearAllBlocks).
         } else {
           self.clearSuppressionState()
           self.reevaluateScheduleShieldFromPersisted()
@@ -341,10 +414,10 @@ public class ExpoAppBlockerModule: Module {
 
     Function("isAppBlocked") { (bundleIdentifier: String) -> Bool in
       self.ensureLoadedPersistedConfig()
-      guard let config = self.currentBlockConfig else {
-        return false
-      }
-      return config.items.contains { $0.bundleIdentifier == bundleIdentifier }
+      // Focus-store split: blocked = present in EITHER immediate layer's item set.
+      let inGate = self.currentBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
+      let inFocus = self.focusBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
+      return inGate || inFocus
     }
 
     AsyncFunction("temporaryUnlock") { (durationMinutes: Int, promise: Promise) in
@@ -369,6 +442,7 @@ public class ExpoAppBlockerModule: Module {
         self.sharedDefaults?.set(grantedAt, forKey: self.unlockGrantedAtKey)
 
         DispatchQueue.main.async {
+          // Focus-store split: earned time opens the GATE store only (focus is not earn-unlockable).
           self.store.shield.applications = nil
           self.store.shield.applicationCategories = nil
           self.store.shield.webDomains = nil
@@ -455,15 +529,19 @@ public class ExpoAppBlockerModule: Module {
           self.userDefaults.removeObject(forKey: self.suppressionTargetTokenKey)
         }
 
-        // Re-apply both shields for the new ticket state. `escapeExemptToken()` now reflects the
+        // Re-apply every shield for the new ticket state. `escapeExemptToken()` now reflects the
         // target (targeted → keep every store's shield up minus that one app) or nil (full → the
-        // gates in applyBlocks / reevaluateScheduleShieldFromPersisted lower both stores).
+        // gates in applyBlocks / reevaluateScheduleShieldFromPersisted lower all stores). The
+        // ticket is layer-agnostic, so BOTH immediate layers (gate + focus stores) re-apply here.
         if let config = self.currentBlockConfig {
           try? self.applyBlocks(config)
         } else {
-          self.store.shield.applications = nil
-          self.store.shield.applicationCategories = nil
-          self.store.shield.webDomains = nil
+          self.clearImmediateStore(self.store)
+        }
+        if let focusConfig = self.focusBlockConfig {
+          try? self.applyBlocks(focusConfig)
+        } else {
+          self.clearImmediateStore(self.focusStore)
         }
         self.reevaluateScheduleShieldFromPersisted()
 
@@ -620,6 +698,7 @@ public class ExpoAppBlockerModule: Module {
         // "now" and discard accrued usage — letting a user reset their budget by
         // bouncing back to this app. The monitor re-blocks on its own once usage
         // reaches the budget; this branch only ensures the shield stays off.
+        // Focus-store split: the budget belongs to the gate layer, so only the GATE store lowers.
         DispatchQueue.main.async {
           self.store.shield.applications = nil
           self.store.shield.applicationCategories = nil
@@ -632,6 +711,16 @@ public class ExpoAppBlockerModule: Module {
     } else if let config = currentBlockConfig {
       do {
         try applyBlocks(config)
+      } catch {
+      }
+    }
+
+    // Focus layer: independent of the earn budget (the branches above only ever touch the GATE
+    // store). Re-assert the focus shield from its slot — applyBlocks self-cleans if the focus
+    // config's own wall-clock expiry has passed, and honors a live ticket.
+    if let focusConfig = focusBlockConfig {
+      do {
+        try applyBlocks(focusConfig)
       } catch {
       }
     }
@@ -681,7 +770,12 @@ public class ExpoAppBlockerModule: Module {
     // NSNumber. Absent → nil (no expiry, back-compat with callers that don't pass it).
     let expiresAtMillis = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue
 
-    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis, mode: mode)
+    // Focus-store split: "focus" routes this config to the dedicated focus store/slot. Absent or
+    // any other value → the default (gate) slot, so an old JS bundle keeps the exact legacy
+    // single-slot behavior.
+    let guardType = dict["guardType"] as? String
+
+    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis, mode: mode, guardType: guardType)
   }
 
   /// Decode an array of raw item dicts (the `blockedItems` shape shared by immediate and
@@ -718,11 +812,29 @@ public class ExpoAppBlockerModule: Module {
     }
   }
 
+  /// Focus-store split helpers: which immediate layer a config belongs to, the store that layer
+  /// shields through, and a store-wide shield clear.
+  private func isFocus(_ config: BlockConfig) -> Bool {
+    return config.guardType == "focus"
+  }
+
+  private func immediateStore(for config: BlockConfig) -> ManagedSettingsStore {
+    return isFocus(config) ? focusStore : store
+  }
+
+  private func clearImmediateStore(_ managedStore: ManagedSettingsStore) {
+    managedStore.shield.applications = nil
+    managedStore.shield.applicationCategories = nil
+    managedStore.shield.webDomains = nil
+  }
+
   private func applyBlocks(_ config: BlockConfig) throws {
+    // Focus-store split: every shield write below targets the config's OWN layer store, so applying
+    // or lowering one immediate layer never touches the other's shield.
+    let target = immediateStore(for: config)
+
     guard config.isActive else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      clearImmediateStore(target)
       return
     }
 
@@ -730,23 +842,29 @@ public class ExpoAppBlockerModule: Module {
     // wall-clock gate). If the configured expiry has passed, treat the block as released — clear
     // the shield AND drop the persisted config so a killed-app relaunch (ensureLoadedPersistedConfig)
     // never re-applies an expired block. The monitor extension is the kill-proof path; this covers
-    // the case where the app comes back to the foreground after expiry.
+    // the case where the app comes back to the foreground after expiry. Per-slot: only THIS config's
+    // store, one-shot, and persisted copy are dropped.
     if let expiry = config.expiresAtMillis, expiry > 0,
        Date().timeIntervalSince1970 * 1000.0 >= expiry {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
-      cancelImmediateExpiryActivity()
-      currentBlockConfig = nil
-      userDefaults.removeObject(forKey: blockConfigStorageKey)
-      sharedDefaults?.removeObject(forKey: blockConfigStorageKey)
+      clearImmediateStore(target)
+      cancelImmediateExpiryActivity(guardType: config.guardType)
+      if isFocus(config) {
+        focusBlockConfig = nil
+        userDefaults.removeObject(forKey: focusBlockConfigStorageKey)
+        sharedDefaults?.removeObject(forKey: focusBlockConfigStorageKey)
+      } else {
+        currentBlockConfig = nil
+        userDefaults.removeObject(forKey: blockConfigStorageKey)
+        sharedDefaults?.removeObject(forKey: blockConfigStorageKey)
+      }
       return
     }
 
-    if isTemporarilyUnlockedInternal() {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+    // Earned time (the usage budget) opens the GATE layer only — a focus session is not
+    // earn-unlockable, so a focus config ignores a live budget. Old bundles never send guardType,
+    // land in the gate slot, and keep the legacy "budget lowers the immediate shield" behavior.
+    if !isFocus(config), isTemporarilyUnlockedInternal() {
+      clearImmediateStore(target)
       return
     }
 
@@ -755,9 +873,7 @@ public class ExpoAppBlockerModule: Module {
     // escaped app below and leaves the rest shielded, so it does NOT take the full-lower path.
     let exempt = escapeExemptToken()
     if isSuppressedInternal() && exempt == nil {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      clearImmediateStore(target)
       return
     }
 
@@ -766,7 +882,7 @@ public class ExpoAppBlockerModule: Module {
     // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
     // PR's manual-check list), so no explicit exception list is added here.
     if config.mode == .allow {
-      applyAllowlistShield(store, allowed: config.items, exempt: exempt)
+      applyAllowlistShield(target, allowed: config.items, exempt: exempt)
       return
     }
 
@@ -776,28 +892,26 @@ public class ExpoAppBlockerModule: Module {
     let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
 
     guard !validAppTokens.isEmpty || !validCategoryTokens.isEmpty || !validWebDomainTokens.isEmpty else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      clearImmediateStore(target)
       return
     }
 
     if !validAppTokens.isEmpty {
-      store.shield.applications = Set(validAppTokens)
+      target.shield.applications = Set(validAppTokens)
     } else {
-      store.shield.applications = nil
+      target.shield.applications = nil
     }
 
     if !validCategoryTokens.isEmpty {
-      store.shield.applicationCategories = .specific(Set(validCategoryTokens))
+      target.shield.applicationCategories = .specific(Set(validCategoryTokens))
     } else {
-      store.shield.applicationCategories = nil
+      target.shield.applicationCategories = nil
     }
 
     if !validWebDomainTokens.isEmpty {
-      store.shield.webDomains = Set(validWebDomainTokens)
+      target.shield.webDomains = Set(validWebDomainTokens)
     } else {
-      store.shield.webDomains = nil
+      target.shield.webDomains = nil
     }
   }
 
@@ -916,7 +1030,7 @@ public class ExpoAppBlockerModule: Module {
   /// DeviceActivity fires at the expiry instant so the monitor extension lifts the shield even if
   /// the host app is force-quit — the iOS analogue of Android's `expiresAtMillis` backstop.
   private func updateImmediateExpiryMonitoring(_ config: BlockConfig) {
-    cancelImmediateExpiryActivity()
+    cancelImmediateExpiryActivity(guardType: config.guardType)
     guard config.isActive, let expiry = config.expiresAtMillis, expiry > 0 else { return }
     let expiryDate = Date(timeIntervalSince1970: expiry / 1000.0)
     let now = Date()
@@ -928,7 +1042,7 @@ public class ExpoAppBlockerModule: Module {
       print("[AppBlocker] immediate-expiry crosses midnight — relying on foreground clear")
       return
     }
-    startImmediateExpiryMonitoring(expiresAt: expiryDate)
+    startImmediateExpiryMonitoring(expiresAt: expiryDate, guardType: config.guardType)
   }
 
   /// Register a one-shot DeviceActivity whose interval STARTS at the expiry instant. Only the
@@ -936,7 +1050,7 @@ public class ExpoAppBlockerModule: Module {
   /// block still works despite DeviceActivity's ~15-minute minimum interval length — we pad the
   /// interval past that minimum. An expiry within ~16 min of midnight can't fit a non-wrapping
   /// ≥15-min window, so it falls back to the app-foreground clear.
-  private func startImmediateExpiryMonitoring(expiresAt: Date) {
+  private func startImmediateExpiryMonitoring(expiresAt: Date, guardType: String?) {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
 
@@ -948,9 +1062,12 @@ public class ExpoAppBlockerModule: Module {
     let expiryMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
     let startMinute = (comps.second ?? 0) > 0 ? expiryMinute + 1 : expiryMinute
     let endMinute = startMinute + minScheduleIntervalMinutes + 1
+    // Focus-store split: each layer registers its OWN one-shot so they never cancel each other.
+    let layer = guardType == "focus" ? "focus" : "gate"
+    let activityName = guardType == "focus" ? focusImmediateExpiryActivityName : immediateExpiryActivityName
     guard startMinute <= 23 * 60 + 59, endMinute <= 23 * 60 + 59 else {
       print("[AppBlocker] immediate-expiry within ~16m of midnight — relying on foreground clear")
-      writeImmediateExpiryProbe(["phase": "register-skipped-midnight", "startMinute": startMinute])
+      writeImmediateExpiryProbe(["phase": "register-skipped-midnight", "startMinute": startMinute, "guardType": layer])
       return
     }
     let schedule = DeviceActivitySchedule(
@@ -960,26 +1077,28 @@ public class ExpoAppBlockerModule: Module {
     )
     do {
       try activityCenter.startMonitoring(
-        DeviceActivityName(immediateExpiryActivityName),
+        DeviceActivityName(activityName),
         during: schedule,
         events: [:]
       )
       writeImmediateExpiryProbe([
         "phase": "registered",
+        "guardType": layer,
         "startMinute": startMinute,
         "endMinute": endMinute,
         "untilMs": Int64(expiresAt.timeIntervalSince1970 * 1000.0)
       ])
     } catch {
       print("[AppBlocker] immediate-expiry startMonitoring failed: \(error.localizedDescription)")
-      writeImmediateExpiryProbe(["phase": "register-failed", "error": "\(error)"])
+      writeImmediateExpiryProbe(["phase": "register-failed", "error": "\(error)", "guardType": layer])
     }
   }
 
-  private func cancelImmediateExpiryActivity() {
+  private func cancelImmediateExpiryActivity(guardType: String?) {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
-    activityCenter.stopMonitoring([DeviceActivityName(immediateExpiryActivityName)])
+    let activityName = guardType == "focus" ? focusImmediateExpiryActivityName : immediateExpiryActivityName
+    activityCenter.stopMonitoring([DeviceActivityName(activityName)])
   }
 
   // MARK: - Escape Ticket Suppression (#572)
@@ -1530,6 +1649,12 @@ public class ExpoAppBlockerModule: Module {
       result["expiresAtMillis"] = expiresAtMillis
     }
 
+    // Focus-store split: keep the layer tag so a persisted focus config round-trips back into the
+    // focus store on reload, and getBlockConfiguration surfaces which layer the dict describes.
+    if let guardType = config.guardType {
+      result["guardType"] = guardType
+    }
+
     return result
   }
 
@@ -1541,23 +1666,36 @@ public class ExpoAppBlockerModule: Module {
     }
     didLoadPersistedConfig = true
 
-    guard let savedConfig = userDefaults.dictionary(forKey: blockConfigStorageKey) else {
-      return
+    if let savedConfig = userDefaults.dictionary(forKey: blockConfigStorageKey) {
+      do {
+        let config = try parseBlockConfig(savedConfig)
+        currentBlockConfig = config
+        try applyBlocks(config)
+      } catch {
+        currentBlockConfig = nil
+        userDefaults.removeObject(forKey: blockConfigStorageKey)
+      }
     }
 
-    do {
-      let config = try parseBlockConfig(savedConfig)
-      currentBlockConfig = config
-      try applyBlocks(config)
-    } catch {
-      currentBlockConfig = nil
-      userDefaults.removeObject(forKey: blockConfigStorageKey)
+    // Focus slot (focus-store split). Absent for old bundles / when no focus session is armed. The
+    // key is only ever written for guardType "focus" configs, so the dict routes itself back to the
+    // focus store through applyBlocks.
+    if let savedFocusConfig = userDefaults.dictionary(forKey: focusBlockConfigStorageKey) {
+      do {
+        let config = try parseBlockConfig(savedFocusConfig)
+        focusBlockConfig = config
+        try applyBlocks(config)
+      } catch {
+        focusBlockConfig = nil
+        userDefaults.removeObject(forKey: focusBlockConfigStorageKey)
+      }
     }
   }
 
-  private func persistBlockConfiguration(_ config: [String: Any]) {
-    userDefaults.set(config, forKey: blockConfigStorageKey)
-    sharedDefaults?.set(config, forKey: blockConfigStorageKey)
+  private func persistBlockConfiguration(_ config: [String: Any], guardType: String?) {
+    let key = guardType == "focus" ? focusBlockConfigStorageKey : blockConfigStorageKey
+    userDefaults.set(config, forKey: key)
+    sharedDefaults?.set(config, forKey: key)
   }
 
   // MARK: - Token Encoding/Decoding
@@ -1818,6 +1956,10 @@ struct BlockConfig {
   let expiresAtMillis: Double?
   // #563: block vs allow semantics for `items` (see BlockMode).
   let mode: BlockMode
+  // Focus-store split: which immediate layer this config arms. "focus" → the dedicated
+  // `appBlocker.focus` store + focus slot; anything else / nil (old JS bundles) → the default
+  // (gate) store + legacy slot.
+  let guardType: String?
 }
 
 struct ScheduleInfo {

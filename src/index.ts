@@ -257,8 +257,21 @@ export function getBlockConfiguration(): IOSBlockConfiguration | null {
   return NativeModule.getBlockConfiguration();
 }
 
-export function clearAllBlocks(): void {
+/**
+ * Clear immediate blocks (iOS; no-op elsewhere). Without `guardType` this is the legacy full
+ * teardown — BOTH immediate layers (gate + focus stores, their persisted configs, the earn budget)
+ * go down, exactly the pre-split behavior. Pass `guardType` to tear down just that layer while the
+ * other stays armed (focus-store split; the earn budget belongs to the gate layer and is cleared
+ * only on `"gate"`/full teardown). On a native binary that predates the split the scoped native
+ * function is absent, so this degrades to the legacy full teardown — callers that need the other
+ * layer back must re-arm it, i.e. keep the pre-split re-arm choreography behind a capability check.
+ */
+export function clearAllBlocks(guardType?: "gate" | "focus"): void {
   if (Platform.OS !== "ios") return;
+  if (guardType && typeof NativeModule.clearBlocksForGuardType === "function") {
+    NativeModule.clearBlocksForGuardType(guardType);
+    return;
+  }
   NativeModule.clearAllBlocks();
 }
 
