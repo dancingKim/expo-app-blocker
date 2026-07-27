@@ -1278,6 +1278,9 @@ public class ExpoAppBlockerModule: Module {
     // cross-midnight window (startMinute > endMinute) is split into two non-wrapping
     // activities so we never rely on a wrapping interval firing:
     //   evening [startMinute, 23:59]  +  morning [00:00, endMinute]
+    // A fragment shorter than DeviceActivity's ~15-minute minimum is registered as a
+    // minimum-length activity with ONE boundary pinned on the meaningful instant instead
+    // (see the branches below) — never skipped, so both window edges always get a wake-up.
     // Both names keep the schedule prefix so `stopScheduleActivities` still filters them.
     for (index, window) in windows.enumerated() {
       if window.startMinute <= window.endMinute {
@@ -1295,9 +1298,19 @@ public class ExpoAppBlockerModule: Module {
             endMinute: eveningEnd
           )
         } else {
-          // Sub-15-minute evening fragment (start after 23:44): skip the wake-up; the
-          // evaluator corrects the shield at the next boundary that does fire.
-          print("[AppBlocker] schedule window \(index) evening fragment < \(minScheduleIntervalMinutes)m — skipping activity")
+          // Sub-15-minute evening fragment (start after 23:44): DeviceActivity rejects an interval
+          // this short, and skipping it (the old behavior) left the free window's OPEN instant
+          // without any wake-up — the gap shield lingered until the morning activity's 00:00
+          // boundary. Register a minimum-length activity that ENDS exactly at the window start
+          // instead: intervalDidEnd is the wake-up, and the evaluator (the SSOT for shield state)
+          // recomputes "inside the window" and opens on time. Its early intervalDidStart boundary is
+          // harmless — the evaluator just re-asserts the current gap state. Same +1 pad past the
+          // ~15-minute minimum as the expiry one-shots.
+          registerScheduleActivity(
+            name: "\(scheduleActivityPrefix)\(index).evening",
+            startMinute: window.startMinute - (minScheduleIntervalMinutes + 1),
+            endMinute: window.startMinute
+          )
         }
         if window.endMinute > 0 {
           if window.endMinute >= minScheduleIntervalMinutes {
@@ -1307,9 +1320,18 @@ public class ExpoAppBlockerModule: Module {
               endMinute: window.endMinute
             )
           } else {
-            // Sub-15-minute morning fragment (endMinute < 15): skip the wake-up; the
-            // evaluator corrects the shield at the next boundary that does fire.
-            print("[AppBlocker] schedule window \(index) morning fragment < \(minScheduleIntervalMinutes)m — skipping activity")
+            // Sub-15-minute morning fragment (endMinute < 15): same rejection — and skipping it left
+            // the free window's CLOSE instant without a wake-up, so everything stayed OPEN until a
+            // later boundary happened to fire (a guardian hole; if the evening fragment was also
+            // short, the whole window used to lose both boundaries). Register a minimum-length
+            // activity that STARTS exactly at the window end: intervalDidStart is the wake-up and
+            // the evaluator re-shields on time. Its late intervalDidEnd boundary is a harmless
+            // re-assert.
+            registerScheduleActivity(
+              name: "\(scheduleActivityPrefix)\(index).morning",
+              startMinute: window.endMinute,
+              endMinute: window.endMinute + minScheduleIntervalMinutes + 1
+            )
           }
         }
       }
