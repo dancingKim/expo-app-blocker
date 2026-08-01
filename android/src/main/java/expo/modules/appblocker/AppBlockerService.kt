@@ -30,6 +30,10 @@ class AppBlockerService : Service() {
   private var consumingSinceMs = 0L
   // Whether a block is currently being enforced (overlay shown / app redirected).
   private var blocking = false
+  // #563 allowlist: packages that must never be shielded (launcher / system UI / dialer / IME /
+  // settings / host). Resolved once lazily — these rarely change within a session, and probing the
+  // PackageManager every 500 ms tick would be wasteful.
+  private val essentialApps: Set<String> by lazy { SystemEssentialApps.resolve(this) }
 
   private val pollRunnable = object : Runnable {
     override fun run() {
@@ -39,8 +43,31 @@ class AppBlockerService : Service() {
   }
 
   private fun tick() {
+    maybeExpireImmediateBlock()
+    maybeExpireSuppression()
     getCurrentForegroundPackage()?.let { currentForeground = it }
     val foreground = currentForeground
+
+    // #572/#598 escape ticket: a valid ticket suppresses blocking, independent of the lock layers.
+    // A FULL ticket (no target) keeps every app open; a TARGETED ticket (#598) exempts only the
+    // escaped package — a DIFFERENT blocked app in the foreground stays blocked. On the first tick
+    // after it expires (maybeExpireSuppression cleared the pref above) this is false, so blocks
+    // re-apply then.
+    if (AppBlockerPrefs.isSuppressed(this)) {
+      consumingSinceMs = 0L
+      val target = AppBlockerPrefs.getSuppressionTargetPackage(this)
+      if (target != null && foreground != null && foreground != target && isBlocked(foreground)) {
+        // Targeted ticket, and a blocked app OTHER than the escaped one is up → keep it blocked.
+        if (!blocking || foreground != lastForegroundPackage) {
+          enforceBlock(foreground, BlockReason.OPENED)
+        }
+      } else {
+        // Full ticket, the exempted app itself, or a non-blocked app → open.
+        clearBlock()
+      }
+      lastForegroundPackage = foreground
+      return
+    }
 
     if (foreground == null || !isBlocked(foreground)) {
       // Outside any blocked app: pause consumption and drop any active block.
@@ -50,8 +77,11 @@ class AppBlockerService : Service() {
       return
     }
 
-    if (unlockController.hasTimeLeft) {
-      // Inside a blocked app with earned time — spend it and keep the app usable.
+    // Earned time applies to immediate-only blocks. Schedule blocking is a pure time
+    // commitment — earned time never bypasses it (matches iOS) — so a schedule-blocked
+    // app is enforced immediately without consuming the budget.
+    if (!isScheduleBlocked(foreground) && unlockController.hasTimeLeft) {
+      // Inside an immediate-only blocked app with earned time — spend it, keep it usable.
       val now = System.currentTimeMillis()
       if (consumingSinceMs > 0L) unlockController.consume(now - consumingSinceMs)
       consumingSinceMs = now
@@ -63,7 +93,8 @@ class AppBlockerService : Service() {
         enforceBlock(foreground, BlockReason.EXPIRED)
       }
     } else {
-      // Inside a blocked app with no earned time — block on entry.
+      // Schedule-blocked (earned time must not be burned on an app the shield makes
+      // unusable), or an immediate block with no earned time — block on entry.
       consumingSinceMs = 0L
       if (!blocking || foreground != lastForegroundPackage) {
         Log.d(TAG, "Blocked app in foreground: $foreground")
@@ -80,6 +111,33 @@ class AppBlockerService : Service() {
     }
   }
 
+  // The immediate block carries an optional auto-release time planted the moment it was
+  // locked (0 = no expiry). expiry is the release guarantee — a JS relock/clear signal
+  // only brings release *forward*, and a killed process drops that signal, so the native
+  // expiry is what guarantees the block ever lifts. Once it has passed, drop the immediate
+  // set + expiry together so subsequent ticks return to the pristine (nothing-blocked)
+  // state. Runs every tick; the boundary alarm guarantees a tick fires at the expiry
+  // instant even if the service had been killed. No-op with no expiry or before it passes.
+  // Schedule blocking is independent and untouched here.
+  private fun maybeExpireImmediateBlock() {
+    val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
+    if (expiry != 0L && System.currentTimeMillis() >= expiry) {
+      Log.d(TAG, "Immediate block auto-release time reached ($expiry) — clearing")
+      // #563: clear whichever mode is armed (allowlist or legacy denylist) so release is complete.
+      AppBlockerPrefs.clearImmediateBlock(this)
+    }
+  }
+
+  // #572: drop an escape ticket once its wall-clock instant has passed so the next tick re-blocks
+  // (and a stale timestamp never lingers). Independent of the immediate-block expiry above.
+  private fun maybeExpireSuppression() {
+    val until = AppBlockerPrefs.getSuppressionUntil(this)
+    if (until != 0L && System.currentTimeMillis() >= until) {
+      Log.d(TAG, "Escape ticket expired ($until) — clearing suppression")
+      AppBlockerPrefs.clearSuppression(this)
+    }
+  }
+
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
@@ -91,13 +149,71 @@ class AppBlockerService : Service() {
     handler.post(pollRunnable)
   }
 
-  private fun isBlocked(packageName: String): Boolean =
-    packageName in AppBlockerPrefs.getBlockedPackages(this)
+  // Union of immediate blocking and schedule-window blocking. Evaluated every poll tick,
+  // so an active window takes effect at its boundary (the wall clock is re-read here).
+  // When no schedule is configured `getSchedulePackages` is empty, so this reduces to the
+  // original immediate-block check — zero behavior change.
+  private fun isBlocked(packageName: String): Boolean {
+    if (isImmediateBlocked(packageName)) return true
+    return isScheduleBlocked(packageName)
+  }
+
+  // Immediate blocking gated on the auto-release expiry (0 = no expiry). Enforced only
+  // while `now < expiry`; once passed the block is no longer applied even before
+  // [maybeExpireImmediateBlock] clears the prefs, so release can't be delayed by a
+  // pending write. Schedule blocking is separate and never gated by this.
+  //
+  // #563 allowlist: in "allow" mode the immediate block shields every app EXCEPT the kept set
+  // (+ system-essential apps); "block" mode is the legacy denylist. No armed mode → nothing blocked.
+  private fun isImmediateBlocked(packageName: String): Boolean {
+    val mode = AppBlockerPrefs.getImmediateMode(this) ?: return false
+    val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
+    val notExpired = expiry == 0L || System.currentTimeMillis() < expiry
+    if (!notExpired) return false
+    return when (mode) {
+      AppBlockerPrefs.MODE_ALLOW ->
+        packageName !in AppBlockerPrefs.getAllowedPackages(this) && !isSystemEssential(packageName)
+      else -> packageName in AppBlockerPrefs.getBlockedPackages(this)
+    }
+  }
+
+  // #570 free-window inversion: a schedule window is now "free time". While the schedule is armed
+  // (>= 1 window configured), everything OUTSIDE the free windows is blocked and inside a window is
+  // fully open. Schedule blocking is still a pure time commitment — earned time never bypasses the
+  // out-of-window block (matches iOS, where the schedule ManagedSettingsStore is independent of
+  // temporary unlock).
+  //
+  // Regression guard (#570 S2/S4): 0 windows = not armed → block nothing (an empty window set can
+  // never become a 24h lockdown); turning 시간표 off clears the windows, so an off schedule also
+  // blocks nothing.
+  //
+  // #563 allowlist: in "allow" mode the out-of-window block shields everything except the kept set
+  // (+ system-essential apps); "block" mode is the legacy denylist.
+  private fun isScheduleBlocked(packageName: String): Boolean {
+    if (ScheduleStore.getWindows(this).isEmpty()) return false                          // not armed / off
+    if (ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false // inside a free window → open
+    return when (ScheduleStore.getMode(this)) {
+      AppBlockerPrefs.MODE_ALLOW ->
+        packageName !in ScheduleStore.getSchedulePackages(this) && !isSystemEssential(packageName)
+      else -> packageName in ScheduleStore.getSchedulePackages(this)
+    }
+  }
+
+  // #563: never shield launcher / system UI / dialer / IME / settings / the host app, so allowlist
+  // "block everything else" can't brick the phone or seal off the OS-level emergency exit.
+  private fun isSystemEssential(packageName: String): Boolean = packageName in essentialApps
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
-    overlayManager.show(packageName, reason)
+    // #596: tell the overlay which layer blocked this so the escape flag it stamps carries the
+    // guardType for the JS router.
+    val guardType = if (isScheduleBlocked(packageName)) OverlayManager.GUARD_TYPE_SCHEDULE else OverlayManager.GUARD_TYPE_GATE
+    overlayManager.show(packageName, guardType)
     showBlockedNotification(packageName, reason)
     recordIntercept(packageName)
+    // #535: the block just redirected the user to the app — stamp the consumable guarded-launch
+    // flag so the JS router (#522) lands on the guarded task on resume (the launcher intent that
+    // OverlayManager fires can't carry routing data).
+    AppBlockerPrefs.recordPendingGuardedLaunch(this, System.currentTimeMillis())
     blocking = true
     consumingSinceMs = 0L
   }
@@ -243,10 +359,14 @@ class AppBlockerService : Service() {
     }
   }
 
+  // #526: the always-on foreground-service notification. Copy SSOT lives in the app at
+  // guardianCopy.awareness.androidForegroundNotification and is injected via configureAndroid
+  // (foregroundNotificationTitle/Text); the baked-in Korean defaults keep back-compat. Voice-compliant
+  // (no 3rd person, no "~하는 중").
   private fun buildNotification(): Notification =
     NotificationCompat.Builder(this, CHANNEL_ID)
-      .setContentTitle("App Blocker")
-      .setContentText("Monitoring blocked apps")
+      .setContentTitle(AppBlockerPrefs.getForegroundNotificationTitle(this))
+      .setContentText(AppBlockerPrefs.getForegroundNotificationText(this))
       .setSmallIcon(applicationInfo.icon)
       .setOngoing(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)

@@ -14,11 +14,15 @@ import type {
   AndroidConfig,
   IOSBlockedItem,
   IOSBlockConfiguration,
+  ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
+  SuppressionState,
+  GuardianProbes,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
+  BlockedAppsRemoveEvent,
 } from "./ExpoAppBlocker.types";
 
 export type {
@@ -28,14 +32,22 @@ export type {
   AndroidBlockableApp,
   IOSBlockedItem,
   IOSBlockConfiguration,
+  BlockMode,
+  ScheduleWindow,
+  IOSScheduleConfiguration,
+  AndroidScheduleConfiguration,
+  ScheduleConfiguration,
   TemporaryUnlockResult,
   RelockResult,
+  SuppressionState,
+  GuardianProbes,
   ShieldConfig,
   AndroidConfig,
   PluginConfig,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
+  BlockedAppsRemoveEvent,
 } from "./ExpoAppBlocker.types";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -106,9 +118,47 @@ export async function getInstalledApps(): Promise<AndroidBlockableApp[]> {
   return NativeModule.getInstalledApps();
 }
 
-export function setBlockedApps(packageNames: string[]): void {
+/**
+ * Replace the set of immediately-blocked apps (Android only; no-op elsewhere).
+ *
+ * Pass `options.expiresAtMillis` (epoch ms) to plant a native auto-release time: the
+ * block lifts on its own at that instant **even if the app process is later killed**,
+ * because the expiry lives in native prefs and a boundary alarm wakes the blocker service
+ * to release it. Omit it (or pass `0`) for a block with no auto-release — then only an
+ * explicit `setBlockedApps([])` / `relockApps()` clears it. Do **not** rely on a JS-side
+ * `setTimeout` for release: RN timers are paused in the background and lost when the OS
+ * kills the app, so a JS-only "unblock later" can silently never fire.
+ *
+ * This wrapper is Android-only (`options` is ignored off Android). The iOS immediate-block path is
+ * {@link setBlockConfiguration}, whose `expiresAtMillis` provides the symmetric native wall-clock
+ * backstop.
+ */
+export function setBlockedApps(
+  packageNames: string[],
+  options?: { expiresAtMillis?: number }
+): void {
   if (Platform.OS !== "android") return;
   NativeModule.setBlockedApps(packageNames);
+  NativeModule.setBlockExpiryAndroid(options?.expiresAtMillis ?? 0);
+}
+
+/**
+ * #563 allowlist immediate blocking (Android only; no-op elsewhere). Shields every app EXCEPT
+ * `packageNames` (plus system-essential apps: launcher / system UI / dialer / IME / settings / the
+ * host app) while armed. An EMPTY array is the release signal — it clears the immediate block, so
+ * "allow nothing / block everything" can never be armed by accident.
+ *
+ * `options.expiresAtMillis` plants the same native wall-clock auto-release as {@link setBlockedApps}
+ * (kill-proof; released by the boundary alarm even if the process dies). The iOS allowlist path is
+ * {@link setBlockConfiguration} with `{ mode: "allow", allowedItems }`.
+ */
+export function setAllowedApps(
+  packageNames: string[],
+  options?: { expiresAtMillis?: number }
+): void {
+  if (Platform.OS !== "android") return;
+  NativeModule.setAllowedAppsAndroid(packageNames);
+  NativeModule.setBlockExpiryAndroid(options?.expiresAtMillis ?? 0);
 }
 
 export function getBlockedApps(): string[] {
@@ -142,6 +192,14 @@ export async function presentFamilyActivityPicker(): Promise<IOSBlockedItem[]> {
   return NativeModule.presentFamilyActivityPicker();
 }
 
+/**
+ * Set the immediate iOS block (Family Controls shields), replacing any previous one.
+ *
+ * Pass `config.expiresAtMillis` (epoch ms) for a native wall-clock auto-release: a `DeviceActivity`
+ * fires at that instant and the monitor extension lifts the shield **even if the app is force-quit**
+ * — symmetric with Android's `setBlockedApps({ expiresAtMillis })`. Omit it for a block with no
+ * auto-release (only `clearAllBlocks()` clears it).
+ */
 export async function setBlockConfiguration(config: IOSBlockConfiguration): Promise<void> {
   if (Platform.OS !== "ios") {
     throw new Error("Block configuration is only available on iOS");
@@ -149,19 +207,158 @@ export async function setBlockConfiguration(config: IOSBlockConfiguration): Prom
   return NativeModule.setBlockConfiguration(config);
 }
 
+/**
+ * Android-only: arm the guarded task id alongside an immediate block, so a block-triggered app
+ * redirect can route the user back to that task (drained via {@link consumePendingGuardedLaunch}).
+ * Mirrors the iOS App Group `appBlocker.guardedItemId.v1` the app writes on arm. `null`/empty clears
+ * it. No-op off Android.
+ */
+export function setGuardedItemId(itemId: string | null): void {
+  if (Platform.OS !== "android") return;
+  NativeModule.setGuardedItemIdAndroid(itemId ?? null);
+}
+
+/**
+ * Android-only: drain the one-shot "a block just redirected you here" flag. Returns the guarded task
+ * id (possibly an empty string when none was armed) when a fresh guarded launch is pending, else
+ * `null`. The verified launcher intent the overlay fires can't carry routing data, so the app's
+ * notification/deep-link router (#522) consumes this on resume to land on the guarded task. Always
+ * `null` off Android (iOS routes via the ShieldAction notification payload instead).
+ */
+export function consumePendingGuardedLaunch(): string | null {
+  if (Platform.OS !== "android") return null;
+  return NativeModule.consumePendingGuardedLaunch() ?? null;
+}
+
+/**
+ * #596 Android-only: drain the one-shot "지금 필요해 was tapped on the overlay" escape flag. Returns
+ * `{ itemId, guardType }` when a fresh escape landing is pending (`itemId` may be an empty string when
+ * no task was armed), else `null`. The app drains this on resume and routes to the reason screen
+ * (guardian_escape) — the Android analogue of the iOS ShieldAction escape notification payload.
+ * Always `null` off Android (iOS routes via the notification payload instead).
+ */
+export function consumePendingGuardedEscape(): { itemId: string; guardType: string } | null {
+  if (Platform.OS !== "android") return null;
+  return NativeModule.consumePendingGuardedEscape() ?? null;
+}
+
+/**
+ * Whether THIS native binary actually bundles the guardian enforcement code — the iOS Family
+ * Controls extensions (shield/monitor `.appex`) or the Android blocker — independent of the JS/OTA
+ * bundle. iOS reads the app bundle's PlugIns dir; Android is always `true` (the blocker is compiled
+ * in). The exposure gate (#541) uses this so it never promises guardian on a build that can't
+ * enforce it. `false` on unsupported platforms / when the native module is absent.
+ */
+export function isGuardianExtensionAttached(): boolean {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return false;
+  return NativeModule.guardianExtensionAttached === true;
+}
+
 export function getBlockConfiguration(): IOSBlockConfiguration | null {
   if (Platform.OS !== "ios") return null;
   return NativeModule.getBlockConfiguration();
 }
 
-export function clearAllBlocks(): void {
+/**
+ * Clear immediate blocks (iOS; no-op elsewhere). Without `guardType` this is the legacy full
+ * teardown — BOTH immediate layers (gate + focus stores, their persisted configs, the earn budget)
+ * go down, exactly the pre-split behavior. Pass `guardType` to tear down just that layer while the
+ * other stays armed (focus-store split; the earn budget belongs to the gate layer and is cleared
+ * only on `"gate"`/full teardown). On a native binary that predates the split the scoped native
+ * function is absent, so this degrades to the legacy full teardown — callers that need the other
+ * layer back must re-arm it, i.e. keep the pre-split re-arm choreography behind a capability check.
+ */
+export function clearAllBlocks(guardType?: "gate" | "focus"): void {
   if (Platform.OS !== "ios") return;
+  if (guardType && typeof NativeModule.clearBlocksForGuardType === "function") {
+    NativeModule.clearBlocksForGuardType(guardType);
+    return;
+  }
   NativeModule.clearAllBlocks();
+}
+
+/**
+ * #657 (iOS; no-op elsewhere): tell the native side that an immediate layer's lock is **satisfied** —
+ * the thing it was guarding is done — while its configuration is still installed. The host defers the
+ * physical teardown whenever an escape ticket is open, and if the app dies in that window the
+ * deferred release is lost: at ticket expiry the monitor extension re-applies the stored config and
+ * the user is locked out again *by a task they already finished*. This marker is what the monitor
+ * consults there; it drops the leftover instead of re-arming it.
+ *
+ * Advisory only — it never lowers a shield by itself. Any later {@link setBlockConfiguration} or
+ * clear for that layer wipes it, so a marker can never outlive the config it refers to. Call it with
+ * `satisfied: false` to retract one explicitly.
+ *
+ * Silent no-op on a native binary that predates the marker (feature-detected), so callers do not
+ * need their own capability check.
+ */
+export function setGuardSatisfied(guardType: "gate" | "focus", satisfied: boolean = true): void {
+  if (Platform.OS !== "ios") return;
+  if (typeof NativeModule.setGuardSatisfied !== "function") return;
+  NativeModule.setGuardSatisfied(guardType, satisfied);
+}
+
+/**
+ * #661 stage 1 (iOS; `null` elsewhere): read back the diagnostic probes the native enforcement path
+ * records — the allowlist decode outcome and the two expiry backstops (see {@link GuardianProbes}).
+ * Read-only and side-effect free: nothing is cleared, so the same record can be inspected twice.
+ *
+ * Returns `null` on a native binary that predates the probes (feature-detected) — an empty object
+ * instead means the binary supports them but nothing has been recorded yet.
+ */
+export function getGuardianProbes(): GuardianProbes | null {
+  if (Platform.OS !== "ios") return null;
+  if (typeof NativeModule.getGuardianProbes !== "function") return null;
+  return NativeModule.getGuardianProbes() ?? {};
 }
 
 export function isAppBlocked(bundleIdentifier: string): boolean {
   if (Platform.OS !== "ios") return false;
   return NativeModule.isAppBlocked(bundleIdentifier);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Schedule-window blocking (both platforms — same JS API)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Block `config.blockedItems` whenever any of `config.windows` is currently active.
+ *
+ * Fully independent of, and unioned with, the immediate blocking set via
+ * `setBlockConfiguration` / `setBlockedApps`: with no schedule configured the immediate
+ * behavior is unchanged, and clearing one never clears the other. Outside every window
+ * the schedule blocks nothing.
+ *
+ * iOS: `blockedItems` are FamilyActivity items from the picker; enforced by a dedicated
+ * `ManagedSettingsStore` driven by `DeviceActivity` window boundaries.
+ * Android: `blockedItems` are package names; enforced by the foreground-service poll,
+ * with exact alarms waking the service at window boundaries.
+ */
+export async function setScheduleConfiguration(config: ScheduleConfiguration): Promise<void> {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return;
+  return NativeModule.setScheduleConfiguration(config);
+}
+
+/**
+ * Remove the schedule configuration and stop schedule-based blocking. Immediate blocks are
+ * untouched.
+ *
+ * #656: a **live** escape ticket now survives this too — it is a fixed-duration promise and is
+ * layer-agnostic (it suppresses the immediate shields as well), so a schedule teardown must not end
+ * it early and re-lock the phone mid-ticket. Its expiry backstop stays armed and re-locks at the
+ * promised instant; only an already-expired ticket is cleaned up here. On a native binary that
+ * predates this fix, clearing the schedule still drops a live ticket, so a caller that must not risk
+ * that should skip the call while a ticket is open.
+ */
+export function clearScheduleConfiguration(): void {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return;
+  NativeModule.clearScheduleConfiguration();
+}
+
+/** The current schedule configuration, or `null` if none is set. */
+export function getScheduleConfiguration(): ScheduleConfiguration | null {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return null;
+  return NativeModule.getScheduleConfiguration() ?? null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -222,6 +419,57 @@ export function checkAndClearPendingUnlock(): boolean {
   return NativeModule.checkAndClearPendingUnlock();
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Escape ticket suppression (#572) — both platforms, same JS API
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Suppress ALL blocking (immediate + schedule) until `untilMillis` (epoch ms), independent of every
+ * lock layer, then auto-re-apply from the stored config. Distinct from {@link temporaryUnlock}
+ * (earn), which is usage-based and never touches schedule blocking: this is a wall-clock window that
+ * lowers both shields and is re-applied **natively at the expiry instant even if the app is killed**
+ * (iOS: a one-shot `DeviceActivity` → the monitor recomputes; Android: the boundary alarm wakes the
+ * service to re-block). Do not re-lock with a JS timer — that is lost when the OS kills the app.
+ *
+ * A `untilMillis` at/​before now is a no-op (never lowers a shield without a live window). Calling
+ * again replaces the active ticket. Tearing down a lock layer ({@link clearAllBlocks} /
+ * {@link clearScheduleConfiguration}) no longer ends a **live** ticket — the ticket outlives the
+ * blocks it was suppressing and expires on its own schedule (#601/#656). Only a ticket that has
+ * already passed is cleaned up by those calls.
+ */
+export async function suppressBlocks(options: {
+  untilMillis: number;
+}): Promise<SuppressionState> {
+  const { untilMillis } = options;
+  if (Platform.OS === "android") {
+    NativeModule.suppressBlocksAndroid(untilMillis);
+    const now = Date.now();
+    return {
+      active: untilMillis > now,
+      untilMillis,
+      remainingMs: Math.max(0, untilMillis - now),
+    };
+  }
+  if (Platform.OS === "ios") {
+    return NativeModule.suppressBlocks(untilMillis);
+  }
+  return { active: false, untilMillis: 0, remainingMs: 0 };
+}
+
+/**
+ * The current escape-ticket state (`remainingMs` in milliseconds), for the door card
+ * '열림 · 타이머 N분' display. Reads back inactive once the ticket has expired.
+ */
+export function getSuppressionState(): SuppressionState {
+  if (Platform.OS === "android") {
+    return NativeModule.getSuppressionStateAndroid();
+  }
+  if (Platform.OS === "ios") {
+    return NativeModule.getSuppressionState();
+  }
+  return { active: false, untilMillis: 0, remainingMs: 0 };
+}
+
 /**
  * Android-only, last-resort recovery: forces a genuine process kill and
  * relaunch. Some native-layer failures (observed: an expo-sqlite connection
@@ -260,6 +508,13 @@ export function restartAppForRecovery(deepLink?: string): void {
 export interface PendingIntercept {
   appName: string | null;
   interceptedAt: number;
+  /**
+   * iOS shield event kind: `"impression"` = the shield rendered (ShieldConfiguration data source),
+   * `"action"` = a shield button was tapped (ShieldAction handler). The two are debounced on
+   * separate keys, so an exposure and the tap that follows it are both recorded. Absent on entries
+   * queued by an older native binary and on Android — treat it as nullable end-to-end.
+   */
+  kind?: "impression" | "action";
 }
 
 /**
@@ -292,9 +547,19 @@ if (Platform.OS === "ios") {
   } catch {}
 }
 
+/**
+ * #602: fixed height (pt) of each row in {@link BlockedAppsNativeList}. The native list is a
+ * non-scrolling, fixed-height VStack (native views don't report an intrinsic size to RN), so the
+ * component sizes its frame deterministically as `BLOCKED_APPS_ROW_HEIGHT × items.length`. Wrap it in
+ * your own ScrollView for scrolling; use this constant if you need to compute the container height.
+ */
+export const BLOCKED_APPS_ROW_HEIGHT = 56;
+
 export function BlockedAppsNativeList({
   items,
   selectionData,
+  removable,
+  onRemoveItem,
   style,
 }: BlockedAppsNativeListProps) {
   if (!NativeBlockedAppsView || Platform.OS !== "ios") return null;
@@ -304,9 +569,19 @@ export function BlockedAppsNativeList({
     .map((item) => ({ token: item.token, type: item.type }));
 
   return React.createElement(NativeBlockedAppsView, {
-    selectionData: selectionData || "",
+    // Only pass selectionData when it carries data — the native view treats "" as a no-op, but
+    // omitting it avoids the prop setter firing at all (tokens is the source of truth for this list).
+    ...(selectionData ? { selectionData } : {}),
     tokens,
-    style: [{ minHeight: 50 }, style],
+    ...(removable !== undefined ? { removable } : {}),
+    // #602: the native view emits { index, token, type }; unwrap nativeEvent for the caller. The view
+    // never mutates registration — the JS owner drops the item from its SSOT.
+    onRemoveItem: onRemoveItem
+      ? (e: { nativeEvent: BlockedAppsRemoveEvent }) => onRemoveItem(e.nativeEvent)
+      : undefined,
+    // Deterministic frame: exactly one BLOCKED_APPS_ROW_HEIGHT per rendered row (a caller-supplied
+    // height in `style` still overrides this).
+    style: [{ height: BLOCKED_APPS_ROW_HEIGHT * tokens.length }, style],
   });
 }
 

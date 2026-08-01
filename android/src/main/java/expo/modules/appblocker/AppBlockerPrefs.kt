@@ -12,6 +12,44 @@ object AppBlockerPrefs {
   private const val INTERCEPT_DEBOUNCE_MS = 2_000L
   private const val MAX_PENDING_INTERCEPTS = 200
   const val KEY_BLOCKED_PACKAGES = "blocked_packages"
+  // #563 allowlist: the kept apps for the immediate block, plus the immediate-block mode
+  // ("allow" | "block" | absent = none). In allow mode the service shields everything except
+  // KEY_ALLOWED_PACKAGES (+ system-essential apps); in block mode it shields KEY_BLOCKED_PACKAGES.
+  const val KEY_ALLOWED_PACKAGES = "allowed_packages"
+  const val KEY_IMMEDIATE_MODE = "immediate_mode"
+  const val MODE_ALLOW = "allow"
+  const val MODE_BLOCK = "block"
+  private const val KEY_BLOCK_EXPIRES_AT = "block_expires_at_millis"
+  // #572 escape ticket: a wall-clock instant until which ALL blocking (immediate + schedule) is
+  // suppressed, independent of the lock layers. 0 = no ticket. The service tick honors it; the
+  // boundary alarm wakes the service at this instant to re-block even if the service had been killed.
+  private const val KEY_SUPPRESSION_UNTIL = "suppression_until_millis"
+  // #598 targeted escape ticket: while a ticket is live and this is set, only this ONE package is
+  // exempt (opens) — every other blocked package stays blocked. Absent → full suppression (all open).
+  // Promoted from the escape-target candidate the overlay records when "지금 필요해" is tapped.
+  private const val KEY_SUPPRESSION_TARGET_PACKAGE = "suppression_target_package"
+  // #598: the package the user pressed "지금 필요해" on, recorded by the overlay (+ freshness ts).
+  // suppressBlocksAndroid consumes it and promotes it to KEY_SUPPRESSION_TARGET_PACKAGE.
+  private const val KEY_ESCAPE_TARGET_PACKAGE = "escape_target_package"
+  private const val KEY_ESCAPE_TARGET_PACKAGE_TS = "escape_target_package_ts"
+  // #596 escape landing: the one-shot "지금 필요해 was tapped" flag — the escape variant of
+  // KEY_PENDING_GUARDED_LAUNCH. Carries the guarded task id + guardType so the JS router lands on the
+  // reason screen (guardian_escape) instead of the task. Same freshness window as the normal launch.
+  private const val KEY_PENDING_GUARDED_ESCAPE = "pending_guarded_escape"
+  private const val KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE = "pending_guarded_escape_guard_type"
+  private const val KEY_PENDING_GUARDED_ESCAPE_TS = "pending_guarded_escape_ts"
+  // #596: overlay button labels (injected by the app via configureAndroid, English fallbacks here —
+  // no Korean hardcoded in the fork). Primary = "하러 가기" landing, secondary = "지금 필요해" escape.
+  private const val KEY_OVERLAY_PRIMARY_BUTTON = "overlay_primary_button"
+  private const val KEY_OVERLAY_SECONDARY_BUTTON = "overlay_secondary_button"
+  // Overlay button colors (hex). Absent → fall back to the existing title/text colors, so the
+  // current look is unchanged unless the app injects them.
+  private const val KEY_OVERLAY_PRIMARY_BUTTON_COLOR = "overlay_primary_button_color"
+  private const val KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR = "overlay_primary_button_text_color"
+  private const val KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR = "overlay_secondary_button_text_color"
+  // Always-on foreground-service notification copy. Absent → the baked-in Korean default (back-compat).
+  private const val KEY_FG_NOTIFICATION_TITLE = "fg_notification_title"
+  private const val KEY_FG_NOTIFICATION_TEXT = "fg_notification_text"
   private const val KEY_OVERLAY_TITLE = "overlay_title"
   private const val KEY_OVERLAY_TEXT = "overlay_text"
   private const val KEY_OVERLAY_BG_COLOR = "overlay_bg_color"
@@ -30,6 +68,13 @@ object AppBlockerPrefs {
   private const val KEY_OVERLAY_SPINNER_COLOR = "overlay_spinner_color"
   private const val KEY_NOTIFICATION_TITLE = "notification_title"
   private const val KEY_NOTIFICATION_TEXT = "notification_text"
+  // #535: guarded-launch routing (Android overlay landing). guardedItemId is armed by the app;
+  // pending* is the one-shot flag stamped when a block redirects the user, drained by the JS router.
+  private const val KEY_GUARDED_ITEM_ID = "guarded_item_id"
+  private const val KEY_PENDING_GUARDED_LAUNCH = "pending_guarded_launch"
+  private const val KEY_PENDING_GUARDED_LAUNCH_TS = "pending_guarded_launch_ts"
+  // Mirror the iOS home-widget freshness window: a guarded launch older than this is stale.
+  private const val MAX_PENDING_GUARDED_LAUNCH_AGE_MS = 5 * 60 * 1000L
 
   fun get(context: Context): SharedPreferences =
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -38,9 +83,223 @@ object AppBlockerPrefs {
     get(context).getStringSet(KEY_BLOCKED_PACKAGES, emptySet()) ?: emptySet()
 
   fun setBlockedPackages(context: Context, packages: Collection<String>) {
+    val set = packages.toSet()
+    val editor = get(context).edit().putStringSet(KEY_BLOCKED_PACKAGES, set)
+    // An empty immediate-block set means nothing is blocked now, so drop any pending
+    // auto-release expiry with it — expiry is only meaningful alongside a non-empty set,
+    // and a stale timestamp must never gate a later block.
+    if (set.isEmpty()) {
+      editor.putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+      editor.remove(KEY_IMMEDIATE_MODE)
+    } else {
+      // #563: mark legacy denylist mode so the service picks the right enforcement branch.
+      editor.putString(KEY_IMMEDIATE_MODE, MODE_BLOCK)
+    }
+    editor.apply()
+  }
+
+  /** #563: the kept apps for allowlist immediate blocking. */
+  fun getAllowedPackages(context: Context): Set<String> =
+    get(context).getStringSet(KEY_ALLOWED_PACKAGES, emptySet()) ?: emptySet()
+
+  /** #563: the immediate-block mode ("allow" | "block"), or null when no immediate block is armed. */
+  fun getImmediateMode(context: Context): String? =
+    get(context).getString(KEY_IMMEDIATE_MODE, null)
+
+  /**
+   * #563: arm allowlist immediate blocking — shield everything except `packages` (+ system apps).
+   * An EMPTY list is the release signal: it clears the immediate block entirely (mode → none, no
+   * allowed set, expiry dropped) so "allow nothing / block everything" can never be armed by
+   * accident. Non-empty sets mode = "allow".
+   */
+  fun setAllowedPackages(context: Context, packages: Collection<String>) {
+    val set = packages.toSet()
+    val editor = get(context).edit()
+    if (set.isEmpty()) {
+      clearImmediate(editor)
+    } else {
+      editor
+        .putStringSet(KEY_ALLOWED_PACKAGES, set)
+        .putString(KEY_IMMEDIATE_MODE, MODE_ALLOW)
+    }
+    editor.apply()
+  }
+
+  /**
+   * #563: clear the immediate block regardless of mode — both the denylist and allowlist sets,
+   * the mode, and the auto-release expiry. Used on release and on auto-expiry so the next tick
+   * returns to the pristine (nothing-blocked) state.
+   */
+  fun clearImmediateBlock(context: Context) {
+    val editor = get(context).edit()
+    clearImmediate(editor)
+    editor.apply()
+  }
+
+  private fun clearImmediate(editor: SharedPreferences.Editor) {
+    editor
+      .remove(KEY_BLOCKED_PACKAGES)
+      .remove(KEY_ALLOWED_PACKAGES)
+      .remove(KEY_IMMEDIATE_MODE)
+      .putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+  }
+
+  /** Immediate-block auto-release time (epoch millis); 0 means no expiry. */
+  fun getBlockExpiresAt(context: Context): Long =
+    get(context).getLong(KEY_BLOCK_EXPIRES_AT, 0L)
+
+  /**
+   * Plant/clear the immediate-block auto-release time. This is the *release guarantee*
+   * stored the moment we lock: an app/server relock signal can only bring release
+   * *forward*, and a killed process drops that signal, so the block is guaranteed to lift
+   * only because this timestamp lives in prefs and the service enforces it. Any value
+   * <= 0 clears it (no expiry).
+   */
+  fun setBlockExpiresAt(context: Context, expiresAtMillis: Long) {
     get(context).edit()
-      .putStringSet(KEY_BLOCKED_PACKAGES, packages.toSet())
+      .putLong(KEY_BLOCK_EXPIRES_AT, if (expiresAtMillis > 0L) expiresAtMillis else 0L)
       .apply()
+  }
+
+  /** #572: the escape-ticket end instant (epoch millis); 0 means no ticket. */
+  fun getSuppressionUntil(context: Context): Long =
+    get(context).getLong(KEY_SUPPRESSION_UNTIL, 0L)
+
+  /** #572: plant/clear the escape-ticket end instant. Any value <= 0 clears it (no ticket). */
+  fun setSuppressionUntil(context: Context, untilMillis: Long) {
+    get(context).edit()
+      .putLong(KEY_SUPPRESSION_UNTIL, if (untilMillis > 0L) untilMillis else 0L)
+      .apply()
+  }
+
+  /** #572: drop the escape ticket. #598: and its targeted package, so a later ticket starts clean. */
+  fun clearSuppression(context: Context) {
+    get(context).edit()
+      .remove(KEY_SUPPRESSION_UNTIL)
+      .remove(KEY_SUPPRESSION_TARGET_PACKAGE)
+      .apply()
+  }
+
+  /** #572: true while an escape ticket is live (`now < suppressionUntil`). */
+  fun isSuppressed(context: Context): Boolean {
+    val until = getSuppressionUntil(context)
+    return until > 0L && System.currentTimeMillis() < until
+  }
+
+  /**
+   * #598: the ONE package a live targeted escape ticket keeps open (every other blocked package stays
+   * blocked), or null for a full-suppression ticket (all open). Set by [setSuppressionTargetPackage].
+   */
+  fun getSuppressionTargetPackage(context: Context): String? =
+    get(context).getString(KEY_SUPPRESSION_TARGET_PACKAGE, null)
+
+  /** #598: plant/clear the targeted-ticket package. null/empty clears it (→ full suppression). */
+  fun setSuppressionTargetPackage(context: Context, packageName: String?) {
+    val editor = get(context).edit()
+    if (packageName.isNullOrEmpty()) editor.remove(KEY_SUPPRESSION_TARGET_PACKAGE)
+    else editor.putString(KEY_SUPPRESSION_TARGET_PACKAGE, packageName)
+    editor.apply()
+  }
+
+  /** #598: the overlay records the package the user pressed "지금 필요해" on (candidate + freshness). */
+  fun recordEscapeTargetPackage(context: Context, packageName: String, atMillis: Long) {
+    get(context).edit()
+      .putString(KEY_ESCAPE_TARGET_PACKAGE, packageName)
+      .putLong(KEY_ESCAPE_TARGET_PACKAGE_TS, atMillis)
+      .apply()
+  }
+
+  /**
+   * #598: return and clear the escape-target candidate iff fresh (same window as the guarded launch),
+   * for suppressBlocksAndroid to promote to the ticket's target. Stale/absent → null → full open.
+   */
+  fun consumeEscapeTargetPackage(context: Context): String? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_ESCAPE_TARGET_PACKAGE_TS, 0L)
+    val pkg = prefs.getString(KEY_ESCAPE_TARGET_PACKAGE, null)
+    if (ts > 0L || pkg != null) {
+      prefs.edit().remove(KEY_ESCAPE_TARGET_PACKAGE).remove(KEY_ESCAPE_TARGET_PACKAGE_TS).apply()
+    }
+    if (ts <= 0L || pkg.isNullOrEmpty()) return null
+    return if (System.currentTimeMillis() - ts <= MAX_PENDING_GUARDED_LAUNCH_AGE_MS) pkg else null
+  }
+
+  /**
+   * #596: record the one-shot escape flag ("지금 필요해" tapped) — the escape variant of
+   * [recordPendingGuardedLaunch]. Stamps the currently-armed guarded task id + the guardType, and
+   * clears any normal pending-launch flag so a single overlay tap routes to exactly one place.
+   */
+  fun recordPendingGuardedEscape(context: Context, guardType: String, atMillis: Long) {
+    val prefs = get(context)
+    val itemId = prefs.getString(KEY_GUARDED_ITEM_ID, "") ?: ""
+    prefs.edit()
+      .putString(KEY_PENDING_GUARDED_ESCAPE, itemId)
+      .putString(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE, guardType)
+      .putLong(KEY_PENDING_GUARDED_ESCAPE_TS, atMillis)
+      .remove(KEY_PENDING_GUARDED_LAUNCH)
+      .remove(KEY_PENDING_GUARDED_LAUNCH_TS)
+      .apply()
+  }
+
+  /**
+   * #596: return and clear the pending escape flag as { itemId, guardType } when a fresh escape tap is
+   * pending, else null. The JS router drains it on resume and lands on the reason screen
+   * (guardian_escape), mirroring the iOS ShieldAction escape notification payload.
+   */
+  fun consumePendingGuardedEscape(context: Context): Map<String, String>? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_PENDING_GUARDED_ESCAPE_TS, 0L)
+    if (ts <= 0L) return null
+    val itemId = prefs.getString(KEY_PENDING_GUARDED_ESCAPE, "") ?: ""
+    val guardType = prefs.getString(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE, "") ?: ""
+    prefs.edit()
+      .remove(KEY_PENDING_GUARDED_ESCAPE)
+      .remove(KEY_PENDING_GUARDED_ESCAPE_GUARD_TYPE)
+      .remove(KEY_PENDING_GUARDED_ESCAPE_TS)
+      .apply()
+    if (System.currentTimeMillis() - ts > MAX_PENDING_GUARDED_LAUNCH_AGE_MS) return null
+    return mapOf("itemId" to itemId, "guardType" to guardType)
+  }
+
+  /**
+   * #535: the guarded task id armed alongside an immediate block (mirrors iOS's App Group
+   * `appBlocker.guardedItemId.v1`). null/empty clears it. Stamped into the pending-launch flag when
+   * a block redirects the user.
+   */
+  fun setGuardedItemId(context: Context, itemId: String?) {
+    val editor = get(context).edit()
+    if (itemId.isNullOrEmpty()) editor.remove(KEY_GUARDED_ITEM_ID) else editor.putString(KEY_GUARDED_ITEM_ID, itemId)
+    editor.apply()
+  }
+
+  /**
+   * #535: record a one-shot "a block just redirected the user here" flag, stamping the currently
+   * armed guarded task id (possibly empty) and the time. The JS router drains it on resume via
+   * [consumePendingGuardedLaunch] and lands on that task.
+   */
+  fun recordPendingGuardedLaunch(context: Context, atMillis: Long) {
+    val prefs = get(context)
+    val itemId = prefs.getString(KEY_GUARDED_ITEM_ID, "") ?: ""
+    prefs.edit()
+      .putString(KEY_PENDING_GUARDED_LAUNCH, itemId)
+      .putLong(KEY_PENDING_GUARDED_LAUNCH_TS, atMillis)
+      .apply()
+  }
+
+  /**
+   * #535: return and clear the pending guarded-launch flag. Returns the guarded task id (possibly
+   * empty string) when a fresh guarded launch is pending, or null when none is pending or it is stale.
+   */
+  fun consumePendingGuardedLaunch(context: Context): String? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_PENDING_GUARDED_LAUNCH_TS, 0L)
+    if (ts <= 0L) return null
+    val itemId = prefs.getString(KEY_PENDING_GUARDED_LAUNCH, "") ?: ""
+    prefs.edit()
+      .remove(KEY_PENDING_GUARDED_LAUNCH)
+      .remove(KEY_PENDING_GUARDED_LAUNCH_TS)
+      .apply()
+    return if (System.currentTimeMillis() - ts <= MAX_PENDING_GUARDED_LAUNCH_AGE_MS) itemId else null
   }
 
   /**
@@ -68,12 +327,26 @@ object AppBlockerPrefs {
     overlaySpinnerSize: Float?,
     overlaySpinnerTopMargin: Float?,
     overlaySpinnerColor: String?,
+    overlayPrimaryButtonText: String?,
+    overlaySecondaryButtonText: String?,
+    overlayPrimaryButtonColor: String?,
+    overlayPrimaryButtonTextColor: String?,
+    overlaySecondaryButtonTextColor: String?,
+    foregroundNotificationTitle: String?,
+    foregroundNotificationText: String?,
     notificationTitle: String?,
     notificationText: String?,
   ) {
     val editor = get(context).edit()
       .putString(KEY_OVERLAY_TITLE, overlayTitle)
       .putString(KEY_OVERLAY_TEXT, overlayText)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON, overlayPrimaryButtonText)
+      .putString(KEY_OVERLAY_SECONDARY_BUTTON, overlaySecondaryButtonText)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON_COLOR, overlayPrimaryButtonColor)
+      .putString(KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR, overlayPrimaryButtonTextColor)
+      .putString(KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR, overlaySecondaryButtonTextColor)
+      .putString(KEY_FG_NOTIFICATION_TITLE, foregroundNotificationTitle)
+      .putString(KEY_FG_NOTIFICATION_TEXT, foregroundNotificationText)
       .putString(KEY_OVERLAY_BG_COLOR, overlayBackgroundColor)
       .putString(KEY_OVERLAY_TITLE_COLOR, overlayTitleColor)
       .putString(KEY_OVERLAY_TEXT_COLOR, overlayTextColor)
@@ -106,6 +379,36 @@ object AppBlockerPrefs {
 
   fun getOverlayText(context: Context): String =
     get(context).getString(KEY_OVERLAY_TEXT, null) ?: "{appName} is blocked."
+
+  // #596 overlay buttons. Primary = "하러 가기" landing (always shown). Secondary = "지금 필요해"
+  // escape (shown unless the app disables it by passing "none"/empty). English fallbacks only —
+  // the app injects the Korean copy via configureAndroid.
+  fun getOverlayPrimaryButtonText(context: Context): String =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON, null) ?: "Go do it"
+
+  fun getOverlaySecondaryButtonText(context: Context): String? {
+    val value = get(context).getString(KEY_OVERLAY_SECONDARY_BUTTON, null) ?: "I need it now"
+    return if (value.isEmpty() || value == "none") null else value
+  }
+
+  // Overlay button colors (hex) — null lets OverlayManager fall back to the title/text colors, so the
+  // current look is unchanged unless the app injects them.
+  fun getOverlayPrimaryButtonColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON_COLOR, null)
+
+  fun getOverlayPrimaryButtonTextColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_PRIMARY_BUTTON_TEXT_COLOR, null)
+
+  fun getOverlaySecondaryButtonTextColor(context: Context): String? =
+    get(context).getString(KEY_OVERLAY_SECONDARY_BUTTON_TEXT_COLOR, null)
+
+  // Always-on foreground-service notification copy — SSOT in the app (guardianCopy.awareness.*);
+  // baked-in Korean defaults keep back-compat when the app doesn't inject.
+  fun getForegroundNotificationTitle(context: Context): String =
+    get(context).getString(KEY_FG_NOTIFICATION_TITLE, null) ?: "앱 잠금 켜짐"
+
+  fun getForegroundNotificationText(context: Context): String =
+    get(context).getString(KEY_FG_NOTIFICATION_TEXT, null) ?: "허용한 앱만 열려."
 
   fun getOverlayBackgroundColor(context: Context): String =
     get(context).getString(KEY_OVERLAY_BG_COLOR, null) ?: "#FFFFFF"

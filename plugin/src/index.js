@@ -73,6 +73,8 @@ function withAppBlockerAndroid(config, pluginConfig) {
       "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
       "android.permission.RECEIVE_BOOT_COMPLETED",
       "android.permission.POST_NOTIFICATIONS",
+      // Exact alarms wake AppBlockerService at schedule-window boundaries.
+      "android.permission.SCHEDULE_EXACT_ALARM",
     ];
 
     // PACKAGE_USAGE_STATS needs tools:ignore
@@ -101,6 +103,17 @@ function withAppBlockerAndroid(config, pluginConfig) {
           "android:exported": "false",
           "android:foregroundServiceType": "specialUse",
         },
+        // Android 14+ (API 34) / Play requirement: a specialUse FGS must declare its subtype here so
+        // Play review can see the use case (the guardian's always-on usage poll = app blocking /
+        // digital wellbeing).
+        property: [
+          {
+            $: {
+              "android:name": "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE",
+              "android:value": "app_blocking_digital_wellbeing",
+            },
+          },
+        ],
       });
     }
 
@@ -110,6 +123,14 @@ function withAppBlockerAndroid(config, pluginConfig) {
       mainApplication.receiver.push({
         $: { "android:name": "expo.modules.appblocker.BootReceiver", "android:enabled": "true", "android:exported": "true" },
         "intent-filter": [{ action: [{ $: { "android:name": "android.intent.action.BOOT_COMPLETED" } }] }],
+      });
+    }
+
+    // Add AlarmReceiver (schedule-window boundary wakeups). Triggered only by our own
+    // exact-alarm PendingIntent, so it is not exported and needs no intent-filter.
+    if (!mainApplication.receiver.some((r) => r.$?.["android:name"] === "expo.modules.appblocker.AlarmReceiver")) {
+      mainApplication.receiver.push({
+        $: { "android:name": "expo.modules.appblocker.AlarmReceiver", "android:enabled": "true", "android:exported": "false" },
       });
     }
 
@@ -226,6 +247,11 @@ function withAppBlockerIOS(config, pluginConfig) {
     config.modResults.BGTaskSchedulerPermittedIdentifiers = [
       `${config.ios?.bundleIdentifier || "expo.app-blocker"}.relock`,
     ];
+    // #609: expose the app group to the MODULE at runtime. The module's Swift (ExpoAppBlockerConfig)
+    // is not placeholder-substituted like the extension templates, so without this it fell back to a
+    // ghost group.<bundleId> distinct from the extensions' real group — breaking every App-Group
+    // handoff. Same `appGroup` the entitlement + extension placeholders use, so all four stay aligned.
+    config.modResults.ExpoAppBlockerAppGroup = appGroup;
     return config;
   });
 
@@ -398,15 +424,24 @@ function withAppBlockerIOS(config, pluginConfig) {
   // their app.json plugins array. Resolved from this package's own
   // node_modules (declared dep), which also makes it work in pnpm/yarn
   // workspaces where transitive plugins aren't hoisted into the app root.
-  try {
-    const withTargetsDir = resolve("@bacons/apple-targets/app.plugin");
-    config = withTargetsDir(config, {});
-  } catch (err) {
-    throw new Error(
-      `[expo-app-blocker] Failed to load '@bacons/apple-targets'. In pnpm or ` +
-      `yarn-workspace monorepos, add it as a direct dependency of your app: ` +
-      `\`pnpm add @bacons/apple-targets\`. Original error: ${err.message}`
-    );
+  //
+  // Apps that already register '@bacons/apple-targets' themselves (e.g. for
+  // their own widget targets) must set `ios.registerAppleTargets: false` and
+  // order this plugin BEFORE their apple-targets entry: config-plugins allows
+  // only one xcode provider mod, so a second registration throws
+  // "provider has already been added". The template copy above still runs, so
+  // the app's single apple-targets pass picks these targets up from `targets/`.
+  if (pluginConfig?.ios?.registerAppleTargets !== false) {
+    try {
+      const withTargetsDir = resolve("@bacons/apple-targets/app.plugin");
+      config = withTargetsDir(config, {});
+    } catch (err) {
+      throw new Error(
+        `[expo-app-blocker] Failed to load '@bacons/apple-targets'. In pnpm or ` +
+        `yarn-workspace monorepos, add it as a direct dependency of your app: ` +
+        `\`pnpm add @bacons/apple-targets\`. Original error: ${err.message}`
+      );
+    }
   }
 
   config = withDangerousMod(config, [

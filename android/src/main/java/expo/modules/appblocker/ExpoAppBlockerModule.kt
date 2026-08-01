@@ -28,6 +28,11 @@ class ExpoAppBlockerModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ExpoAppBlocker")
 
+    // #535: Android compiles the blocker in (no separate extension), so guardian is attached
+    // whenever this native module is present. Mirrors iOS's guardianExtensionAttached for the JS
+    // exposure gate (#541).
+    Constants("guardianExtensionAttached" to true)
+
     OnCreate {
       AppBlockerService.start(context)
       Log.d(TAG, "Module OnCreate: started AppBlockerService")
@@ -88,6 +93,13 @@ class ExpoAppBlockerModule : Module() {
         overlaySpinnerSize = numberOrNull("overlaySpinnerSize"),
         overlaySpinnerTopMargin = numberOrNull("overlaySpinnerTopMargin"),
         overlaySpinnerColor = config["overlaySpinnerColor"] as? String,
+        overlayPrimaryButtonText = config["overlayPrimaryButtonText"] as? String,
+        overlaySecondaryButtonText = config["overlaySecondaryButtonText"] as? String,
+        overlayPrimaryButtonColor = config["overlayPrimaryButtonColor"] as? String,
+        overlayPrimaryButtonTextColor = config["overlayPrimaryButtonTextColor"] as? String,
+        overlaySecondaryButtonTextColor = config["overlaySecondaryButtonTextColor"] as? String,
+        foregroundNotificationTitle = config["foregroundNotificationTitle"] as? String,
+        foregroundNotificationText = config["foregroundNotificationText"] as? String,
         notificationTitle = config["notificationTitle"] as? String,
         notificationText = config["notificationText"] as? String,
       )
@@ -99,8 +111,78 @@ class ExpoAppBlockerModule : Module() {
       Log.d(TAG, "setBlockedApps: $packageNames")
     }
 
+    // #563 allowlist immediate blocking: shield every app EXCEPT `packageNames` (+ system-essential
+    // apps) while armed. An empty list clears the immediate block (release). Expiry is planted
+    // separately via setBlockExpiryAndroid, exactly like setBlockedApps.
+    Function("setAllowedAppsAndroid") { packageNames: List<String> ->
+      AppBlockerPrefs.setAllowedPackages(context, packageNames)
+      AppBlockerService.start(context)
+      Log.d(TAG, "setAllowedAppsAndroid: $packageNames")
+    }
+
+    // Plant (or clear) the immediate block's auto-release time. Epoch millis; <= 0 clears
+    // it. The service gates the immediate block on this and lazily clears it once passed,
+    // and re-arming the boundary alarm makes it wake the service at the expiry instant so
+    // release happens even if this app process was later killed. JS sends the millis as a
+    // Double (epoch ms overflows Int).
+    Function("setBlockExpiryAndroid") { expiresAtMillis: Double ->
+      AppBlockerPrefs.setBlockExpiresAt(context, expiresAtMillis.toLong())
+      AlarmReceiver.scheduleNext(context)
+      Log.d(TAG, "setBlockExpiryAndroid: $expiresAtMillis")
+    }
+
     Function("getBlockedApps") {
       AppBlockerPrefs.getBlockedPackages(context).toList()
+    }
+
+    // #535: guarded task id the app arms alongside an immediate block (mirrors the iOS
+    // appBlocker.guardedItemId.v1 App Group key). Recorded into the consumable pending-launch flag
+    // when a block redirects the user, so the JS router (#522) can land on that task. null/empty clears.
+    Function("setGuardedItemIdAndroid") { itemId: String? ->
+      AppBlockerPrefs.setGuardedItemId(context, itemId)
+      Log.d(TAG, "setGuardedItemIdAndroid: $itemId")
+    }
+
+    // #535: drain the one-shot "a block just redirected you here" flag. Returns the guarded task id
+    // (possibly empty string) when a fresh guarded launch is pending, else null. The verified
+    // launcher intent can't carry routing data, so the JS router (#522) consumes this on resume to
+    // land on the guarded task — analogous to the home widget's consumePendingLaunchAction.
+    Function("consumePendingGuardedLaunch") {
+      AppBlockerPrefs.consumePendingGuardedLaunch(context)
+    }
+
+    // #596: drain the one-shot "지금 필요해 tapped" escape flag. Returns { itemId, guardType } when a
+    // fresh escape landing is pending, else null. The JS router lands on the reason screen
+    // (guardian_escape), mirroring the iOS ShieldAction escape notification payload.
+    Function("consumePendingGuardedEscape") {
+      AppBlockerPrefs.consumePendingGuardedEscape(context)
+    }
+
+    Function("setScheduleConfiguration") { config: Map<String, Any?> ->
+      ScheduleStore.setConfiguration(context, config)
+      // Arm the boundary alarm and make sure the service is alive so an already-open
+      // window is enforced on the next poll tick.
+      AlarmReceiver.scheduleNext(context)
+      AppBlockerService.start(context)
+      Log.d(TAG, "setScheduleConfiguration: $config")
+    }
+
+    Function("clearScheduleConfiguration") {
+      ScheduleStore.clear(context)
+      // #656: keep a LIVE escape ticket. An escape ticket is a fixed-duration promise and is
+      // layer-agnostic (it suppresses the immediate block too), so ending it early because the
+      // schedule layer was torn down re-locked the phone mid-ticket. Only a ticket that is already
+      // over is dropped here. Mirrors the iOS `clearScheduleConfigurationInternal` branch.
+      if (!AppBlockerPrefs.isSuppressed(context)) AppBlockerPrefs.clearSuppression(context)
+      // scheduleNext re-arms for whatever boundary is left (a live ticket's expiry, an immediate
+      // block's auto-release) and cancels the alarm outright when nothing remains — so the "clearing
+      // the schedule leaves no wakeups behind" guarantee holds without killing the ticket's re-lock.
+      AlarmReceiver.scheduleNext(context)
+      Log.d(TAG, "clearScheduleConfiguration")
+    }
+
+    Function("getScheduleConfiguration") {
+      ScheduleStore.getConfigurationMap(context)
     }
 
     Function("drainPendingIntercepts") {
@@ -129,6 +211,31 @@ class ExpoAppBlockerModule : Module() {
 
     Function("getRemainingUnlockTimeAndroid") {
       TemporaryUnlockController.remainingSeconds(context)
+    }
+
+    // #572 escape ticket: suppress ALL blocking (immediate + schedule) until untilMillis (epoch ms),
+    // independent of the lock layers. The service tick honors it; the boundary alarm re-blocks at T
+    // even if the service was killed. Epoch ms arrives as a Double (overflows Int), like
+    // setBlockExpiryAndroid.
+    Function("suppressBlocksAndroid") { untilMillis: Double ->
+      AppBlockerPrefs.setSuppressionUntil(context, untilMillis.toLong())
+      // #598: promote the overlay-captured escaped package (if fresh) to this ticket's target — only
+      // that app stays open, every other blocked app keeps its shield. Absent/stale → full open.
+      AppBlockerPrefs.setSuppressionTargetPackage(context, AppBlockerPrefs.consumeEscapeTargetPackage(context))
+      AlarmReceiver.scheduleNext(context)
+      AppBlockerService.start(context)
+      Log.d(TAG, "suppressBlocksAndroid: $untilMillis")
+    }
+
+    // #572: current escape-ticket state (remaining ms) for the door card '열림 · 타이머 N분' display.
+    Function("getSuppressionStateAndroid") {
+      val until = AppBlockerPrefs.getSuppressionUntil(context)
+      val remaining = (until - System.currentTimeMillis()).coerceAtLeast(0L)
+      mapOf(
+        "active" to (remaining > 0L),
+        "untilMillis" to until.toDouble(),
+        "remainingMs" to remaining.toDouble(),
+      )
     }
 
     // Last-resort recovery for an unrecoverable native state (observed:
