@@ -157,6 +157,30 @@ export interface SuppressionState {
   remainingMs: number;
 }
 
+/**
+ * #661 stage 1: the natively-recorded diagnostic probes, read back for a real-device round. Each
+ * key holds only the LATEST record of its kind (a new event overwrites the previous one), and a key
+ * is absent when nothing of that kind has been recorded yet. Records are free-form JSON — they are
+ * evidence to read, not a contract to branch on.
+ *
+ * - `suppressionExpiry` — the escape ticket's kill-proof re-lock: `phase: "registered"` means the
+ *   one-shot was armed but iOS never called back; a `decision` field means it fired and says how it
+ *   resolved (including the previously-silent `no-ticket-recorded`, `register-skipped-*` cases).
+ * - `immediateExpiry` — the same registered/fired story for an immediate (gate/focus) block's
+ *   wall-clock release, plus `satisfied-not-rearmed` when a finished lock was dropped instead of
+ *   being resurrected.
+ * - `allowlistShield` — the last allowlist application: `requestedApps` vs `decodedApps` and their
+ *   `shortfall`. A non-zero shortfall means apps the user allowed were shielded anyway.
+ *
+ * iOS only (the records come from the App Group container written by the shield/monitor
+ * extensions).
+ */
+export interface GuardianProbes {
+  suppressionExpiry?: Record<string, unknown>;
+  immediateExpiry?: Record<string, unknown>;
+  allowlistShield?: Record<string, unknown>;
+}
+
 export interface FamilyActivityPickerSelectionEvent {
   /** Selected apps, categories, and web domains (pass to setBlockConfiguration) */
   items: IOSBlockedItem[];

@@ -65,6 +65,16 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // #614: same fired-outcome probe for the immediate (gate/focus) wall-clock expiry.
   private let immediateExpiryProbeKey = "appBlocker.immediateExpiryProbe.v1"
   private let immediateExpiryProbeFileName = "immediateExpiryProbe.json"
+  // #661 stage 1 (RECORD ONLY): allowlist-shield decode outcome — requested vs decoded app tokens.
+  // Same record the module writes (it carries `process` to tell the two writers apart).
+  private let allowlistShieldProbeKey = "appBlocker.allowlistShieldProbe.v1"
+  private let allowlistShieldProbeFileName = "allowlistShieldProbe.json"
+  // #657 satisfied marker (epoch ms), written by the host via `setGuardSatisfied`: this layer's
+  // reason to be locked is already done, even though its persisted config is still here (the host
+  // defers the teardown while an escape ticket is open). Present → the config is a leftover and this
+  // extension must NOT re-arm it. Cleared by the host on every arm/teardown, so it cannot go stale.
+  private let blockSatisfiedKey = "appBlocker.blockSatisfied.v1"
+  private let focusBlockSatisfiedKey = "appBlocker.blockSatisfied.focus.v1"
 
   private let store = ManagedSettingsStore()
   // Dedicated schedule store; must match the name used in ExpoAppBlockerModule.swift.
@@ -228,6 +238,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   private func expireSuppressionIfDue() {
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
+      // #661: the one-shot fired but no ticket is recorded — the App Group read came back empty
+      // (ticket already cleared by a teardown, or the container was unreadable from this process).
+      // Nothing is re-locked on this path, and it used to be silent; record it.
+      writeSuppressionExpiryProbe(decision: "no-ticket-recorded")
       return
     }
     guard Date().timeIntervalSince1970 * 1000.0 >= until else {
@@ -276,6 +290,23 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: immediateExpiryProbeKey, decision: decision, extra: extra)
   }
 
+  /// #661 stage 1: record the allowlist-shield decode outcome from THIS process. Same record shape
+  /// and destination as the module's writer (App Group file + a best-effort UserDefaults mirror);
+  /// `process` tells the two apart. RECORD ONLY — nothing here changes the shield.
+  private func writeAllowlistShieldProbe(_ fields: [String: Any]) {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    var probe = fields
+    probe["process"] = "monitor"
+    probe["at"] = Int64(Date().timeIntervalSince1970 * 1000.0)
+    guard let data = try? JSONSerialization.data(withJSONObject: probe) else { return }
+    if let fileURL = appGroupFileURL(allowlistShieldProbeFileName) {
+      try? data.write(to: fileURL, options: .atomic)
+    }
+    if let json = String(data: data, encoding: .utf8) {
+      defaults.set(json, forKey: allowlistShieldProbeKey)
+    }
+  }
+
   private func appGroupFileURL(_ name: String) -> URL? {
     FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
       .appendingPathComponent(name)
@@ -292,10 +323,37 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     return "reapplied-schedule-shield"
   }
 
+  /// #657: a layer marked SATISFIED by the host is a leftover, not a lock — its reason to exist is
+  /// already done and only the physical teardown is outstanding (deferred while an escape ticket was
+  /// open, then lost to an app kill). Drop it here instead of re-arming it: clear that layer's
+  /// shield, its persisted config, and the marker itself (one-shot, so the marker can never linger
+  /// and suppress a genuinely armed lock — and the host clears it on every arm anyway).
+  /// Returns true when the layer was consumed and the caller must not re-apply anything.
+  private func consumeSatisfiedLayerIfMarked(satisfiedKey: String, configKey: String,
+                                             target: ManagedSettingsStore, layer: String) -> Bool {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    let satisfiedAt = (defaults.object(forKey: satisfiedKey) as? NSNumber)?.doubleValue ?? 0
+    guard satisfiedAt > 0 else { return false }
+    target.shield.applications = nil
+    target.shield.applicationCategories = nil
+    target.shield.webDomains = nil
+    defaults.removeObject(forKey: configKey)
+    defaults.removeObject(forKey: satisfiedKey)
+    writeImmediateExpiryProbe(decision: "satisfied-not-rearmed", extra: ["guardType": layer])
+    return true
+  }
+
   /// Re-apply the immediate shields from the persisted configs (unless a layer's OWN wall-clock
   /// expiry has passed → drop it) and re-evaluate the schedule window state. Runs only after the
   /// ticket flag is cleared, so the gates in `reapplyBlockConfiguration` / `reevaluateScheduleShield`
   /// don't skip. Focus-store split: the gate and focus layers recompute independently.
+  ///
+  /// #657: a gate the user already SATISFIED is not re-armed here. That used to be an assumption
+  /// about the host ("JS clears the config when the task completes") rather than a rule this process
+  /// enforced — and when the host could not clear it (release deferred for a live ticket, then the
+  /// app killed), the ticket's expiry resurrected the lock for a finished task. The real guard now
+  /// lives in `reapplyBlockConfiguration` / `reapplyFocusConfiguration` (see
+  /// `consumeSatisfiedLayerIfMarked`), so this comment and the code agree.
   private func recomputeShieldsAfterSuppression() {
     let defaults = sharedDefaults ?? UserDefaults.standard
     if let dict = defaults.dictionary(forKey: blockConfigStorageKey) {
@@ -344,6 +402,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let exempt = escapeExemptToken()
     if isSuppressed() && exempt == nil { return }
 
+    // #657: the user already finished what this lock was guarding — do not resurrect it.
+    if consumeSatisfiedLayerIfMarked(satisfiedKey: blockSatisfiedKey,
+                                     configKey: blockConfigStorageKey,
+                                     target: store,
+                                     layer: "gate") { return }
+
     let userDefaults = sharedDefaults ?? UserDefaults.standard
 
     guard let configDict = userDefaults.dictionary(forKey: blockConfigStorageKey) else {
@@ -357,7 +421,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    applyBlocks(blockConfig, exempt: exempt, target: store)
+    applyBlocks(blockConfig, exempt: exempt, target: store, layer: "gate")
   }
 
   /// Focus-layer twin of `recomputeShieldsAfterSuppression`'s gate path (focus-store split):
@@ -367,6 +431,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   private func reapplyFocusConfiguration() {
     let exempt = escapeExemptToken()
     if isSuppressed() && exempt == nil { return }
+
+    // #657: same satisfied guard as the gate layer, on the focus slot/store.
+    if consumeSatisfiedLayerIfMarked(satisfiedKey: focusBlockSatisfiedKey,
+                                     configKey: focusBlockConfigStorageKey,
+                                     target: focusStore,
+                                     layer: "focus") { return }
 
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let dict = defaults.dictionary(forKey: focusBlockConfigStorageKey) else {
@@ -384,7 +454,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
     guard let blockConfig = parseBlockConfig(dict) else { return }
-    applyBlocks(blockConfig, exempt: exempt, target: focusStore)
+    applyBlocks(blockConfig, exempt: exempt, target: focusStore, layer: "focus")
   }
 
   // MARK: - Schedule-Window Blocking
@@ -505,7 +575,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   private func applyScheduleShield(_ items: [MonitorBlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
-      applyAllowlistShield(scheduleStore, allowed: items, exempt: exempt)
+      applyAllowlistShield(scheduleStore, allowed: items, layer: "schedule", exempt: exempt)
       return
     }
     let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
@@ -533,8 +603,22 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// `ShieldSettings.ActivityCategoryPolicy.all(except:)`. Only ApplicationTokens can go in the
   /// except-set (the app layer refuses non-app selections). Empty allowed set → no shield (the app
   /// gates 0 allowed apps as "lock not possible", so empty is never a real block-all here).
-  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo], exempt: ApplicationToken? = nil) {
+  ///
+  /// #661 stage 1: records requested vs decoded app tokens for `layer` (RECORD ONLY — no fail-open
+  /// judgement, no threshold; the shield applied is unchanged).
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
+    let requestedApps = items.filter { $0.type == .app }.count
+    writeAllowlistShieldProbe([
+      "layer": layer,
+      "requestedItems": items.count,
+      "requestedApps": requestedApps,
+      "decodedApps": allowedAppTokens.count,
+      "nonAppItems": items.count - requestedApps,
+      "shortfall": max(0, requestedApps - allowedAppTokens.count),
+      "hasTicketExempt": exempt != nil,
+      "shielded": !allowedAppTokens.isEmpty
+    ])
     if allowedAppTokens.isEmpty {
       // Empty allow set = no shield on this store; a targeted-ticket exempt must not turn that into
       // a block-everything-except-one shield.
@@ -608,7 +692,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
   /// Focus-store split: `target` is the layer's own store (gate = default `store`, focus =
   /// `focusStore`), so a recompute for one layer never rewrites the other's shield.
-  private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil, target: ManagedSettingsStore) {
+  private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil, target: ManagedSettingsStore, layer: String) {
     guard config.isActive else {
       target.shield.applications = nil
       target.shield.applicationCategories = nil
@@ -619,7 +703,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // #563 allowlist: shield every app except the kept ones (whether iOS also exempts
     // system-essential/controlling apps is pending real-device verification).
     if config.mode == .allow {
-      applyAllowlistShield(target, allowed: config.items, exempt: exempt)
+      applyAllowlistShield(target, allowed: config.items, layer: layer, exempt: exempt)
       return
     }
 

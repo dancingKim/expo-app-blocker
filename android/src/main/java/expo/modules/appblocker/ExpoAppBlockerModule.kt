@@ -169,9 +169,15 @@ class ExpoAppBlockerModule : Module() {
 
     Function("clearScheduleConfiguration") {
       ScheduleStore.clear(context)
-      // #572: tearing down the schedule drops any escape ticket so it can't outlive the blocks.
-      AppBlockerPrefs.clearSuppression(context)
-      AlarmReceiver.cancel(context)
+      // #656: keep a LIVE escape ticket. An escape ticket is a fixed-duration promise and is
+      // layer-agnostic (it suppresses the immediate block too), so ending it early because the
+      // schedule layer was torn down re-locked the phone mid-ticket. Only a ticket that is already
+      // over is dropped here. Mirrors the iOS `clearScheduleConfigurationInternal` branch.
+      if (!AppBlockerPrefs.isSuppressed(context)) AppBlockerPrefs.clearSuppression(context)
+      // scheduleNext re-arms for whatever boundary is left (a live ticket's expiry, an immediate
+      // block's auto-release) and cancels the alarm outright when nothing remains — so the "clearing
+      // the schedule leaves no wakeups behind" guarantee holds without killing the ticket's re-lock.
+      AlarmReceiver.scheduleNext(context)
       Log.d(TAG, "clearScheduleConfiguration")
     }
 

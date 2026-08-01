@@ -18,6 +18,7 @@ import type {
   TemporaryUnlockResult,
   RelockResult,
   SuppressionState,
+  GuardianProbes,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
   BlockedAppsNativeListProps,
@@ -39,6 +40,7 @@ export type {
   TemporaryUnlockResult,
   RelockResult,
   SuppressionState,
+  GuardianProbes,
   ShieldConfig,
   AndroidConfig,
   PluginConfig,
@@ -275,6 +277,41 @@ export function clearAllBlocks(guardType?: "gate" | "focus"): void {
   NativeModule.clearAllBlocks();
 }
 
+/**
+ * #657 (iOS; no-op elsewhere): tell the native side that an immediate layer's lock is **satisfied** —
+ * the thing it was guarding is done — while its configuration is still installed. The host defers the
+ * physical teardown whenever an escape ticket is open, and if the app dies in that window the
+ * deferred release is lost: at ticket expiry the monitor extension re-applies the stored config and
+ * the user is locked out again *by a task they already finished*. This marker is what the monitor
+ * consults there; it drops the leftover instead of re-arming it.
+ *
+ * Advisory only — it never lowers a shield by itself. Any later {@link setBlockConfiguration} or
+ * clear for that layer wipes it, so a marker can never outlive the config it refers to. Call it with
+ * `satisfied: false` to retract one explicitly.
+ *
+ * Silent no-op on a native binary that predates the marker (feature-detected), so callers do not
+ * need their own capability check.
+ */
+export function setGuardSatisfied(guardType: "gate" | "focus", satisfied: boolean = true): void {
+  if (Platform.OS !== "ios") return;
+  if (typeof NativeModule.setGuardSatisfied !== "function") return;
+  NativeModule.setGuardSatisfied(guardType, satisfied);
+}
+
+/**
+ * #661 stage 1 (iOS; `null` elsewhere): read back the diagnostic probes the native enforcement path
+ * records — the allowlist decode outcome and the two expiry backstops (see {@link GuardianProbes}).
+ * Read-only and side-effect free: nothing is cleared, so the same record can be inspected twice.
+ *
+ * Returns `null` on a native binary that predates the probes (feature-detected) — an empty object
+ * instead means the binary supports them but nothing has been recorded yet.
+ */
+export function getGuardianProbes(): GuardianProbes | null {
+  if (Platform.OS !== "ios") return null;
+  if (typeof NativeModule.getGuardianProbes !== "function") return null;
+  return NativeModule.getGuardianProbes() ?? {};
+}
+
 export function isAppBlocked(bundleIdentifier: string): boolean {
   if (Platform.OS !== "ios") return false;
   return NativeModule.isAppBlocked(bundleIdentifier);
@@ -302,7 +339,17 @@ export async function setScheduleConfiguration(config: ScheduleConfiguration): P
   return NativeModule.setScheduleConfiguration(config);
 }
 
-/** Remove the schedule configuration and stop schedule-based blocking. Immediate blocks are untouched. */
+/**
+ * Remove the schedule configuration and stop schedule-based blocking. Immediate blocks are
+ * untouched.
+ *
+ * #656: a **live** escape ticket now survives this too — it is a fixed-duration promise and is
+ * layer-agnostic (it suppresses the immediate shields as well), so a schedule teardown must not end
+ * it early and re-lock the phone mid-ticket. Its expiry backstop stays armed and re-locks at the
+ * promised instant; only an already-expired ticket is cleaned up here. On a native binary that
+ * predates this fix, clearing the schedule still drops a live ticket, so a caller that must not risk
+ * that should skip the call while a ticket is open.
+ */
 export function clearScheduleConfiguration(): void {
   if (Platform.OS !== "ios" && Platform.OS !== "android") return;
   NativeModule.clearScheduleConfiguration();
@@ -385,8 +432,10 @@ export function checkAndClearPendingUnlock(): boolean {
  * service to re-block). Do not re-lock with a JS timer — that is lost when the OS kills the app.
  *
  * A `untilMillis` at/​before now is a no-op (never lowers a shield without a live window). Calling
- * again replaces the active ticket. Clearing the blocks ({@link clearAllBlocks} /
- * {@link clearScheduleConfiguration}) also drops the ticket.
+ * again replaces the active ticket. Tearing down a lock layer ({@link clearAllBlocks} /
+ * {@link clearScheduleConfiguration}) no longer ends a **live** ticket — the ticket outlives the
+ * blocks it was suppressing and expires on its own schedule (#601/#656). Only a ticket that has
+ * already passed is cleaned up by those calls.
  */
 export async function suppressBlocks(options: {
   untilMillis: number;

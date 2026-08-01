@@ -87,6 +87,20 @@ public class ExpoAppBlockerModule: Module {
   private let suppressionExpiryProbeFileName = "suppressionExpiryProbe.json"
   // #614: same registered/fired probe for the immediate (gate/focus) wall-clock expiry.
   private let immediateExpiryProbeFileName = "immediateExpiryProbe.json"
+  // #661 stage 1 (RECORD ONLY): the last allowlist-shield application — how many items were asked
+  // for vs how many app tokens actually decoded into the `all(except:)` set. A shortfall means some
+  // "keep this app open" entries silently dropped out and the user is shielded from an app they
+  // allowed. No policy is attached here yet (the fail-open decision + threshold are deferred to
+  // stage 2); this only makes the shortfall visible after the fact.
+  private let allowlistShieldProbeFileName = "allowlistShieldProbe.json"
+  // #657 satisfied marker. An immediate layer whose reason-to-lock is already done, but whose
+  // persisted config the host could not tear down yet — e.g. the release was deferred while an
+  // escape ticket was open and the app was killed before it could be settled. The monitor
+  // reads this at its kill-proof recompute and drops the leftover instead of re-arming a lock the
+  // user already satisfied. Written ONLY by `setGuardSatisfied` (JS), and cleared automatically by
+  // every arm/teardown below, so a marker can never outlive the config it refers to.
+  private let blockSatisfiedKey = "appBlocker.blockSatisfied.v1"
+  private let focusBlockSatisfiedKey = "appBlocker.blockSatisfied.focus.v1"
   // #598 targeted escape ticket. The ShieldAction records the ApplicationToken the user pressed
   // "지금 필요해" on into `escapeTargetTokenKey` (+ a timestamp for freshness). `suppressBlocks`
   // consumes it and, when fresh, promotes it to `suppressionTargetTokenKey` — the ONE app that stays
@@ -270,6 +284,10 @@ public class ExpoAppBlockerModule: Module {
           } else {
             self.currentBlockConfig = blockConfig
           }
+          // #657: a fresh arm is by definition NOT satisfied. Dropping the marker BEFORE the new
+          // config lands is what keeps a stale marker from ever meeting a freshly-armed config — if
+          // the monitor woke up in between it would drop the lock the user is arming right now.
+          self.setGuardSatisfiedInternal(guardType: blockConfig.guardType, satisfied: false)
           try self.applyBlocks(blockConfig)
           self.persistBlockConfiguration(config, guardType: blockConfig.guardType)
           // #535: (re)arm or cancel the wall-clock expiry DeviceActivity for this config.
@@ -329,6 +347,9 @@ public class ExpoAppBlockerModule: Module {
         self.userDefaults.removeObject(forKey: self.focusBlockConfigStorageKey)
         self.sharedDefaults?.removeObject(forKey: self.focusBlockConfigStorageKey)
         self.clearUnlockState()
+        // #657: both configs are gone, so their satisfied markers have nothing left to refer to.
+        self.setGuardSatisfiedInternal(guardType: nil, satisfied: false)
+        self.setGuardSatisfiedInternal(guardType: "focus", satisfied: false)
 
         if self.isSuppressedInternal() {
           // Ticket still live — leave suppression state + its expiry DeviceActivity + the persisted
@@ -365,6 +386,8 @@ public class ExpoAppBlockerModule: Module {
           self.sharedDefaults?.removeObject(forKey: self.blockConfigStorageKey)
           self.clearUnlockState()
         }
+        // #657: this layer's config is gone — drop its satisfied marker with it.
+        self.setGuardSatisfiedInternal(guardType: guardType, satisfied: false)
 
         // Same ticket-aware tail as clearAllBlocks (#601): a live escape ticket, its expiry
         // DeviceActivity, and the persisted schedule config must survive a layer teardown (the
@@ -378,6 +401,42 @@ public class ExpoAppBlockerModule: Module {
           self.reevaluateScheduleShieldFromPersisted()
         }
       }
+    }
+
+    // #657: mark an immediate layer's lock as SATISFIED — the reason it was armed is done, even
+    // though its persisted config is still around (the host defers the physical teardown while an
+    // escape ticket is open). The monitor's kill-proof recompute reads the marker and drops the
+    // leftover config instead of re-arming it at ticket expiry, which is what otherwise resurrects
+    // "the lock for a task I already finished". Purely advisory: it never lowers a shield by itself,
+    // and any later `setBlockConfiguration` / clear for that layer wipes it, so it cannot go stale.
+    // `guardType` "focus" marks the focus layer; anything else marks the gate layer (same routing as
+    // parseBlockConfig). NEW function — callers must feature-detect it (`typeof`) for old binaries.
+    Function("setGuardSatisfied") { (guardType: String, satisfied: Bool) in
+      self.stateQueue.async {
+        self.setGuardSatisfiedInternal(guardType: guardType, satisfied: satisfied)
+      }
+    }
+
+    // #661 stage 1: hand the natively-written diagnostic probes to JS so a real-device round can be
+    // read back from the app instead of pulling the App Group container off the device. Read-only —
+    // it never clears a record (each probe file holds only the LATEST event and is overwritten by
+    // the next one, so draining would just lose evidence). Absent records are omitted from the dict.
+    // NEW function — callers must feature-detect it (`typeof`) for old binaries.
+    Function("getGuardianProbes") { () -> [String: Any] in
+      var out: [String: Any] = [:]
+      if let probe = self.readProbeRecord(
+        fileName: self.suppressionExpiryProbeFileName, udKey: "appBlocker.suppressionExpiryProbe.v1") {
+        out["suppressionExpiry"] = probe
+      }
+      if let probe = self.readProbeRecord(
+        fileName: self.immediateExpiryProbeFileName, udKey: "appBlocker.immediateExpiryProbe.v1") {
+        out["immediateExpiry"] = probe
+      }
+      if let probe = self.readProbeRecord(
+        fileName: self.allowlistShieldProbeFileName, udKey: "appBlocker.allowlistShieldProbe.v1") {
+        out["allowlistShield"] = probe
+      }
+      return out
     }
 
     Function("checkAndClearPendingUnlock") { () -> Bool in
@@ -882,7 +941,7 @@ public class ExpoAppBlockerModule: Module {
     // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
     // PR's manual-check list), so no explicit exception list is added here.
     if config.mode == .allow {
-      applyAllowlistShield(target, allowed: config.items, exempt: exempt)
+      applyAllowlistShield(target, allowed: config.items, layer: isFocus(config) ? "focus" : "gate", exempt: exempt)
       return
     }
 
@@ -1174,9 +1233,19 @@ public class ExpoAppBlockerModule: Module {
     cancelSuppressionExpiryActivity()
     let expiryDate = Date(timeIntervalSince1970: untilMillis / 1000.0)
     let now = Date()
-    guard expiryDate > now else { return }
+    // #661: both skips below leave the ticket WITHOUT a kill-proof re-lock (only the foreground
+    // re-apply remains), and both used to be silent — so an "it never re-locked" report could not be
+    // told apart from "iOS never fired the callback". Record them; behavior is unchanged.
+    guard expiryDate > now else {
+      writeSuppressionExpiryProbe(["phase": "register-skipped-past", "untilMs": Int64(untilMillis)])
+      return
+    }
     guard Calendar.current.isDate(expiryDate, inSameDayAs: now) else {
       print("[AppBlocker] suppression expiry crosses midnight — relying on foreground re-apply")
+      writeSuppressionExpiryProbe([
+        "phase": "register-skipped-crossmidnight",
+        "untilMs": Int64(untilMillis)
+      ])
       return
     }
     startSuppressionExpiryMonitoring(expiresAt: expiryDate)
@@ -1244,8 +1313,56 @@ public class ExpoAppBlockerModule: Module {
     writeExpiryProbe(fileName: suppressionExpiryProbeFileName, udKey: "appBlocker.suppressionExpiryProbe.v1", fields)
   }
 
+  /// #661 stage 1: record the allowlist-shield decode outcome (RECORD ONLY — the shield applied is
+  /// exactly what it was before this probe existed). `requestedApps` vs `decodedApps` is the signal:
+  /// a shortfall means some allowed apps never reached the `all(except:)` set and are being shielded
+  /// despite the user allowing them.
+  private func writeAllowlistShieldProbe(_ fields: [String: Any]) {
+    var probe = fields
+    probe["process"] = "module"
+    writeExpiryProbe(fileName: allowlistShieldProbeFileName, udKey: "appBlocker.allowlistShieldProbe.v1", probe)
+  }
+
+  /// #661 stage 1: read one probe record back — the App Group container file first (the durable
+  /// copy), falling back to the UserDefaults mirror. nil when neither exists.
+  private func readProbeRecord(fileName: String, udKey: String) -> [String: Any]? {
+    if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier),
+       let data = try? Data(contentsOf: container.appendingPathComponent(fileName)),
+       let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      return parsed
+    }
+    if let json = sharedDefaults?.string(forKey: udKey),
+       let data = json.data(using: .utf8),
+       let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      return parsed
+    }
+    return nil
+  }
+
   private func writeImmediateExpiryProbe(_ fields: [String: Any]) {
     writeExpiryProbe(fileName: immediateExpiryProbeFileName, udKey: "appBlocker.immediateExpiryProbe.v1", fields)
+  }
+
+  // MARK: - Satisfied Marker (#657)
+
+  /// Which layer's satisfied marker a `guardType` refers to — same routing as `parseBlockConfig`
+  /// ("focus" → focus slot, anything else including nil → the gate/legacy slot).
+  private func satisfiedKey(for guardType: String?) -> String {
+    return guardType == "focus" ? focusBlockSatisfiedKey : blockSatisfiedKey
+  }
+
+  /// Set/clear the layer's satisfied marker (epoch ms when set). Mirrored into the App Group so the
+  /// monitor extension — a separate process — sees it at its kill-proof recompute.
+  private func setGuardSatisfiedInternal(guardType: String?, satisfied: Bool) {
+    let key = satisfiedKey(for: guardType)
+    if satisfied {
+      let now = Date().timeIntervalSince1970 * 1000.0
+      sharedDefaults?.set(now, forKey: key)
+      userDefaults.set(now, forKey: key)
+    } else {
+      sharedDefaults?.removeObject(forKey: key)
+      userDefaults.removeObject(forKey: key)
+    }
   }
 
   private func cancelSuppressionExpiryActivity() {
@@ -1387,10 +1504,25 @@ public class ExpoAppBlockerModule: Module {
     }
   }
 
+  /// Tear down the SCHEDULE layer: its activities, its shield, its persisted config. Nothing else.
+  ///
+  /// #656: this used to `clearSuppressionState()` unconditionally, which also killed a LIVE escape
+  /// ticket and its expiry DeviceActivity. An escape ticket is a fixed-duration promise to the user
+  /// and is layer-agnostic — it suppresses the immediate shields too — so a schedule teardown ending
+  /// it early re-locked the phone mid-ticket ("약속한 10분을 3분 만에 뺏는" 재잠금). The schedule
+  /// re-arm the app runs after a task completes is exactly such a teardown, which made this the last
+  /// trigger of that bug. So branch the same way `clearAllBlocks` already does (#601):
+  ///   · ticket still live → keep the ticket, its target, and its expiry DeviceActivity. The
+  ///     monitor's suppression-expiry backstop still fires at the promised instant; with the
+  ///     schedule config now gone it simply finds nothing to re-shield for this layer.
+  ///   · no live ticket → drop the stale ticket state as before.
+  /// Only the ticket's lifetime changes; the schedule teardown itself is byte-for-byte the same.
   private func clearScheduleConfigurationInternal() {
     stopScheduleActivities()
     clearScheduleShield()
-    clearSuppressionState()  // #572: tearing down the schedule drops any escape ticket
+    if !isSuppressedInternal() {
+      clearSuppressionState()
+    }
     userDefaults.removeObject(forKey: scheduleConfigStorageKey)
     sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
   }
@@ -1412,7 +1544,7 @@ public class ExpoAppBlockerModule: Module {
   private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
-      applyAllowlistShield(scheduleStore, allowed: items, exempt: exempt)
+      applyAllowlistShield(scheduleStore, allowed: items, layer: "schedule", exempt: exempt)
       return
     }
     let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
@@ -1444,8 +1576,25 @@ public class ExpoAppBlockerModule: Module {
   /// everything" — the app never arms a lock with 0 allowed apps (0 = lock not possible), so we
   /// treat empty defensively as "no shield" rather than a block-all footgun. Whether iOS implicitly
   /// exempts the controlling app / system-essential apps is pending real-device verification.
-  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo], exempt: ApplicationToken? = nil) {
+  ///
+  /// #661 stage 1: every application also records how many items were requested vs how many app
+  /// tokens actually decoded (`layer` says which store). RECORD ONLY — no fail-open judgement and no
+  /// threshold here; that decision is deferred (stage 2), so the shield applied is unchanged.
+  private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
+    // #661: requested vs decoded. `requestedApps` counts only app-typed items — the only kind that
+    // can enter an `all(except:)` set — so a non-zero `nonAppItems` is itself a shortfall signal.
+    let requestedApps = items.filter { $0.type == .app }.count
+    writeAllowlistShieldProbe([
+      "layer": layer,
+      "requestedItems": items.count,
+      "requestedApps": requestedApps,
+      "decodedApps": allowedAppTokens.count,
+      "nonAppItems": items.count - requestedApps,
+      "shortfall": max(0, requestedApps - allowedAppTokens.count),
+      "hasTicketExempt": exempt != nil,
+      "shielded": !allowedAppTokens.isEmpty
+    ])
     if allowedAppTokens.isEmpty {
       // Empty allow set = no shield on this store (0 allowed is "lock not possible", never block-all).
       // Do NOT let a targeted-ticket exempt token turn that into a block-everything-except-one shield.
