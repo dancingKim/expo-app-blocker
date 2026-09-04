@@ -154,8 +154,19 @@ class ExpoAppBlockerModule : Module() {
     // #596: drain the one-shot "지금 필요해 tapped" escape flag. Returns { itemId, guardType } when a
     // fresh escape landing is pending, else null. The JS router lands on the reason screen
     // (guardian_escape), mirroring the iOS ShieldAction escape notification payload.
+    // #732: also carry the escaped app's package + display label (Android knows the app, iOS does
+    // not) so the reason screen / wait row can say "YouTube · 10분". The target candidate is only
+    // PEEKED here — suppressBlocksAndroid still consumes/promotes it when the ticket is issued.
+    // Keys are absent (not empty) when unknown so JS falls back to the reason title.
     Function("consumePendingGuardedEscape") {
-      AppBlockerPrefs.consumePendingGuardedEscape(context)
+      val base = AppBlockerPrefs.consumePendingGuardedEscape(context) ?: return@Function null
+      val pkg = AppBlockerPrefs.peekEscapeTargetPackage(context)
+      val out = base.toMutableMap()
+      if (!pkg.isNullOrEmpty()) {
+        out["targetPackage"] = pkg
+        resolveAppLabel(pkg)?.let { out["label"] = it }
+      }
+      out
     }
 
     Function("setScheduleConfiguration") { config: Map<String, Any?> ->
@@ -231,11 +242,19 @@ class ExpoAppBlockerModule : Module() {
     Function("getSuppressionStateAndroid") {
       val until = AppBlockerPrefs.getSuppressionUntil(context)
       val remaining = (until - System.currentTimeMillis()).coerceAtLeast(0L)
-      mapOf(
+      // #732: the live ticket's targeted package (#598) + its display label; absent when the ticket
+      // is a full-open one (or none). iOS never fills these (no app identity there).
+      val target = if (remaining > 0L) AppBlockerPrefs.getSuppressionTargetPackage(context) else null
+      val out = mutableMapOf<String, Any?>(
         "active" to (remaining > 0L),
         "untilMillis" to until.toDouble(),
         "remainingMs" to remaining.toDouble(),
       )
+      if (!target.isNullOrEmpty()) {
+        out["targetPackage"] = target
+        out["label"] = resolveAppLabel(target)
+      }
+      out
     }
 
     // Last-resort recovery for an unrecoverable native state (observed:
@@ -303,6 +322,21 @@ class ExpoAppBlockerModule : Module() {
       }.sortedBy { it["name"]?.toString()?.lowercase() }
     }
   }
+
+  /**
+   * #732: display label for an installed package (what the launcher shows), or null when the
+   * package is gone / not visible. Never throws — the label is presentation only; JS falls back to
+   * the reason title when it is missing.
+   */
+  private fun resolveAppLabel(packageName: String): String? =
+    try {
+      val pm = context.packageManager
+      val info = pm.getApplicationInfo(packageName, 0)
+      pm.getApplicationLabel(info)?.toString()?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) {
+      Log.d(TAG, "resolveAppLabel: no label for $packageName (${e.javaClass.simpleName})")
+      null
+    }
 
   private fun drawableToBase64Png(drawable: Drawable): String {
     val size = 96

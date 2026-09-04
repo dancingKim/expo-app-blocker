@@ -201,6 +201,19 @@ object AppBlockerPrefs {
     editor.apply()
   }
 
+  /**
+   * #732: read (do NOT clear) the fresh escape-target candidate so the JS reason screen can show the
+   * app's real name. [consumeEscapeTargetPackage] still promotes/clears it when the ticket is issued.
+   * Stale/absent → null (same freshness window as the guarded launch).
+   */
+  fun peekEscapeTargetPackage(context: Context): String? {
+    val prefs = get(context)
+    val ts = prefs.getLong(KEY_ESCAPE_TARGET_PACKAGE_TS, 0L)
+    val pkg = prefs.getString(KEY_ESCAPE_TARGET_PACKAGE, null)
+    if (ts <= 0L || pkg.isNullOrEmpty()) return null
+    return if (System.currentTimeMillis() - ts <= MAX_PENDING_GUARDED_LAUNCH_AGE_MS) pkg else null
+  }
+
   /** #598: the overlay records the package the user pressed "지금 필요해" on (candidate + freshness). */
   fun recordEscapeTargetPackage(context: Context, packageName: String, atMillis: Long) {
     get(context).edit()

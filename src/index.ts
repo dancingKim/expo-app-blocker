@@ -18,6 +18,7 @@ import type {
   TemporaryUnlockResult,
   RelockResult,
   SuppressionState,
+  PendingGuardedEscape,
   GuardianProbes,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
@@ -40,6 +41,7 @@ export type {
   TemporaryUnlockResult,
   RelockResult,
   SuppressionState,
+  PendingGuardedEscape,
   GuardianProbes,
   ShieldConfig,
   AndroidConfig,
@@ -236,8 +238,10 @@ export function consumePendingGuardedLaunch(): string | null {
  * no task was armed), else `null`. The app drains this on resume and routes to the reason screen
  * (guardian_escape) — the Android analogue of the iOS ShieldAction escape notification payload.
  * Always `null` off Android (iOS routes via the notification payload instead).
+ * #732: the payload may also carry `targetPackage` + `label` (the app the user tapped escape on) —
+ * see {@link PendingGuardedEscape}; both are absent on older binaries and when stale.
  */
-export function consumePendingGuardedEscape(): { itemId: string; guardType: string } | null {
+export function consumePendingGuardedEscape(): PendingGuardedEscape | null {
   if (Platform.OS !== "android") return null;
   return NativeModule.consumePendingGuardedEscape() ?? null;
 }

@@ -155,6 +155,25 @@ export interface SuppressionState {
   active: boolean;
   untilMillis: number;
   remainingMs: number;
+  /**
+   * #732 Android only: the live ticket's targeted package (#598) and its launcher label. Absent
+   * (undefined) on iOS, on a full-open ticket, and while no ticket is live.
+   */
+  targetPackage?: string;
+  label?: string | null;
+}
+
+/**
+ * #596/#732 Android only: the drained "지금 필요해 was tapped" escape flag. `itemId` may be `""`
+ * when no task was armed. `targetPackage`/`label` (#732) are the app the user tapped escape on —
+ * absent when the candidate is stale or the package is not visible; `label` may be absent even
+ * when `targetPackage` is present. Presentation only — never sent to the server as app identity.
+ */
+export interface PendingGuardedEscape {
+  itemId: string;
+  guardType: string;
+  targetPackage?: string;
+  label?: string;
 }
 
 /**
