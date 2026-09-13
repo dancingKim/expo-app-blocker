@@ -137,6 +137,7 @@ public class ExpoAppBlockerModule: Module {
   private let stateQueue = DispatchQueue(label: "expo.appblocker.state", qos: .userInitiated)
   private let scheduleLock = NSLock()
   private var isProcessingUnlockState = false
+  private var isReapplyingRecoveredTokens = false
 
   public func definition() -> ModuleDefinition {
     Name("ExpoAppBlocker")
@@ -183,6 +184,7 @@ public class ExpoAppBlockerModule: Module {
 
     OnCreate {
       self.sharedDefaults = UserDefaults(suiteName: self.appGroupIdentifier)
+      self.stateQueue.sync { self.initializeIsolatedStorage() }
       // #609: confirm module ↔ extension container alignment on the next device round. containerNil=true
       // means the resolved group is not entitled (still the ghost) — file handoffs would be no-ops.
       let containerNil = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: self.appGroupIdentifier) == nil
@@ -191,6 +193,49 @@ public class ExpoAppBlockerModule: Module {
 
       self.stateQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
         self?.checkAndApplyUnlockState()
+      }
+    }
+
+    AsyncFunction("refreshApplicationTokens") { (tokens: [String], promise: Promise) in
+      self.stateQueue.async {
+        guard GuardianTokenRecovery.supported else {
+          promise.resolve(["supported": false, "remaps": [String: String]()])
+          return
+        }
+        do {
+          let remaps = try GuardianTokenRecovery.refresh(
+            tokens + self.persistedRecoveryTokens(), group: self.appGroupIdentifier, persist: true)
+          self.isReapplyingRecoveredTokens = true
+          defer { self.isReapplyingRecoveredTokens = false }
+          try self.reapplyTokenRecoveryLayers()
+          promise.resolve(["supported": true, "remaps": remaps])
+        } catch {
+          promise.reject("TOKEN_RECOVERY_FAILED", "Application identity recovery could not complete")
+        }
+      }
+    }
+
+    // The displayed, committed selection owns membership. Pending identities are refreshed
+    // for later approval, but never enter a shield's exceptions through recovery.
+    AsyncFunction("refreshGuardianAllowedApps") { (items: [[String: Any]], pendingTokens: [String], promise: Promise) in
+      self.stateQueue.async {
+        do {
+          let tokens = items.compactMap { $0["token"] as? String }
+          let remaps = GuardianTokenRecovery.supported
+            ? try GuardianTokenRecovery.refresh(tokens + pendingTokens, group: self.appGroupIdentifier, persist: true)
+            : [String: String]()
+          self.isReapplyingRecoveredTokens = true
+          defer { self.isReapplyingRecoveredTokens = false }
+          // Validate before replacing any known-good policy.
+          guard self.makeBlockedItems(from: items).compactMap({ $0.appToken }).count == items.count else {
+            throw NSError(domain: "AppBlocker", code: 2)
+          }
+          self.replacePersistedAllowedItems(items)
+          try self.reapplyTokenRecoveryLayers()
+          promise.resolve(["supported": true, "remaps": remaps])
+        } catch {
+          promise.reject("TOKEN_RECOVERY_FAILED", "Allowed applications could not be reconciled")
+        }
       }
     }
 
@@ -222,15 +267,19 @@ public class ExpoAppBlockerModule: Module {
 
     AsyncFunction("presentFamilyActivityPicker") { (promise: Promise) in
       DispatchQueue.main.async {
-        self.ensureLoadedPersistedConfig()
+        let initialConfig = self.stateQueue.sync {
+          self.ensureLoadedPersistedConfig()
+          return self.currentBlockConfig
+        }
 
         guard self.authCenter.authorizationStatus == .approved else {
           promise.reject("NOT_AUTHORIZED", "Family Controls authorization not granted")
           return
         }
 
-        let initialAppTokens = Set(self.currentBlockConfig?.items.compactMap { $0.appToken } ?? [])
-        let initialCategoryTokens = Set(self.currentBlockConfig?.items.compactMap { $0.categoryToken } ?? [])
+        let initialAppTokens = Set(initialConfig?.items.filter { $0.type == .app }
+          .compactMap { self.decodeApplicationToken(from: $0.tokenId) } ?? [])
+        let initialCategoryTokens = Set(initialConfig?.items.compactMap { $0.categoryToken } ?? [])
         // Scoped, weak handle to the picker's own controller. The exit paths
         // must dismiss ONLY this controller — never rootVC.dismiss(), which
         // collapses an RN modal (e.g. SettingsModal) presented beneath the
@@ -305,15 +354,11 @@ public class ExpoAppBlockerModule: Module {
     }
 
     Function("getBlockConfiguration") { () -> [String: Any]? in
-      self.ensureLoadedPersistedConfig()
-
-      // Legacy view: the gate slot first (an old JS bundle only ever populates that one, so its
-      // read-back is unchanged), else the focus slot — "is anything immediate armed?" stays
-      // truthful. The returned dict carries `guardType` for the focus slot.
-      guard let config = self.currentBlockConfig ?? self.focusBlockConfig else {
-        return nil
+      self.stateQueue.sync {
+        self.ensureLoadedPersistedConfig()
+        guard let config = self.currentBlockConfig ?? self.focusBlockConfig else { return nil }
+        return self.serializeBlockConfig(config)
       }
-      return self.serializeBlockConfig(config)
     }
 
     // Tear down the IMMEDIATE (gate/focus) block — the immediate `store` shield and its persisted
@@ -472,11 +517,12 @@ public class ExpoAppBlockerModule: Module {
     }
 
     Function("isAppBlocked") { (bundleIdentifier: String) -> Bool in
-      self.ensureLoadedPersistedConfig()
-      // Focus-store split: blocked = present in EITHER immediate layer's item set.
-      let inGate = self.currentBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
-      let inFocus = self.focusBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
-      return inGate || inFocus
+      self.stateQueue.sync {
+        self.ensureLoadedPersistedConfig()
+        let inGate = self.currentBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
+        let inFocus = self.focusBlockConfig?.items.contains { $0.bundleIdentifier == bundleIdentifier } ?? false
+        return inGate || inFocus
+      }
     }
 
     AsyncFunction("temporaryUnlock") { (durationMinutes: Int, promise: Promise) in
@@ -614,6 +660,18 @@ public class ExpoAppBlockerModule: Module {
             "untilMillis": untilMillis,
             "remainingMs": Int(untilMillis - nowMillis)
           ])
+        }
+      }
+    }
+
+    // Explicit user early close. Restore the same layers as natural expiry before acknowledging.
+    AsyncFunction("endSuppression") { (promise: Promise) in
+      self.stateQueue.async {
+        do {
+          try self.endSuppressionInternal()
+          DispatchQueue.main.async { promise.resolve(self.suppressionState()) }
+        } catch {
+          DispatchQueue.main.async { promise.reject("ERR_END_SUPPRESSION", error.localizedDescription) }
         }
       }
     }
@@ -786,6 +844,77 @@ public class ExpoAppBlockerModule: Module {
   }
 
   // MARK: - Block Configuration
+
+  private func initializeIsolatedStorage() {
+    guard appGroupIdentifier.hasSuffix(".shared"), let defaults = sharedDefaults,
+          !defaults.bool(forKey: "appBlocker.isolatedStorage.v1") else { return }
+    // No owner can be proved for the old shared container. Drop only this app's
+    // enforcement and private cache; JS re-arms from its account-owned state.
+    activityCenter.stopMonitoring()
+    store.clearAllSettings()
+    focusStore.clearAllSettings()
+    scheduleStore.clearAllSettings()
+    for key in userDefaults.dictionaryRepresentation().keys where key.hasPrefix("appBlocker.") {
+      userDefaults.removeObject(forKey: key)
+    }
+    defaults.set(true, forKey: "appBlocker.isolatedStorage.v1")
+  }
+
+  private func replacePersistedAllowedItems(_ items: [[String: Any]]) {
+    guard let defaults = sharedDefaults else { return }
+    for key in [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey] {
+      guard var config = defaults.dictionary(forKey: key) else { continue }
+      if items.isEmpty {
+        defaults.removeObject(forKey: key)
+        userDefaults.removeObject(forKey: key)
+      } else {
+        config["mode"] = "allow"
+        config["allowedItems"] = items
+        config["blockedItems"] = items
+        config["appSelections"] = items
+        defaults.set(config, forKey: key)
+        userDefaults.set(config, forKey: key)
+      }
+    }
+    if items.isEmpty { stopScheduleActivities() }
+  }
+
+  private func persistedRecoveryTokens() -> [String] {
+    guard let defaults = sharedDefaults else { return [] }
+    var tokens: [String] = []
+    for key in [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey] {
+      guard let config = defaults.dictionary(forKey: key) else { continue }
+      for field in ["allowedItems", "blockedItems", "appSelections"] {
+        for item in config[field] as? [[String: Any]] ?? [] where item["type"] as? String == "app" {
+          if let token = item["token"] as? String { tokens.append(token) }
+        }
+      }
+    }
+    for key in [escapeTargetTokenKey, suppressionTargetTokenKey] {
+      if let token = defaults.string(forKey: key) { tokens.append(token) }
+    }
+    return tokens
+  }
+  private func reapplyTokenRecoveryLayers() throws {
+    // Re-read extension-owned expiry/satisfaction; never restore stale host snapshots.
+    guard let defaults = sharedDefaults else { return }
+    didLoadPersistedConfig = true
+    currentBlockConfig = nil
+    focusBlockConfig = nil
+    for (key, satisfied, target) in [(blockConfigStorageKey, blockSatisfiedKey, store),
+                                     (focusBlockConfigStorageKey, focusBlockSatisfiedKey, focusStore)] {
+      guard defaults.object(forKey: satisfied) == nil,
+            let dict = defaults.dictionary(forKey: key) else { clearImmediateStore(target); continue }
+      let config = try parseBlockConfig(dict)
+      guard config.isActive else { clearImmediateStore(target); continue }
+      if let expiry = config.expiresAtMillis, expiry > 0,
+         expiry <= Date().timeIntervalSince1970 * 1000 { clearImmediateStore(target); continue }
+      if isFocus(config) { focusBlockConfig = config }
+      else { currentBlockConfig = config }
+      try applyBlocks(config)
+    }
+    reevaluateScheduleShieldFromPersisted()
+  }
 
   private func parseBlockConfig(_ dict: [String: Any]) throws -> BlockConfig {
     // #563 allowlist mode: `mode == "allow"` reinterprets the item set as the apps to KEEP OPEN;
@@ -1224,56 +1353,71 @@ public class ExpoAppBlockerModule: Module {
     cancelSuppressionExpiryActivity()
   }
 
-  /// (Re)arm the one-shot DeviceActivity that fires at the ticket's expiry instant so the monitor
-  /// re-applies the shields even if the host app is force-quit — same pattern as the immediate
-  /// wall-clock expiry. Same-day only (a DeviceActivitySchedule interval is a time-of-day window);
-  /// a cross-midnight ticket falls back to the app-foreground re-apply (applyBlocks' gate clears
-  /// once `isSuppressedInternal` goes false).
+  private func endSuppressionInternal() throws {
+    // Load while the ticket is still active, avoiding a transient re-arm before satisfied
+    // markers have been consumed. Never manufacture a missing immediate configuration.
+    ensureLoadedPersistedConfig()
+    clearSuppressionState()
+    for guardType in ["gate", "focus"] {
+      let focus = guardType == "focus"
+      let target = focus ? focusStore : store
+      let markerKey = satisfiedKey(for: guardType)
+      let satisfied = sharedDefaults?.object(forKey: markerKey) != nil
+        || userDefaults.object(forKey: markerKey) != nil
+      if satisfied {
+        let configKey = focus ? focusBlockConfigStorageKey : blockConfigStorageKey
+        userDefaults.removeObject(forKey: configKey)
+        sharedDefaults?.removeObject(forKey: configKey)
+        if focus { focusBlockConfig = nil } else { currentBlockConfig = nil }
+        cancelImmediateExpiryActivity(guardType: guardType)
+        setGuardSatisfiedInternal(guardType: guardType, satisfied: false)
+      }
+      if let config = focus ? focusBlockConfig : currentBlockConfig {
+        // Existing evaluator preserves expiry, earned time and empty-allowlist safety.
+        try applyBlocks(config)
+      } else {
+        clearImmediateStore(target)
+      }
+    }
+    reevaluateScheduleShieldFromPersisted()
+  }
+
+  /// Use absolute date components: a ticket's deadline survives midnight and time-zone changes.
   private func updateSuppressionExpiryMonitoring(untilMillis: Double) {
     cancelSuppressionExpiryActivity()
     let expiryDate = Date(timeIntervalSince1970: untilMillis / 1000.0)
     let now = Date()
-    // #661: both skips below leave the ticket WITHOUT a kill-proof re-lock (only the foreground
-    // re-apply remains), and both used to be silent — so an "it never re-locked" report could not be
-    // told apart from "iOS never fired the callback". Record them; behavior is unchanged.
     guard expiryDate > now else {
       writeSuppressionExpiryProbe(["phase": "register-skipped-past", "untilMs": Int64(untilMillis)])
-      return
-    }
-    guard Calendar.current.isDate(expiryDate, inSameDayAs: now) else {
-      print("[AppBlocker] suppression expiry crosses midnight — relying on foreground re-apply")
-      writeSuppressionExpiryProbe([
-        "phase": "register-skipped-crossmidnight",
-        "untilMs": Int64(untilMillis)
-      ])
       return
     }
     startSuppressionExpiryMonitoring(expiresAt: expiryDate)
   }
 
-  /// Register the one-shot expiry DeviceActivity (interval STARTS at the expiry instant, so only its
-  /// start boundary matters — padded past DeviceActivity's ~15-minute minimum length).
+  /// Round up, including fractional seconds, so an early minute callback cannot consume the alarm.
+  /// Keep the interval open for a day: DeviceActivity calls back on device use, which may be much
+  /// later than the deadline. A sixteen-minute window could elapse entirely while the phone slept.
+  private func suppressionExpiryComponents(expiresAt: Date) -> (start: DateComponents, end: DateComponents) {
+    let start = Date(timeIntervalSince1970: ceil(expiresAt.timeIntervalSince1970 / 60.0) * 60.0)
+    let end = start.addingTimeInterval(24 * 60 * 60)
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    func components(_ date: Date) -> DateComponents {
+      var value = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+      value.calendar = calendar
+      value.timeZone = calendar.timeZone
+      return value
+    }
+    return (components(start), components(end))
+  }
+
   private func startSuppressionExpiryMonitoring(expiresAt: Date) {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
-
-    // #607: DeviceActivity is MINUTE-granular, so an intervalStart carrying seconds makes iOS fire
-    // intervalDidStart at the minute FLOOR — before the true expiry — and expireSuppressionIfDue then
-    // rejects it as "not-due". Since the activity is one-shot (repeats:false), it never fires again →
-    // the observed native silence. Round the start UP to the minute AT OR AFTER the expiry so the fire
-    // lands at/after the real instant (`now >= until` holds). Costs at most ~1 min of extra ticket.
-    let comps = Calendar.current.dateComponents([.hour, .minute, .second], from: expiresAt)
-    let expiryMinute = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
-    let startMinute = (comps.second ?? 0) > 0 ? expiryMinute + 1 : expiryMinute
-    let endMinute = startMinute + minScheduleIntervalMinutes + 1
-    guard startMinute <= 23 * 60 + 59, endMinute <= 23 * 60 + 59 else {
-      print("[AppBlocker] suppression expiry within ~16m of midnight — relying on foreground re-apply")
-      writeSuppressionExpiryProbe(["phase": "register-skipped-midnight", "startMinute": startMinute])
-      return
-    }
+    let interval = suppressionExpiryComponents(expiresAt: expiresAt)
     let schedule = DeviceActivitySchedule(
-      intervalStart: scheduleTimeComponents(minuteOfDay: startMinute),
-      intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
+      intervalStart: interval.start,
+      intervalEnd: interval.end,
       repeats: false
     )
     do {
@@ -1284,8 +1428,8 @@ public class ExpoAppBlockerModule: Module {
       )
       writeSuppressionExpiryProbe([
         "phase": "registered",
-        "startMinute": startMinute,
-        "endMinute": endMinute,
+        "startMs": Int64(interval.start.date!.timeIntervalSince1970 * 1000.0),
+        "endMs": Int64(interval.end.date!.timeIntervalSince1970 * 1000.0),
         "untilMs": Int64(expiresAt.timeIntervalSince1970 * 1000.0)
       ])
     } catch {
@@ -1582,6 +1726,20 @@ public class ExpoAppBlockerModule: Module {
   /// threshold here; that decision is deferred (stage 2), so the shield applied is unchanged.
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
+    var refreshedExceptions: Set<ApplicationToken>?
+    if GuardianTokenRecovery.supported {
+      do {
+        refreshedExceptions = try GuardianTokenRecovery.exceptions(
+          items.filter { $0.type == .app }.map { $0.tokenId }, exempt: exempt,
+          group: appGroupIdentifier, persist: true, refreshRequired: !isReapplyingRecoveredTokens)
+        allowedAppTokens = Set(items.filter { $0.type == .app }.compactMap {
+          GuardianTokenRecovery.decode($0.tokenId, group: appGroupIdentifier)
+        })
+      } catch {
+        writeAllowlistShieldProbe(["layer": layer, "recovery": "failed", "requestedItems": items.count])
+        return
+      }
+    }
     // #661: requested vs decoded. `requestedApps` counts only app-typed items — the only kind that
     // can enter an `all(except:)` set — so a non-zero `nonAppItems` is itself a shortfall signal.
     let requestedApps = items.filter { $0.type == .app }.count
@@ -1605,7 +1763,8 @@ public class ExpoAppBlockerModule: Module {
     }
     // #598: the escaped app joins the allow (except) set for the ticket, so it is the only extra app
     // that opens while everything else stays shielded.
-    if let exempt = exempt { allowedAppTokens.insert(exempt) }
+    if let refreshedExceptions { allowedAppTokens = refreshedExceptions }
+    else if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
@@ -1633,8 +1792,7 @@ public class ExpoAppBlockerModule: Module {
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
       return
     }
-    guard let dict = userDefaults.dictionary(forKey: scheduleConfigStorageKey)
-      ?? sharedDefaults?.dictionary(forKey: scheduleConfigStorageKey) else {
+    guard let dict = (sharedDefaults ?? userDefaults).dictionary(forKey: scheduleConfigStorageKey) else {
       clearScheduleShield()
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -1837,7 +1995,9 @@ public class ExpoAppBlockerModule: Module {
     }
     didLoadPersistedConfig = true
 
-    if let savedConfig = userDefaults.dictionary(forKey: blockConfigStorageKey) {
+    let persisted = sharedDefaults ?? userDefaults
+    if persisted.object(forKey: blockSatisfiedKey) == nil,
+       let savedConfig = persisted.dictionary(forKey: blockConfigStorageKey) {
       do {
         let config = try parseBlockConfig(savedConfig)
         currentBlockConfig = config
@@ -1851,7 +2011,8 @@ public class ExpoAppBlockerModule: Module {
     // Focus slot (focus-store split). Absent for old bundles / when no focus session is armed. The
     // key is only ever written for guardType "focus" configs, so the dict routes itself back to the
     // focus store through applyBlocks.
-    if let savedFocusConfig = userDefaults.dictionary(forKey: focusBlockConfigStorageKey) {
+    if persisted.object(forKey: focusBlockSatisfiedKey) == nil,
+       let savedFocusConfig = persisted.dictionary(forKey: focusBlockConfigStorageKey) {
       do {
         let config = try parseBlockConfig(savedFocusConfig)
         focusBlockConfig = config
@@ -1881,15 +2042,7 @@ public class ExpoAppBlockerModule: Module {
   }
 
   private func decodeApplicationToken(from encoded: String) -> ApplicationToken? {
-    guard let data = Data(base64Encoded: encoded) else {
-      return nil
-    }
-
-    do {
-      return try JSONDecoder().decode(ApplicationToken.self, from: data)
-    } catch {
-      return nil
-    }
+    return GuardianTokenRecovery.decode(encoded, group: appGroupIdentifier)
   }
 
   private func encodeCategoryToken(_ token: ActivityCategoryToken) -> String? {
@@ -1923,8 +2076,7 @@ public class ExpoAppBlockerModule: Module {
 
   // Static versions for use in View prop closures
   static func decodeApplicationTokenStatic(from encoded: String) -> ApplicationToken? {
-    guard let data = Data(base64Encoded: encoded) else { return nil }
-    return try? JSONDecoder().decode(ApplicationToken.self, from: data)
+    return GuardianTokenRecovery.decode(encoded, group: ExpoAppBlockerConfig.appGroupIdentifier)
   }
 
   static func decodeCategoryTokenStatic(from encoded: String) -> ActivityCategoryToken? {

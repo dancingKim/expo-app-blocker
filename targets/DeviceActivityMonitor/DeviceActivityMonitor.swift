@@ -608,6 +608,17 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// judgement, no threshold; the shield applied is unchanged).
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
+    var refreshedExceptions: Set<ApplicationToken>?
+    if GuardianTokenRecovery.supported {
+      do {
+        refreshedExceptions = try GuardianTokenRecovery.exceptions(
+          items.filter { $0.type == .app }.map { $0.tokenId }, exempt: exempt,
+          group: appGroupIdentifier, persist: false)
+      } catch {
+        writeAllowlistShieldProbe(["layer": layer, "recovery": "failed", "requestedItems": items.count])
+        return
+      }
+    }
     let requestedApps = items.filter { $0.type == .app }.count
     writeAllowlistShieldProbe([
       "layer": layer,
@@ -628,7 +639,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
     // #598: the escaped app joins the allow (except) set for the ticket.
-    if let exempt = exempt { allowedAppTokens.insert(exempt) }
+    if let refreshedExceptions { allowedAppTokens = refreshedExceptions }
+    else if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
@@ -739,15 +751,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   private func decodeApplicationToken(from encoded: String) -> ApplicationToken? {
-    guard let data = Data(base64Encoded: encoded) else {
-      return nil
-    }
-
-    do {
-      return try JSONDecoder().decode(ApplicationToken.self, from: data)
-    } catch {
-      return nil
-    }
+    return GuardianTokenRecovery.decode(encoded, group: appGroupIdentifier)
   }
 
   private func decodeCategoryToken(from encoded: String) -> ActivityCategoryToken? {

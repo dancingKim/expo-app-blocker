@@ -10,11 +10,16 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Process
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.ResultReceiver
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import expo.modules.kotlin.exception.Exceptions
+import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.ByteArrayOutputStream
@@ -236,6 +241,39 @@ class ExpoAppBlockerModule : Module() {
       AlarmReceiver.scheduleNext(context)
       AppBlockerService.start(context)
       Log.d(TAG, "suppressBlocksAndroid: $untilMillis")
+    }
+
+    AsyncFunction("endSuppressionAndroid") { promise: Promise ->
+      val handler = Handler(Looper.getMainLooper())
+      handler.post {
+        var settled = false
+        val timeout = Runnable {
+          if (!settled) {
+            settled = true
+            promise.reject("ERR_END_SUPPRESSION", "Blocker service did not acknowledge early close", null)
+          }
+        }
+        val receiver = object : ResultReceiver(handler) {
+          override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+            if (settled) return
+            settled = true
+            handler.removeCallbacks(timeout)
+            if (resultCode == 0) {
+              promise.resolve(mapOf("active" to false, "untilMillis" to 0.0, "remainingMs" to 0.0))
+            } else {
+              promise.reject("ERR_END_SUPPRESSION", "Native blocking rules could not be restored", null)
+            }
+          }
+        }
+        handler.postDelayed(timeout, 5000L)
+        try {
+          AppBlockerService.endSuppression(context, receiver)
+        } catch (error: Exception) {
+          settled = true
+          handler.removeCallbacks(timeout)
+          promise.reject("ERR_END_SUPPRESSION", error.message, error)
+        }
+      }
     }
 
     // #572: current escape-ticket state (remaining ms) for the door card '열림 · 타이머 N분' display.

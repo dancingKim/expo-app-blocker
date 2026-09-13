@@ -268,6 +268,10 @@ function withAppBlockerIOS(config, pluginConfig) {
   if (projectRoot) {
     const targetsDir = path.join(projectRoot, "targets");
     const packageTargetsDir = path.resolve(__dirname, "..", "..", "targets");
+    const recoveryTarget = path.join(targetsDir, "DeviceActivityMonitor");
+    fs.mkdirSync(recoveryTarget, { recursive: true });
+    fs.copyFileSync(path.resolve(__dirname, "../../ios/GuardianTokenRecovery.swift"),
+      path.join(recoveryTarget, "GuardianTokenRecovery.swift"));
 
     // 1. Copy template Swift files + expo-target.config.js from this package
     //    into the consumer's `targets/`. Preserves any user-managed assets.

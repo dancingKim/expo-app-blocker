@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.ResultReceiver
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
@@ -292,6 +293,21 @@ class AppBlockerService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
+      ACTION_END_SUPPRESSION -> {
+        @Suppress("DEPRECATION")
+        val receiver = intent.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER)
+        try {
+          AppBlockerPrefs.clearSuppression(this)
+          AlarmReceiver.scheduleNext(this)
+          // Same expiry evaluator as the regular poll: preserves configuration, earned time,
+          // schedule-only operation and essential/allowed apps; removes the escaped target.
+          tick()
+          receiver?.send(0, null)
+        } catch (error: Exception) {
+          Log.e(TAG, "Early close failed", error)
+          receiver?.send(1, null)
+        }
+      }
       ACTION_TEMPORARY_UNLOCK -> {
         val minutes = intent.getIntExtra(EXTRA_DURATION_MINUTES, 0)
         Log.d(TAG, "Granting $minutes minutes of earned time")
@@ -383,6 +399,15 @@ class AppBlockerService : Service() {
     private const val ACTION_TEMPORARY_UNLOCK = "expo.modules.appblocker.TEMPORARY_UNLOCK"
     private const val ACTION_RELOCK = "expo.modules.appblocker.RELOCK"
     private const val EXTRA_DURATION_MINUTES = "duration_minutes"
+    private const val ACTION_END_SUPPRESSION = "expo.modules.appblocker.END_SUPPRESSION"
+    private const val EXTRA_RESULT_RECEIVER = "result_receiver"
+
+    fun endSuppression(context: Context, receiver: ResultReceiver) {
+      startCommand(context, Intent(context, AppBlockerService::class.java).apply {
+        action = ACTION_END_SUPPRESSION
+        putExtra(EXTRA_RESULT_RECEIVER, receiver)
+      })
+    }
 
     fun start(context: Context) {
       startCommand(context, Intent(context, AppBlockerService::class.java))

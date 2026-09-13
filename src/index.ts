@@ -474,6 +474,37 @@ export function getSuppressionState(): SuppressionState {
   return { active: false, untilMillis: 0, remainingMs: 0 };
 }
 
+/** Refresh device-local application identities, retaining membership and all guard policy. */
+export async function refreshApplicationTokens(tokens: string[]): Promise<{
+  supported: boolean;
+  remaps: Record<string, string>;
+}> {
+  if (Platform.OS !== "ios" || typeof NativeModule.refreshApplicationTokens !== "function") {
+    return { supported: false, remaps: {} };
+  }
+  return NativeModule.refreshApplicationTokens(tokens);
+}
+
+/** Reconcile all shield exceptions with the committed JS selection, excluding pending apps. */
+export async function refreshGuardianAllowedApps(items: { type: string; token: string }[], pendingTokens: string[]): Promise<{
+  supported: boolean; remaps: Record<string, string>;
+}> {
+  if (Platform.OS !== "ios" || typeof NativeModule.refreshGuardianAllowedApps !== "function") {
+    return refreshApplicationTokens([...items.map(item => item.token), ...pendingTokens]);
+  }
+  return NativeModule.refreshGuardianAllowedApps(items, pendingTokens);
+}
+
+/** End a ticket early and restore native rules before resolving. Safe to repeat.
+ * Rejects on older native binaries: callers must keep their running key on failure.
+ * Android acknowledges after its service evaluates the current blocking rules.
+ */
+export async function endSuppression(): Promise<SuppressionState> {
+  if (Platform.OS === "android") return NativeModule.endSuppressionAndroid();
+  if (Platform.OS === "ios") return NativeModule.endSuppression();
+  return { active: false, untilMillis: 0, remainingMs: 0 };
+}
+
 /**
  * Android-only, last-resort recovery: forces a genuine process kill and
  * relaunch. Some native-layer failures (observed: an expo-sqlite connection

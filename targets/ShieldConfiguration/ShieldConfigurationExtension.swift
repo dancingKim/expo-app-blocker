@@ -41,10 +41,19 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
   private let shieldTempUnlockSubtitle = "SHIELD_TEMP_UNLOCK_SUBTITLE_PLACEHOLDER"
   private let shieldTempUnlockButtonLabel = "SHIELD_TEMP_UNLOCK_BUTTON_PLACEHOLDER"
   private let shieldPrimaryButtonColor = UIColor(red: SHIELD_PRIMARY_R_PLACEHOLDER, green: SHIELD_PRIMARY_G_PLACEHOLDER, blue: SHIELD_PRIMARY_B_PLACEHOLDER, alpha: 1.0)
-  private let shieldBackgroundColor: UIColor? = SHIELD_BG_COLOR_PLACEHOLDER
+  private let shieldBackgroundColor: UIColor? = UIColor { traits in
+    if traits.userInterfaceStyle == .dark { return UIColor(red: 0.141, green: 0.137, blue: 0.129, alpha: 1.0) }
+    return (SHIELD_BG_COLOR_PLACEHOLDER as UIColor?) ?? .systemBackground
+  }
   private let shieldBlurStyle: UIBlurEffect.Style? = SHIELD_BLUR_STYLE_PLACEHOLDER
-  private let shieldTitleColor = UIColor(red: SHIELD_TITLE_R_PLACEHOLDER, green: SHIELD_TITLE_G_PLACEHOLDER, blue: SHIELD_TITLE_B_PLACEHOLDER, alpha: 1.0)
-  private let shieldSubtitleColor = UIColor(red: SHIELD_SUBTITLE_R_PLACEHOLDER, green: SHIELD_SUBTITLE_G_PLACEHOLDER, blue: SHIELD_SUBTITLE_B_PLACEHOLDER, alpha: 1.0)
+  private let shieldTitleColor = UIColor { traits in
+    traits.userInterfaceStyle == .dark ? UIColor(red: 0.984, green: 0.953, blue: 0.918, alpha: 1.0)
+      : UIColor(red: SHIELD_TITLE_R_PLACEHOLDER, green: SHIELD_TITLE_G_PLACEHOLDER, blue: SHIELD_TITLE_B_PLACEHOLDER, alpha: 1.0)
+  }
+  private let shieldSubtitleColor = UIColor { traits in
+    traits.userInterfaceStyle == .dark ? UIColor(red: 0.851, green: 0.784, blue: 0.729, alpha: 1.0)
+      : UIColor(red: SHIELD_SUBTITLE_R_PLACEHOLDER, green: SHIELD_SUBTITLE_G_PLACEHOLDER, blue: SHIELD_SUBTITLE_B_PLACEHOLDER, alpha: 1.0)
+  }
   // #525 schedule-window shield copy — hand-synced with guardianCopy.ts schedule.*ShieldTitle/
   // Subtitle. Keeps the "하러 가기" redirect button (NOT an unlock — the schedule store survives the
   // unlock path, so the button only returns to the app). (#588: the bedtime preset was removed by
