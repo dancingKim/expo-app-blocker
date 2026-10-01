@@ -334,6 +334,7 @@ class ExpoAppBlockerModule : Module() {
 
     AsyncFunction("getInstalledApps") {
       val pm = context.packageManager
+      val essentialApps = SystemEssentialApps.resolve(context)
       val intent = Intent(Intent.ACTION_MAIN).apply {
         addCategory(Intent.CATEGORY_LAUNCHER)
       }
@@ -354,6 +355,7 @@ class ExpoAppBlockerModule : Module() {
 
         mapOf(
           "packageName" to appInfo.packageName,
+          "isAlwaysAllowed" to (SystemEssentialApps.isSystemApp(appInfo.flags) || appInfo.packageName in essentialApps),
           "name" to (pm.getApplicationLabel(appInfo)?.toString() ?: appInfo.packageName),
           "iconBase64" to iconBase64
         )

@@ -3,6 +3,7 @@ package expo.modules.appblocker
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.os.Build
@@ -22,6 +23,26 @@ import android.telecom.TelecomManager
  * augmented with the stable framework package names as a floor.
  */
 object SystemEssentialApps {
+  /** Includes built-in apps that have since received a Play/OEM update. */
+  fun isSystemApp(flags: Int): Boolean =
+    flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+
+  /**
+   * Package visibility hides some OEM internal surfaces. Do not shield a package unless we can
+   * establish that it is a user app. This needs no QUERY_ALL_PACKAGES permission: launchable user
+   * apps remain visible through the existing MAIN/LAUNCHER query. Unresolvable background/internal
+   * packages are also exempt; this is a deliberate safety fallback, not a claim they are system apps.
+   * Resolve on use so installation/updates do not leave a stale service-lifetime classification.
+   */
+  fun isSystemOrUnresolved(context: Context, packageName: String): Boolean = try {
+    @Suppress("DEPRECATION")
+    isSystemApp(context.packageManager.getApplicationInfo(packageName, 0).flags)
+  } catch (_: PackageManager.NameNotFoundException) {
+    true
+  } catch (_: SecurityException) {
+    true
+  }
+
   fun resolve(context: Context): Set<String> {
     val pkgs = HashSet<String>()
     val pm = context.packageManager

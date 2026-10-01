@@ -165,15 +165,15 @@ class AppBlockerService : Service() {
   // pending write. Schedule blocking is separate and never gated by this.
   //
   // #563 allowlist: in "allow" mode the immediate block shields every app EXCEPT the kept set
-  // (+ system-essential apps); "block" mode is the legacy denylist. No armed mode → nothing blocked.
+  // (+ all system apps and system-essential roles); "block" mode is the legacy denylist.
   private fun isImmediateBlocked(packageName: String): Boolean {
     val mode = AppBlockerPrefs.getImmediateMode(this) ?: return false
     val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
     val notExpired = expiry == 0L || System.currentTimeMillis() < expiry
-    if (!notExpired) return false
+    if (!notExpired || isSystemEssential(packageName)) return false
     return when (mode) {
       AppBlockerPrefs.MODE_ALLOW ->
-        packageName !in AppBlockerPrefs.getAllowedPackages(this) && !isSystemEssential(packageName)
+        packageName !in AppBlockerPrefs.getAllowedPackages(this)
       else -> packageName in AppBlockerPrefs.getBlockedPackages(this)
     }
   }
@@ -189,20 +189,22 @@ class AppBlockerService : Service() {
   // blocks nothing.
   //
   // #563 allowlist: in "allow" mode the out-of-window block shields everything except the kept set
-  // (+ system-essential apps); "block" mode is the legacy denylist.
+  // (+ all system apps and system-essential roles); "block" mode is the legacy denylist.
   private fun isScheduleBlocked(packageName: String): Boolean {
     if (ScheduleStore.getWindows(this).isEmpty()) return false                          // not armed / off
     if (ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false // inside a free window → open
+    if (isSystemEssential(packageName)) return false
     return when (ScheduleStore.getMode(this)) {
       AppBlockerPrefs.MODE_ALLOW ->
-        packageName !in ScheduleStore.getSchedulePackages(this) && !isSystemEssential(packageName)
+        packageName !in ScheduleStore.getSchedulePackages(this)
       else -> packageName in ScheduleStore.getSchedulePackages(this)
     }
   }
 
-  // #563: never shield launcher / system UI / dialer / IME / settings / the host app, so allowlist
-  // "block everything else" can't brick the phone or seal off the OS-level emergency exit.
-  private fun isSystemEssential(packageName: String): Boolean = packageName in essentialApps
+  // System apps are always allowed, including built-in browsers and OEM internal screens.
+  // Keep the essential-role floor for user-installed launchers, dialers and keyboards too.
+  private fun isSystemEssential(packageName: String): Boolean =
+    packageName in essentialApps || SystemEssentialApps.isSystemOrUnresolved(this, packageName)
 
   private fun enforceBlock(packageName: String, reason: BlockReason) {
     // #596: tell the overlay which layer blocked this so the escape flag it stamps carries the

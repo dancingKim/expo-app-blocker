@@ -28,6 +28,8 @@ export interface AndroidBlockableApp {
   packageName: string;
   name: string;
   iconBase64?: string | null;
+  /** System/updated-system app or essential role. Absent on older native binaries. */
+  isAlwaysAllowed?: boolean;
 }
 
 export interface IOSBlockedItem {
