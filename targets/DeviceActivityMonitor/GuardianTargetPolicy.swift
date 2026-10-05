@@ -4,10 +4,17 @@ import Foundation
 struct GuardianOpeningScope: Equatable {
   enum Failure: Error { case invalidScope, capacity, invalidConfiguration }
   let full: Bool
+  let allowLayer: Bool
   let apps: Set<String>
   let webDomains: Set<String>
   init(_ raw: [String: Any]) throws {
+    if raw["policy"] as? String == "targets-v2" {
+      guard raw["kind"] as? String == "allow-layer", raw["apps"] == nil,
+            raw["webDomains"] == nil else { throw Failure.invalidScope }
+      full = false; allowLayer = true; apps = []; webDomains = []; return
+    }
     guard raw["policy"] as? String == "targets-v1" else { throw Failure.invalidScope }
+    allowLayer = false
     if raw["kind"] as? String == "full" {
       guard raw["apps"] == nil, raw["webDomains"] == nil else { throw Failure.invalidScope }
       full = true; apps = []; webDomains = []
@@ -20,8 +27,17 @@ struct GuardianOpeningScope: Equatable {
     }
   }
   var dictionary: [String: Any] {
+    if allowLayer { return ["policy": "targets-v2", "kind": "allow-layer"] }
     if full { return ["policy": "targets-v1", "kind": "full"] }
     return ["policy": "targets-v1", "kind": "targets", "apps": apps.sorted(), "webDomains": webDomains.sorted()]
+  }
+  static func live(_ raw: [String: Any]?, nowMillis: Double) -> GuardianOpeningScope? {
+    guard let raw, let until = raw["untilMillis"] as? Double, until.isFinite,
+          until > nowMillis else { return nil }
+    return try? GuardianOpeningScope(raw)
+  }
+  static func supportedExtensions(_ policies: [String: String]) -> Bool {
+    ["ShieldAction", "DeviceActivityMonitor"].allSatisfy { policies[$0] == "allow-layer-v1" }
   }
 }
 
@@ -30,8 +46,8 @@ struct GuardianTargetPlan<T: Hashable, W: Hashable> {
   let blockedApps: Set<T>
   let blockedWeb: Set<W>
   init(allowEnabled: Bool, blockEnabled: Bool, allowed: Set<T>, blockedApps: Set<T>,
-       blockedWeb: Set<W>, openedApps: Set<T>, openedWeb: Set<W>, full: Bool) throws {
-    let effectiveAllow = allowEnabled && !allowed.isEmpty && !full
+       blockedWeb: Set<W>, openedApps: Set<T>, openedWeb: Set<W>, full: Bool, allowLayer: Bool = false) throws {
+    let effectiveAllow = allowEnabled && !allowed.isEmpty && !full && !allowLayer
     let exceptions = effectiveAllow ? allowed.union(openedApps) : []
     guard exceptions.count <= 50, blockedApps.count <= 50, blockedWeb.count <= 50 else {
       throw GuardianOpeningScope.Failure.capacity
@@ -63,6 +79,10 @@ enum GuardianTargetRuntime {
     if let raw = defaults.dictionary(forKey: scopeKey) { return (try? GuardianOpeningScope(raw).full) == true }
     if defaults.object(forKey: scopeKey) != nil { return false }
     return defaults.string(forKey: legacyTargetKey) == nil
+  }
+  static func allowLayer(_ defaults: UserDefaults) -> Bool {
+    GuardianOpeningScope.live(defaults.dictionary(forKey: scopeKey),
+      nowMillis: Date().timeIntervalSince1970 * 1000)?.allowLayer == true
   }
   static func app(_ token: String, group: String) throws -> ApplicationToken {
     let canonical = GuardianTokenRecovery.supported
@@ -117,7 +137,7 @@ enum GuardianTargetRuntime {
   static func validateOpening(_ scope: GuardianOpeningScope, configs: [[String: Any]], group: String) throws {
     let opened = try Set(scope.apps.map { try app($0, group: group) })
     _ = try scope.webDomains.map { try web($0) }
-    guard !scope.full else { return }
+    guard !scope.full && !scope.allowLayer else { return }
     var allowed = Set<ApplicationToken>()
     for config in configs {
       let dual = config["targetPolicy"] as? String == "dual-v1"
@@ -138,7 +158,7 @@ enum GuardianTargetRuntime {
     let plan = try GuardianTargetPlan(allowEnabled: config["allowEnabled"] as? Bool == true,
       blockEnabled: config["blockEnabled"] as? Bool == true, allowed: allowed, blockedApps: blocked,
       blockedWeb: domains, openedApps: openedApps, openedWeb: openedWeb,
-      full: config["isActive"] as? Bool == false || full(defaults))
+      full: config["isActive"] as? Bool == false || full(defaults), allowLayer: allowLayer(defaults))
     let direct = directStore(layer)
     store.shield.applications = nil
     store.shield.applicationCategories = plan.allowed.isEmpty ? nil : .all(except: plan.allowed)

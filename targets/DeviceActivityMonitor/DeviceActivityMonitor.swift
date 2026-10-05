@@ -613,6 +613,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// #661 stage 1: records requested vs decoded app tokens for `layer` (RECORD ONLY — no fail-open
   /// judgement, no threshold; the shield applied is unchanged).
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [MonitorBlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
+    if GuardianTargetRuntime.allowLayer(sharedDefaults ?? UserDefaults.standard) {
+      GuardianTargetRuntime.clear(managedStore)
+      return
+    }
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
     var refreshedExceptions: Set<ApplicationToken>?
     if GuardianTokenRecovery.supported {

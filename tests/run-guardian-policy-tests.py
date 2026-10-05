@@ -14,7 +14,7 @@ def run(args):
 with tempfile.TemporaryDirectory(prefix='guardian-policy-tests-') as output:
     output = Path(output)
     assert (ROOT / 'ios/GuardianTargetPolicy.swift').read_bytes() == (ROOT / 'targets/DeviceActivityMonitor/GuardianTargetPolicy.swift').read_bytes(), 'Host/monitor policy drift'
-    run(['xcrun', 'swiftc', 'ios/GuardianTargetPolicy.swift', 'tests/GuardianTargetPolicyTests.swift', '-o', output / 'swift-tests'])
+    run(['xcrun', 'swiftc', 'ios/GuardianTargetPolicy.swift', 'targets/ShieldAction/GuardianEscapeScope.swift', 'tests/GuardianTargetPolicyTests.swift', '-o', output / 'swift-tests'])
     run([output / 'swift-tests'])
     kotlin_sources = ['android/src/main/java/expo/modules/appblocker/' + name + '.kt' for name in ['GuardianTargetPolicy', 'AppBlockerPrefs', 'ScheduleStore']] + ['tests/AndroidPreferencesFixture.kt', 'tests/GuardianTargetPolicyTests.kt']
     json_cache = Path(os.environ.get('GRADLE_USER_HOME', str(Path.home() / '.gradle'))) / 'caches/modules-2/files-2.1/org.json/json/20180813'

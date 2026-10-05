@@ -58,6 +58,7 @@ export type BlockMode = "block" | "allow";
 
 /** Explicit capability-gated scope, frozen by the app before request/wait. Identities stay local. */
 export type GuardianKeyScope =
+  | { policy: 'targets-v2'; kind: 'allow-layer' }
   | { policy: 'targets-v1'; kind: 'full' }
   | { policy: 'targets-v1'; kind: 'targets'; apps: string[]; webDomains: string[] };
 
