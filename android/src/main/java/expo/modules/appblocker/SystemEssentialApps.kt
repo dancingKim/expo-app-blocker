@@ -43,6 +43,20 @@ object SystemEssentialApps {
     true
   }
 
+  /** Explicit block selections may include launcher-visible system apps, never essential roles. */
+  fun canDirectlyBlock(context: Context, packageName: String): Boolean {
+    if (packageName in resolve(context)) return false
+    return try {
+      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(packageName)
+      @Suppress("DEPRECATION")
+      context.packageManager.queryIntentActivities(intent, 0).any {
+        it.activityInfo?.applicationInfo?.enabled == true && it.activityInfo?.enabled == true
+      }
+    } catch (_: Exception) {
+      false
+    }
+  }
+
   fun resolve(context: Context): Set<String> {
     val pkgs = HashSet<String>()
     val pm = context.packageManager

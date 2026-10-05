@@ -56,8 +56,8 @@ class AppBlockerService : Service() {
     // re-apply then.
     if (AppBlockerPrefs.isSuppressed(this)) {
       consumingSinceMs = 0L
-      val target = AppBlockerPrefs.getSuppressionTargetPackage(this)
-      if (target != null && foreground != null && foreground != target && isBlocked(foreground)) {
+      val scope = AppBlockerPrefs.getKeyScope(this)
+      if (foreground != null && scope?.opens(foreground) != true && isBlocked(foreground)) {
         // Targeted ticket, and a blocked app OTHER than the escaped one is up → keep it blocked.
         if (!blocking || foreground != lastForegroundPackage) {
           enforceBlock(foreground, BlockReason.OPENED)
@@ -170,11 +170,14 @@ class AppBlockerService : Service() {
     val mode = AppBlockerPrefs.getImmediateMode(this) ?: return false
     val expiry = AppBlockerPrefs.getBlockExpiresAt(this)
     val notExpired = expiry == 0L || System.currentTimeMillis() < expiry
-    if (!notExpired || isSystemEssential(packageName)) return false
+    if (!notExpired) return false
+    if (mode == AppBlockerPrefs.MODE_DUAL) {
+      return AppBlockerPrefs.getTargetPolicy(this)?.blocks(packageName, isSystemEssential(packageName), SystemEssentialApps.canDirectlyBlock(this, packageName)) ?: false
+    }
     return when (mode) {
       AppBlockerPrefs.MODE_ALLOW ->
-        packageName !in AppBlockerPrefs.getAllowedPackages(this)
-      else -> packageName in AppBlockerPrefs.getBlockedPackages(this)
+        !isSystemEssential(packageName) && packageName !in AppBlockerPrefs.getAllowedPackages(this)
+      else -> packageName in AppBlockerPrefs.getBlockedPackages(this) && SystemEssentialApps.canDirectlyBlock(this, packageName)
     }
   }
 
@@ -191,13 +194,18 @@ class AppBlockerService : Service() {
   // #563 allowlist: in "allow" mode the out-of-window block shields everything except the kept set
   // (+ all system apps and system-essential roles); "block" mode is the legacy denylist.
   private fun isScheduleBlocked(packageName: String): Boolean {
-    if (ScheduleStore.getWindows(this).isEmpty()) return false                          // not armed / off
+    if (ScheduleStore.getWindows(this).isEmpty()) {
+      val targets = ScheduleStore.getTargetPolicy(this)
+      if (!ScheduleStore.isContinuous(this) || (targets?.enforceable ?: ScheduleStore.getSchedulePackages(this).isNotEmpty()) == false) return false
+    }
     if (ScheduleStore.isAnyWindowActive(this, System.currentTimeMillis())) return false // inside a free window → open
-    if (isSystemEssential(packageName)) return false
+    if (ScheduleStore.getMode(this) == AppBlockerPrefs.MODE_DUAL) {
+      return ScheduleStore.getTargetPolicy(this)?.blocks(packageName, isSystemEssential(packageName), SystemEssentialApps.canDirectlyBlock(this, packageName)) ?: false
+    }
     return when (ScheduleStore.getMode(this)) {
       AppBlockerPrefs.MODE_ALLOW ->
-        packageName !in ScheduleStore.getSchedulePackages(this)
-      else -> packageName in ScheduleStore.getSchedulePackages(this)
+        !isSystemEssential(packageName) && packageName !in ScheduleStore.getSchedulePackages(this)
+      else -> packageName in ScheduleStore.getSchedulePackages(this) && SystemEssentialApps.canDirectlyBlock(this, packageName)
     }
   }
 

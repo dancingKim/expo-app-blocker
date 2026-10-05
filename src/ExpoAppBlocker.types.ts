@@ -30,6 +30,8 @@ export interface AndroidBlockableApp {
   iconBase64?: string | null;
   /** System/updated-system app or essential role. Absent on older native binaries. */
   isAlwaysAllowed?: boolean;
+  /** Explicit block mode may include a built-in launcher app, but never essential system roles. */
+  isDirectlyBlockable?: boolean;
 }
 
 export interface IOSBlockedItem {
@@ -54,7 +56,27 @@ export interface IOSBlockedItem {
  */
 export type BlockMode = "block" | "allow";
 
-export interface IOSBlockConfiguration {
+/** Explicit capability-gated scope, frozen by the app before request/wait. Identities stay local. */
+export type GuardianKeyScope =
+  | { policy: 'targets-v1'; kind: 'full' }
+  | { policy: 'targets-v1'; kind: 'targets'; apps: string[]; webDomains: string[] };
+
+export interface GuardianTargetModes {
+  targetPolicy?: 'dual-v1';
+  allowEnabled?: boolean;
+  blockEnabled?: boolean;
+}
+
+export type GuardianTargetConfiguration = GuardianTargetModes & {
+  targetPolicy: 'dual-v1'; allowEnabled: boolean; blockEnabled: boolean;
+  allowedItems: IOSBlockedItem[] | string[];
+  blockedItems: IOSBlockedItem[] | string[];
+  isActive: boolean;
+  guardType?: 'gate' | 'focus';
+  expiresAtMillis?: number;
+};
+
+export interface IOSBlockConfiguration extends GuardianTargetModes {
   /** #563: `"allow"` reinterprets the item set (in `allowedItems`) as the apps to KEEP open. */
   mode?: BlockMode;
   /**
@@ -116,7 +138,9 @@ export interface ScheduleWindow {
  * `allowedItems` and an active window shields everything else; legacy `mode: "block"` shields
  * `blockedItems`.
  */
-export interface IOSScheduleConfiguration {
+export interface IOSScheduleConfiguration extends GuardianTargetModes {
+  /** Explicit opt-in; valid with allow/dual policy and an explicitly empty windows array. */
+  policy?: 'continuous-v1';
   mode?: BlockMode;
   windows: ScheduleWindow[];
   blockedItems?: IOSBlockedItem[];
@@ -128,7 +152,8 @@ export interface IOSScheduleConfiguration {
  * `setAllowedApps`. #563: `allowedItems` (mode "allow") = kept packages; `blockedItems` (legacy) =
  * shielded packages.
  */
-export interface AndroidScheduleConfiguration {
+export interface AndroidScheduleConfiguration extends GuardianTargetModes {
+  policy?: 'continuous-v1';
   mode?: BlockMode;
   windows: ScheduleWindow[];
   blockedItems?: string[];

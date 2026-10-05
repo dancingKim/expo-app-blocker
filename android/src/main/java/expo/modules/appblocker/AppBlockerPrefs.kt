@@ -17,6 +17,9 @@ object AppBlockerPrefs {
   // KEY_ALLOWED_PACKAGES (+ system-essential apps); in block mode it shields KEY_BLOCKED_PACKAGES.
   const val KEY_ALLOWED_PACKAGES = "allowed_packages"
   const val KEY_IMMEDIATE_MODE = "immediate_mode"
+  const val MODE_DUAL = "dual-v1"
+  private const val KEY_TARGET_CONFIG = "guardian_target_configuration"
+  private const val KEY_KEY_SCOPE = "guardian_key_scope"
   const val MODE_ALLOW = "allow"
   const val MODE_BLOCK = "block"
   private const val KEY_BLOCK_EXPIRES_AT = "block_expires_at_millis"
@@ -84,7 +87,7 @@ object AppBlockerPrefs {
 
   fun setBlockedPackages(context: Context, packages: Collection<String>) {
     val set = packages.toSet()
-    val editor = get(context).edit().putStringSet(KEY_BLOCKED_PACKAGES, set)
+    val editor = get(context).edit().remove(KEY_TARGET_CONFIG).putStringSet(KEY_BLOCKED_PACKAGES, set)
     // An empty immediate-block set means nothing is blocked now, so drop any pending
     // auto-release expiry with it — expiry is only meaningful alongside a non-empty set,
     // and a stale timestamp must never gate a later block.
@@ -114,7 +117,7 @@ object AppBlockerPrefs {
    */
   fun setAllowedPackages(context: Context, packages: Collection<String>) {
     val set = packages.toSet()
-    val editor = get(context).edit()
+    val editor = get(context).edit().remove(KEY_TARGET_CONFIG)
     if (set.isEmpty()) {
       clearImmediate(editor)
     } else {
@@ -138,10 +141,78 @@ object AppBlockerPrefs {
 
   private fun clearImmediate(editor: SharedPreferences.Editor) {
     editor
+      .remove(KEY_TARGET_CONFIG)
       .remove(KEY_BLOCKED_PACKAGES)
       .remove(KEY_ALLOWED_PACKAGES)
       .remove(KEY_IMMEDIATE_MODE)
       .putLong(KEY_BLOCK_EXPIRES_AT, 0L)
+  }
+
+  internal fun setTargetConfiguration(context: Context, config: Map<String, Any?>) {
+    GuardianTargetPolicy.parse(config)
+    val active = config["isActive"] != false
+    val expiry = (config["expiresAtMillis"] as? Number)?.toLong() ?: 0L
+    val prefs = get(context)
+    val previous = prefs.getString(KEY_TARGET_CONFIG, null)
+    val previousMode = prefs.getString(KEY_IMMEDIATE_MODE, null)
+    val previousExpiry = prefs.getLong(KEY_BLOCK_EXPIRES_AT, 0L)
+    val previousAllowed = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet())
+    val previousBlocked = prefs.getStringSet(KEY_BLOCKED_PACKAGES, emptySet())
+    val editor = prefs.edit()
+    if (active) {
+      editor.putString(KEY_TARGET_CONFIG, JSONObject(config).toString())
+        .putString(KEY_IMMEDIATE_MODE, MODE_DUAL).putLong(KEY_BLOCK_EXPIRES_AT, expiry)
+    } else { clearImmediate(editor) }
+    if (!editor.commit()) {
+      // Android commit may update memory even when disk persistence fails: restore both views.
+      prefs.edit().putString(KEY_TARGET_CONFIG, previous).putString(KEY_IMMEDIATE_MODE, previousMode)
+        .putLong(KEY_BLOCK_EXPIRES_AT, previousExpiry).putStringSet(KEY_ALLOWED_PACKAGES, previousAllowed)
+        .putStringSet(KEY_BLOCKED_PACKAGES, previousBlocked).commit()
+      error("Target policy persistence failed")
+    }
+  }
+
+  internal fun jsonMap(raw: String): Map<String, Any?> {
+    val json = JSONObject(raw)
+    return json.keys().asSequence().associateWith { key -> jsonValue(json.get(key)) }
+  }
+  private fun jsonValue(value: Any?): Any? = when (value) {
+    is JSONArray -> (0 until value.length()).map { jsonValue(value.get(it)) }
+    is JSONObject -> value.keys().asSequence().associateWith { jsonValue(value.get(it)) }
+    JSONObject.NULL -> null
+    else -> value
+  }
+
+  internal fun getTargetPolicy(context: Context): GuardianTargetPolicy? =
+    get(context).getString(KEY_TARGET_CONFIG, null)?.let {
+      runCatching { GuardianTargetPolicy.parse(jsonMap(it)) }.getOrNull()
+    }
+
+  internal fun setScopedSuppression(context: Context, until: Long, scope: GuardianKeyScope) {
+    val raw = scope.asMap() + ("untilMillis" to until)
+    val prefs = get(context)
+    val previous = prefs.getString(KEY_KEY_SCOPE, null)
+    val previousUntil = prefs.getLong(KEY_SUPPRESSION_UNTIL, 0L)
+    val previousTarget = prefs.getString(KEY_SUPPRESSION_TARGET_PACKAGE, null)
+    if (!prefs.edit().putString(KEY_KEY_SCOPE, JSONObject(raw).toString())
+        .putLong(KEY_SUPPRESSION_UNTIL, until).remove(KEY_SUPPRESSION_TARGET_PACKAGE).commit()) {
+      prefs.edit().putString(KEY_KEY_SCOPE, previous).putLong(KEY_SUPPRESSION_UNTIL, previousUntil)
+        .putString(KEY_SUPPRESSION_TARGET_PACKAGE, previousTarget).commit()
+      error("Opening persistence failed")
+    }
+  }
+
+  internal fun hasExplicitKeyScope(context: Context): Boolean = get(context).contains(KEY_KEY_SCOPE)
+
+  internal fun getKeyScope(context: Context): GuardianKeyScope? {
+    val prefs = get(context)
+    if (prefs.contains(KEY_KEY_SCOPE)) {
+      // An explicit but malformed value must never mean full opening.
+      return runCatching { GuardianKeyScope.parse(jsonMap(prefs.getString(KEY_KEY_SCOPE, "")!!)) }
+        .getOrElse { GuardianKeyScope(false, emptySet()) }
+    }
+    val legacy = getSuppressionTargetPackage(context)
+    return GuardianKeyScope(legacy == null, legacy?.let { setOf(it) } ?: emptySet())
   }
 
   /** Immediate-block auto-release time (epoch millis); 0 means no expiry. */
@@ -168,6 +239,7 @@ object AppBlockerPrefs {
   /** #572: plant/clear the escape-ticket end instant. Any value <= 0 clears it (no ticket). */
   fun setSuppressionUntil(context: Context, untilMillis: Long) {
     get(context).edit()
+      .remove(KEY_KEY_SCOPE)
       .putLong(KEY_SUPPRESSION_UNTIL, if (untilMillis > 0L) untilMillis else 0L)
       .apply()
   }
@@ -175,6 +247,7 @@ object AppBlockerPrefs {
   /** #572: drop the escape ticket. #598: and its targeted package, so a later ticket starts clean. */
   fun clearSuppression(context: Context) {
     get(context).edit()
+      .remove(KEY_KEY_SCOPE)
       .remove(KEY_SUPPRESSION_UNTIL)
       .remove(KEY_SUPPRESSION_TARGET_PACKAGE)
       .apply()

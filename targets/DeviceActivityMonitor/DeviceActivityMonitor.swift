@@ -204,9 +204,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       writeImmediateExpiryProbe(decision: "not-due", extra: ["guardType": layer])
       return
     }
-    target.shield.applications = nil
-    target.shield.applicationCategories = nil
-    target.shield.webDomains = nil
+    clearLayer(target)
     defaults.removeObject(forKey: configKey)
     writeImmediateExpiryProbe(decision: "released", extra: ["guardType": layer])
   }
@@ -217,7 +215,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// gate so a ticket keeps every shield the monitor would apply down until it expires.
   private func isSuppressed() -> Bool {
     let defaults = sharedDefaults ?? UserDefaults.standard
-    guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
+    let until = GuardianTargetRuntime.until(defaults)
+    guard until > 0 else {
       return false
     }
     return Date().timeIntervalSince1970 * 1000.0 < until
@@ -237,7 +236,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// from the stored config (kill-proof re-application). Guards a spurious/early boundary fire.
   private func expireSuppressionIfDue() {
     let defaults = sharedDefaults ?? UserDefaults.standard
-    guard let until = (defaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue, until > 0 else {
+    let until = GuardianTargetRuntime.until(defaults)
+    guard until > 0 else {
       // #661: the one-shot fired but no ticket is recorded — the App Group read came back empty
       // (ticket already cleared by a teardown, or the container was unreadable from this process).
       // Nothing is re-locked on this path, and it used to be silent; record it.
@@ -250,6 +250,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
     defaults.removeObject(forKey: suppressionUntilKey)
+    defaults.removeObject(forKey: GuardianTargetRuntime.scopeKey)
     // #598: drop the ticket's target too so the recompute re-shields the previously-exempt app.
     defaults.removeObject(forKey: suppressionTargetTokenKey)
     recomputeShieldsAfterSuppression()
@@ -318,7 +319,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else { return "no-schedule-config" }
     let windows = parseScheduleWindows(dict)
-    if windows.isEmpty { return "schedule-not-armed" }
+    if windows.isEmpty && !isContinuousSchedule(dict) { return "schedule-not-armed" }
     if isInsideAnyScheduleWindow(windows: windows, at: Date()) { return "schedule-open-window" }
     return "reapplied-schedule-shield"
   }
@@ -334,9 +335,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let defaults = sharedDefaults ?? UserDefaults.standard
     let satisfiedAt = (defaults.object(forKey: satisfiedKey) as? NSNumber)?.doubleValue ?? 0
     guard satisfiedAt > 0 else { return false }
-    target.shield.applications = nil
-    target.shield.applicationCategories = nil
-    target.shield.webDomains = nil
+    clearLayer(target)
     defaults.removeObject(forKey: configKey)
     defaults.removeObject(forKey: satisfiedKey)
     writeImmediateExpiryProbe(decision: "satisfied-not-rearmed", extra: ["guardType": layer])
@@ -359,17 +358,13 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     if let dict = defaults.dictionary(forKey: blockConfigStorageKey) {
       let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue ?? 0
       if expiry > 0, Date().timeIntervalSince1970 * 1000.0 >= expiry {
-        store.shield.applications = nil
-        store.shield.applicationCategories = nil
-        store.shield.webDomains = nil
+        clearLayer(store)
         defaults.removeObject(forKey: blockConfigStorageKey)
       } else {
         reapplyBlockConfiguration()
       }
     } else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      clearLayer(store)
     }
     reapplyFocusConfiguration()
     reevaluateScheduleShield()
@@ -388,6 +383,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   /// Clear all persisted unlock state (budget + consumed counter + grant time).
+  private func clearLayer(_ target: ManagedSettingsStore) {
+    GuardianTargetRuntime.clear(target)
+    let layer = target === scheduleStore ? "schedule" : target === focusStore ? "focus" : "gate"
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore(layer))
+  }
+
   private func clearUnlockState() {
     sharedDefaults?.removeObject(forKey: temporaryUnlockKey)
     sharedDefaults?.removeObject(forKey: usageConsumedKey)
@@ -400,7 +401,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // just the escaped app exempt. Either way the monitor re-applies from this same path once the
     // ticket expires.
     let exempt = escapeExemptToken()
-    if isSuppressed() && exempt == nil { return }
+    if GuardianTargetRuntime.full(sharedDefaults ?? UserDefaults.standard) { return }
 
     // #657: the user already finished what this lock was guarding — do not resurrect it.
     if consumeSatisfiedLayerIfMarked(satisfiedKey: blockSatisfiedKey,
@@ -411,9 +412,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     let userDefaults = sharedDefaults ?? UserDefaults.standard
 
     guard let configDict = userDefaults.dictionary(forKey: blockConfigStorageKey) else {
-      store.shield.applications = nil
-      store.shield.applicationCategories = nil
-      store.shield.webDomains = nil
+      clearLayer(store)
       return
     }
 
@@ -430,7 +429,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// it down (same gate as `reapplyBlockConfiguration`); a targeted ticket exempts just the one app.
   private func reapplyFocusConfiguration() {
     let exempt = escapeExemptToken()
-    if isSuppressed() && exempt == nil { return }
+    if GuardianTargetRuntime.full(sharedDefaults ?? UserDefaults.standard) { return }
 
     // #657: same satisfied guard as the gate layer, on the focus slot/store.
     if consumeSatisfiedLayerIfMarked(satisfiedKey: focusBlockSatisfiedKey,
@@ -440,16 +439,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
     let defaults = sharedDefaults ?? UserDefaults.standard
     guard let dict = defaults.dictionary(forKey: focusBlockConfigStorageKey) else {
-      focusStore.shield.applications = nil
-      focusStore.shield.applicationCategories = nil
-      focusStore.shield.webDomains = nil
+      clearLayer(focusStore)
       return
     }
     let expiry = (dict["expiresAtMillis"] as? NSNumber)?.doubleValue ?? 0
     if expiry > 0, Date().timeIntervalSince1970 * 1000.0 >= expiry {
-      focusStore.shield.applications = nil
-      focusStore.shield.applicationCategories = nil
-      focusStore.shield.webDomains = nil
+      clearLayer(focusStore)
       defaults.removeObject(forKey: focusBlockConfigStorageKey)
       return
     }
@@ -467,7 +462,7 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // #572/#598: a live FULL escape ticket also suppresses the schedule shield — keep it down while
     // valid. A TARGETED ticket instead exempts just the escaped app and keeps the gap shield up.
     let exempt = escapeExemptToken()
-    if isSuppressed() && exempt == nil {
+    if GuardianTargetRuntime.full(sharedDefaults ?? UserDefaults.standard) {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -482,9 +477,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     // (legacy). The mode picks the shield policy in applyScheduleShield.
     let mode: BlockMode = (dict["mode"] as? String) == "allow" ? .allow : .block
     // #570 free-window inversion: a window = "free time". Shield everything OUTSIDE the free
-    // windows while armed; open (clear) while inside one. 0 windows = not armed → clear (never a
-    // 24h lockdown; JS clears the config in that case, this is the defensive backstop).
-    if windows.isEmpty {
+    // windows while armed; open while inside one. Only explicit continuous-v1 may arm zero windows.
+    if windows.isEmpty && !isContinuousSchedule(dict) {
       clearScheduleShield()
       defaults.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -497,9 +491,19 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       // Outside all free windows → shield everything but the allowed apps (minus the escaped app for
       // a targeted ticket). The gap shield always records the "schedule" variant (weekday shield,
       // redirect + escape buttons) — the only schedule shield since #570.
-      applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode, exempt: exempt)
-      defaults.set("schedule", forKey: scheduleShieldVariantKey)
+      if dict["targetPolicy"] as? String == "dual-v1" {
+        try? GuardianTargetRuntime.render(dict, store: scheduleStore, layer: "schedule", defaults: defaults, group: appGroupIdentifier)
+        updateScheduleShieldVariant()
+      } else { applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode, exempt: exempt) }
     }
+  }
+
+  /// Only an explicit empty array opts in; malformed/legacy configs keep their old meaning.
+  private func isContinuousSchedule(_ config: [String: Any]) -> Bool {
+    guard (config["targetPolicy"] as? String == "dual-v1" || config["mode"] as? String == "allow"),
+          config["policy"] as? String == "continuous-v1",
+          let raw = config["windows"] as? [Any] else { return false }
+    return raw.isEmpty
   }
 
   private func parseScheduleWindows(_ dict: [String: Any]) -> [MonitorScheduleWindow] {
@@ -573,15 +577,17 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   }
 
   private func applyScheduleShield(_ items: [MonitorBlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
+    defer { updateScheduleShieldVariant() }
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore("schedule"))
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
       applyAllowlistShield(scheduleStore, allowed: items, layer: "schedule", exempt: exempt)
       return
     }
-    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let exemptSet = GuardianTargetRuntime.opened(sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier).0
     let apps = items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let categories = items.compactMap { $0.categoryToken }
-    let webDomains = items.compactMap { $0.webDomainToken }
+    let webDomains = items.compactMap { $0.webDomainToken }.filter { !GuardianTargetRuntime.opened(sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier).1.contains($0) }
     if apps.isEmpty {
       scheduleStore.shield.applications = nil
     } else {
@@ -633,23 +639,32 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     if allowedAppTokens.isEmpty {
       // Empty allow set = no shield on this store; a targeted-ticket exempt must not turn that into
       // a block-everything-except-one shield.
-      managedStore.shield.applications = nil
-      managedStore.shield.applicationCategories = nil
-      managedStore.shield.webDomains = nil
+      clearLayer(managedStore)
       return
     }
     // #598: the escaped app joins the allow (except) set for the ticket.
     if let refreshedExceptions { allowedAppTokens = refreshedExceptions }
     else if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
+    allowedAppTokens.formUnion(GuardianTargetRuntime.opened(sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier).0)
+    guard allowedAppTokens.count <= 50 else { return }
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
   }
 
+  private func updateScheduleShieldVariant() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    let direct = GuardianTargetRuntime.directStore("schedule")
+    if scheduleStore.shield.applications != nil || scheduleStore.shield.applicationCategories != nil || scheduleStore.shield.webDomains != nil || direct.shield.applications != nil || direct.shield.webDomains != nil {
+      defaults.set("schedule", forKey: scheduleShieldVariantKey)
+    } else {
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
+    }
+  }
+
   private func clearScheduleShield() {
-    scheduleStore.shield.applications = nil
-    scheduleStore.shield.applicationCategories = nil
-    scheduleStore.shield.webDomains = nil
+    (sharedDefaults ?? UserDefaults.standard).removeObject(forKey: scheduleShieldVariantKey)
+    clearLayer(scheduleStore)
   }
 
   private func parseBlockConfig(_ dict: [String: Any]) -> MonitorBlockConfig? {
@@ -699,19 +714,22 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
 
     let isActive = dict["isActive"] as? Bool ?? true
-    return MonitorBlockConfig(items: items, isActive: isActive, mode: mode)
+    return MonitorBlockConfig(items: items, isActive: isActive, mode: mode, targetConfiguration: dict["targetPolicy"] as? String == "dual-v1" ? dict : nil)
   }
 
   /// Focus-store split: `target` is the layer's own store (gate = default `store`, focus =
   /// `focusStore`), so a recompute for one layer never rewrites the other's shield.
   private func applyBlocks(_ config: MonitorBlockConfig, exempt: ApplicationToken? = nil, target: ManagedSettingsStore, layer: String) {
     guard config.isActive else {
-      target.shield.applications = nil
-      target.shield.applicationCategories = nil
-      target.shield.webDomains = nil
+      clearLayer(target)
       return
     }
 
+    if let dual = config.targetConfiguration {
+      try? GuardianTargetRuntime.render(dual, store: target, layer: layer, defaults: sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier)
+      return
+    }
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore(layer))
     // #563 allowlist: shield every app except the kept ones (whether iOS also exempts
     // system-essential/controlling apps is pending real-device verification).
     if config.mode == .allow {
@@ -719,15 +737,13 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
       return
     }
 
-    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let exemptSet = GuardianTargetRuntime.opened(sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier).0
     let validAppTokens = config.items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let validCategoryTokens = config.items.compactMap { $0.categoryToken }
-    let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
+    let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }.filter { !GuardianTargetRuntime.opened(sharedDefaults ?? UserDefaults.standard, group: appGroupIdentifier).1.contains($0) }
 
     guard !validAppTokens.isEmpty || !validCategoryTokens.isEmpty || !validWebDomainTokens.isEmpty else {
-      target.shield.applications = nil
-      target.shield.applicationCategories = nil
-      target.shield.webDomains = nil
+      clearLayer(target)
       return
     }
 
@@ -805,6 +821,7 @@ struct MonitorBlockConfig {
   let isActive: Bool
   // #563: block vs allow semantics for `items`.
   let mode: BlockMode
+  let targetConfiguration: [String: Any]?
 }
 
 /// One schedule window: local minute-of-day bounds (0..1439) plus the ISO weekdays

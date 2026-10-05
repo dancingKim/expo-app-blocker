@@ -7,6 +7,8 @@ import { Platform } from "react-native";
 import React from "react";
 
 import type {
+  GuardianKeyScope,
+  GuardianTargetConfiguration,
   PermissionStatus,
   AndroidPermissions,
   IOSPermissions,
@@ -27,6 +29,8 @@ import type {
 } from "./ExpoAppBlocker.types";
 
 export type {
+  GuardianKeyScope,
+  GuardianTargetConfiguration,
   PermissionStatus,
   AndroidPermissions,
   IOSPermissions,
@@ -258,6 +262,30 @@ export function isGuardianExtensionAttached(): boolean {
   return NativeModule.guardianExtensionAttached === true;
 }
 
+/** Capability of the installed binary, never inferred from the OTA JS version. */
+export function getGuardianSchedulePolicy(): 'continuous-v1' | null {
+  return isGuardianExtensionAttached() && NativeModule?.guardianSchedulePolicy === 'continuous-v1'
+    ? 'continuous-v1' : null;
+}
+
+
+export function getGuardianTargetPolicy(): 'dual-v1' | null {
+  return isGuardianExtensionAttached() && NativeModule?.guardianTargetPolicy === 'dual-v1' ? 'dual-v1' : null;
+}
+export function getGuardianKeyScopePolicy(): 'targets-v1' | null {
+  return isGuardianExtensionAttached() && NativeModule?.guardianKeyScopePolicy === 'targets-v1' ? 'targets-v1' : null;
+}
+/** null is unresolved/absent, never permission to open everything. */
+export function getGuardianEscapeCandidate(): GuardianKeyScope | null {
+  return getGuardianKeyScopePolicy() ? NativeModule.getGuardianEscapeCandidate() : null;
+}
+export async function setGuardianTargetConfiguration(config: GuardianTargetConfiguration): Promise<void> {
+  if (!getGuardianTargetPolicy()) throw new Error('Guardian target policy requires a new native binary');
+  if (Platform.OS === 'ios') return NativeModule.setBlockConfiguration(config);
+  return NativeModule.setGuardianTargetConfiguration(config);
+}
+
+
 export function getBlockConfiguration(): IOSBlockConfiguration | null {
   if (Platform.OS !== "ios") return null;
   return NativeModule.getBlockConfiguration();
@@ -339,6 +367,7 @@ export function isAppBlocked(bundleIdentifier: string): boolean {
  * with exact alarms waking the service at window boundaries.
  */
 export async function setScheduleConfiguration(config: ScheduleConfiguration): Promise<void> {
+  if (config.targetPolicy && !getGuardianTargetPolicy()) throw new Error("Guardian target policy requires a new native binary");
   if (Platform.OS !== "ios" && Platform.OS !== "android") return;
   return NativeModule.setScheduleConfiguration(config);
 }
@@ -443,8 +472,13 @@ export function checkAndClearPendingUnlock(): boolean {
  */
 export async function suppressBlocks(options: {
   untilMillis: number;
+  scope?: GuardianKeyScope;
 }): Promise<SuppressionState> {
-  const { untilMillis } = options;
+  const { untilMillis, scope } = options;
+  if (scope !== undefined) {
+    if (!getGuardianKeyScopePolicy()) throw new Error("Guardian key scope requires a new native binary");
+    return NativeModule.suppressBlocksWithScope(untilMillis, scope);
+  }
   if (Platform.OS === "android") {
     NativeModule.suppressBlocksAndroid(untilMillis);
     const now = Date.now();

@@ -149,7 +149,10 @@ public class ExpoAppBlockerModule: Module {
     // attached (the extensions ship only on the internal variant), independent of the OTA JS
     // bundle. Android has no separate extension — the blocker is compiled in — so it is `true`.
     Constants([
-      "guardianExtensionAttached": self.hasGuardianExtension()
+      "guardianExtensionAttached": self.hasGuardianExtension(),
+      "guardianSchedulePolicy": self.hasGuardianExtension() ? "continuous-v1" : "",
+      "guardianTargetPolicy": self.hasGuardianExtension() ? "dual-v1" : "",
+      "guardianKeyScopePolicy": self.hasGuardianExtension() ? "targets-v1" : ""
     ])
 
     // Native view that renders blocked app tokens with real names and icons
@@ -222,7 +225,7 @@ public class ExpoAppBlockerModule: Module {
         do {
           let tokens = items.compactMap { $0["token"] as? String }
           let remaps = GuardianTokenRecovery.supported
-            ? try GuardianTokenRecovery.refresh(tokens + pendingTokens, group: self.appGroupIdentifier, persist: true)
+            ? try GuardianTokenRecovery.refresh(tokens + pendingTokens + self.persistedRecoveryTokens(), group: self.appGroupIdentifier, persist: true)
             : [String: String]()
           self.isReapplyingRecoveredTokens = true
           defer { self.isReapplyingRecoveredTokens = false }
@@ -230,7 +233,7 @@ public class ExpoAppBlockerModule: Module {
           guard self.makeBlockedItems(from: items).compactMap({ $0.appToken }).count == items.count else {
             throw NSError(domain: "AppBlocker", code: 2)
           }
-          self.replacePersistedAllowedItems(items)
+          try self.replacePersistedAllowedItems(items)
           try self.reapplyTokenRecoveryLayers()
           promise.resolve(["supported": true, "remaps": remaps])
         } catch {
@@ -324,6 +327,7 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         do {
           self.ensureLoadedPersistedConfig()
+          try self.validateTargetConfiguration(config)
           let blockConfig = try self.parseBlockConfig(config)
           // Focus-store split: `guardType: "focus"` arms the focus slot/store; absent (old JS
           // bundles) or anything else arms the gate slot/store — the legacy behavior. Arming one
@@ -548,9 +552,7 @@ public class ExpoAppBlockerModule: Module {
 
         DispatchQueue.main.async {
           // Focus-store split: earned time opens the GATE store only (focus is not earn-unlockable).
-          self.store.shield.applications = nil
-          self.store.shield.applicationCategories = nil
-          self.store.shield.webDomains = nil
+          self.clearImmediateStore(self.store)
         }
 
         // Arm usage-threshold monitoring so the monitor re-blocks once measured
@@ -621,6 +623,8 @@ public class ExpoAppBlockerModule: Module {
           return
         }
 
+        self.sharedDefaults?.removeObject(forKey: GuardianTargetRuntime.scopeKey)
+        self.userDefaults.removeObject(forKey: GuardianTargetRuntime.scopeKey)
         self.sharedDefaults?.set(untilMillis, forKey: self.suppressionUntilKey)
         self.userDefaults.set(untilMillis, forKey: self.suppressionUntilKey)
 
@@ -664,6 +668,63 @@ public class ExpoAppBlockerModule: Module {
       }
     }
 
+    Function("getGuardianEscapeCandidate") { () -> [String: Any]? in
+      let defaults = self.sharedDefaults ?? self.userDefaults
+      let file = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: self.appGroupIdentifier)?.appendingPathComponent("escapeScope.v1.json")
+      let disk = file.flatMap { try? Data(contentsOf: $0) }.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+      let saved = [disk, defaults.dictionary(forKey: GuardianTargetRuntime.candidateKey)].compactMap { $0 }.max {
+        (($0["atMillis"] as? NSNumber)?.doubleValue ?? 0) < (($1["atMillis"] as? NSNumber)?.doubleValue ?? 0)
+      }
+      guard let raw = saved, let at = (raw["atMillis"] as? NSNumber)?.doubleValue,
+            (0...self.escapeTargetTokenMaxAgeMs).contains(Date().timeIntervalSince1970 * 1000 - at),
+            let scope = try? GuardianOpeningScope(raw), !scope.full,
+            (try? GuardianTargetRuntime.validateOpening(scope, configs: [], group: self.appGroupIdentifier)) != nil else { return nil }
+      return scope.dictionary
+    }
+
+    AsyncFunction("suppressBlocksWithScope") { (untilMillis: Double, raw: [String: Any], promise: Promise) in
+      self.stateQueue.async {
+        var persistedThisAttempt = false
+        do {
+          self.ensureLoadedPersistedConfig()
+          let defaults = self.sharedDefaults ?? self.userDefaults
+          let scope = try GuardianOpeningScope(raw)
+          guard untilMillis.isFinite, untilMillis > Date().timeIntervalSince1970 * 1000 else {
+            throw GuardianOpeningScope.Failure.invalidScope
+          }
+          if GuardianTargetRuntime.active(defaults) {
+            guard let previous = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey),
+                  try GuardianOpeningScope(previous) == scope,
+                  GuardianTargetRuntime.until(defaults) == untilMillis else { throw GuardianOpeningScope.Failure.invalidScope }
+            promise.resolve(self.suppressionState()); return
+          }
+          let configs = [self.blockConfigStorageKey, self.focusBlockConfigStorageKey, self.scheduleConfigStorageKey].compactMap { defaults.dictionary(forKey: $0) }
+          try GuardianTargetRuntime.validateOpening(scope, configs: configs, group: self.appGroupIdentifier)
+          guard self.sharedDefaults != nil else { throw GuardianOpeningScope.Failure.invalidConfiguration }
+          var persisted = scope.dictionary
+          persisted["untilMillis"] = untilMillis
+          defaults.set(persisted, forKey: GuardianTargetRuntime.scopeKey)
+          persistedThisAttempt = true
+          self.userDefaults.set(persisted, forKey: GuardianTargetRuntime.scopeKey)
+          defaults.set(untilMillis, forKey: self.suppressionUntilKey)
+          self.userDefaults.set(untilMillis, forKey: self.suppressionUntilKey)
+          defaults.removeObject(forKey: self.suppressionTargetTokenKey)
+          self.userDefaults.removeObject(forKey: self.suppressionTargetTokenKey)
+          if let config = self.currentBlockConfig { try self.applyBlocks(config) }
+          if let config = self.focusBlockConfig { try self.applyBlocks(config) }
+          self.reevaluateScheduleShieldFromPersisted()
+          self.updateSuppressionExpiryMonitoring(untilMillis: untilMillis)
+          promise.resolve(self.suppressionState())
+        } catch {
+          // Preflight rejects before storage; an unexpected render failure also restores policy.
+          if persistedThisAttempt {
+            try? self.endSuppressionInternal()
+          }
+          promise.reject("ERR_GUARDIAN_KEY_SCOPE", "Opening scope could not be applied")
+        }
+      }
+    }
+
     // Explicit user early close. Restore the same layers as natural expiry before acknowledging.
     AsyncFunction("endSuppression") { (promise: Promise) in
       self.stateQueue.async {
@@ -686,11 +747,12 @@ public class ExpoAppBlockerModule: Module {
 
     AsyncFunction("setScheduleConfiguration") { (config: [String: Any], promise: Promise) in
       self.stateQueue.async {
-        self.applyScheduleConfiguration(config)
-        self.persistScheduleConfiguration(config)
-        DispatchQueue.main.async {
-          promise.resolve(nil)
-        }
+        do {
+          try self.validateTargetConfiguration(config)
+          self.applyScheduleConfiguration(config)
+          self.persistScheduleConfiguration(config)
+          DispatchQueue.main.async { promise.resolve(nil) }
+        } catch { promise.reject("ERR_GUARDIAN_TARGETS", "Target policy could not be applied") }
       }
     }
 
@@ -718,8 +780,8 @@ public class ExpoAppBlockerModule: Module {
             at: pluginsURL, includingPropertiesForKeys: nil) else {
       return false
     }
-    return contents.contains {
-      $0.pathExtension == "appex" && $0.lastPathComponent.contains("ShieldConfiguration")
+    return ["ShieldConfiguration", "ShieldAction", "DeviceActivityMonitor"].allSatisfy { name in
+      contents.contains { $0.pathExtension == "appex" && $0.lastPathComponent.contains(name) }
     }
   }
 
@@ -817,9 +879,7 @@ public class ExpoAppBlockerModule: Module {
         // reaches the budget; this branch only ensures the shield stays off.
         // Focus-store split: the budget belongs to the gate layer, so only the GATE store lowers.
         DispatchQueue.main.async {
-          self.store.shield.applications = nil
-          self.store.shield.applicationCategories = nil
-          self.store.shield.webDomains = nil
+          self.clearImmediateStore(self.store)
         }
       } else {
         // Budget spent or cleared by the daily reset.
@@ -854,17 +914,33 @@ public class ExpoAppBlockerModule: Module {
     store.clearAllSettings()
     focusStore.clearAllSettings()
     scheduleStore.clearAllSettings()
+    for layer in ["gate", "focus", "schedule"] { GuardianTargetRuntime.directStore(layer).clearAllSettings() }
     for key in userDefaults.dictionaryRepresentation().keys where key.hasPrefix("appBlocker.") {
       userDefaults.removeObject(forKey: key)
     }
     defaults.set(true, forKey: "appBlocker.isolatedStorage.v1")
   }
 
-  private func replacePersistedAllowedItems(_ items: [[String: Any]]) {
+  private func replacePersistedAllowedItems(_ items: [[String: Any]]) throws {
     guard let defaults = sharedDefaults else { return }
+    let proposed = [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey].compactMap { key -> [String: Any]? in
+      guard var config = defaults.dictionary(forKey: key) else { return nil }
+      if config["targetPolicy"] as? String == "dual-v1" || config["mode"] as? String == "allow" { config["allowedItems"] = items }
+      return config
+    }
+    for config in proposed where config["targetPolicy"] as? String == "dual-v1" { try GuardianTargetRuntime.validate(config, group: appGroupIdentifier) }
+    if GuardianTargetRuntime.active(defaults), let raw = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey) {
+      try GuardianTargetRuntime.validateOpening(GuardianOpeningScope(raw), configs: proposed, group: appGroupIdentifier)
+    }
     for key in [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey] {
       guard var config = defaults.dictionary(forKey: key) else { continue }
-      if items.isEmpty {
+      if config["targetPolicy"] as? String == "dual-v1" {
+        config["allowedItems"] = items
+        defaults.set(config, forKey: key)
+        userDefaults.set(config, forKey: key)
+      } else if config["mode"] as? String != "allow" {
+        continue
+      } else if items.isEmpty {
         defaults.removeObject(forKey: key)
         userDefaults.removeObject(forKey: key)
       } else {
@@ -876,7 +952,7 @@ public class ExpoAppBlockerModule: Module {
         userDefaults.set(config, forKey: key)
       }
     }
-    if items.isEmpty { stopScheduleActivities() }
+    if items.isEmpty && defaults.dictionary(forKey: scheduleConfigStorageKey) == nil { stopScheduleActivities() }
   }
 
   private func persistedRecoveryTokens() -> [String] {
@@ -892,6 +968,9 @@ public class ExpoAppBlockerModule: Module {
     }
     for key in [escapeTargetTokenKey, suppressionTargetTokenKey] {
       if let token = defaults.string(forKey: key) { tokens.append(token) }
+    }
+    for key in [GuardianTargetRuntime.scopeKey, GuardianTargetRuntime.candidateKey] {
+      tokens += defaults.dictionary(forKey: key)?["apps"] as? [String] ?? []
     }
     return tokens
   }
@@ -914,6 +993,18 @@ public class ExpoAppBlockerModule: Module {
       try applyBlocks(config)
     }
     reevaluateScheduleShieldFromPersisted()
+  }
+
+  private func validateTargetConfiguration(_ config: [String: Any]) throws {
+    if config["targetPolicy"] as? String == "dual-v1" { try GuardianTargetRuntime.validate(config, group: appGroupIdentifier) }
+    let defaults = sharedDefaults ?? userDefaults
+    if GuardianTargetRuntime.active(defaults), let raw = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey) {
+      let replacing = config["windows"] != nil ? scheduleConfigStorageKey
+        : config["guardType"] as? String == "focus" ? focusBlockConfigStorageKey : blockConfigStorageKey
+      let keys = [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey].filter { $0 != replacing }
+      let configs = keys.compactMap { defaults.dictionary(forKey: $0) } + [config]
+      try GuardianTargetRuntime.validateOpening(GuardianOpeningScope(raw), configs: configs, group: appGroupIdentifier)
+    }
   }
 
   private func parseBlockConfig(_ dict: [String: Any]) throws -> BlockConfig {
@@ -963,7 +1054,7 @@ public class ExpoAppBlockerModule: Module {
     // single-slot behavior.
     let guardType = dict["guardType"] as? String
 
-    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis, mode: mode, guardType: guardType)
+    return BlockConfig(items: items, isActive: isActive, schedule: schedule, expiresAtMillis: expiresAtMillis, mode: mode, guardType: guardType, targetConfiguration: dict["targetPolicy"] as? String == "dual-v1" ? dict : nil)
   }
 
   /// Decode an array of raw item dicts (the `blockedItems` shape shared by immediate and
@@ -1011,6 +1102,7 @@ public class ExpoAppBlockerModule: Module {
   }
 
   private func clearImmediateStore(_ managedStore: ManagedSettingsStore) {
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore(managedStore === focusStore ? "focus" : "gate"))
     managedStore.shield.applications = nil
     managedStore.shield.applicationCategories = nil
     managedStore.shield.webDomains = nil
@@ -1060,11 +1152,16 @@ public class ExpoAppBlockerModule: Module {
     // (full) ticket keeps it fully down; a TARGETED ticket (#598) instead exempts just the one
     // escaped app below and leaves the rest shielded, so it does NOT take the full-lower path.
     let exempt = escapeExemptToken()
-    if isSuppressedInternal() && exempt == nil {
+    if GuardianTargetRuntime.full(sharedDefaults ?? userDefaults) {
       clearImmediateStore(target)
       return
     }
 
+    if let dual = config.targetConfiguration {
+      try GuardianTargetRuntime.render(dual, store: target, layer: isFocus(config) ? "focus" : "gate", defaults: sharedDefaults ?? userDefaults, group: appGroupIdentifier)
+      return
+    }
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore(isFocus(config) ? "focus" : "gate"))
     // #563 allowlist: shield every app EXCEPT the kept (allowed) ones. The except-set is the user's
     // allowed apps; whether Family Controls also implicitly exempts system-essential apps
     // (Phone/Settings/…) and the controlling app is **pending real-device verification** (see the
@@ -1074,10 +1171,10 @@ public class ExpoAppBlockerModule: Module {
       return
     }
 
-    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let exemptSet = GuardianTargetRuntime.opened(sharedDefaults ?? userDefaults, group: appGroupIdentifier).0
     let validAppTokens = config.items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let validCategoryTokens = config.items.compactMap { $0.categoryToken }
-    let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }
+    let validWebDomainTokens = config.items.compactMap { $0.webDomainToken }.filter { !GuardianTargetRuntime.opened(sharedDefaults ?? userDefaults, group: appGroupIdentifier).1.contains($0) }
 
     guard !validAppTokens.isEmpty || !validCategoryTokens.isEmpty || !validWebDomainTokens.isEmpty else {
       clearImmediateStore(target)
@@ -1294,8 +1391,7 @@ public class ExpoAppBlockerModule: Module {
   /// The current escape-ticket state: `active` (a live window), `untilMillis` (the wall-clock end),
   /// and `remainingMs`. Reads back inactive once the window has passed (self-cleaning for the host).
   private func suppressionState() -> [String: Any] {
-    let until = (sharedDefaults?.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue
-      ?? (userDefaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue ?? 0
+    let until = GuardianTargetRuntime.until(sharedDefaults ?? userDefaults)
     let nowMillis = Date().timeIntervalSince1970 * 1000.0
     let remaining = until - nowMillis
     if until <= 0 || remaining <= 0 {
@@ -1307,8 +1403,7 @@ public class ExpoAppBlockerModule: Module {
   /// True while an escape ticket is live (`now < suppressionUntil`). The shield-apply paths gate on
   /// this so a ticket keeps every shield down regardless of the lock layers.
   private func isSuppressedInternal() -> Bool {
-    let until = (sharedDefaults?.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue
-      ?? (userDefaults.object(forKey: suppressionUntilKey) as? NSNumber)?.doubleValue ?? 0
+    let until = GuardianTargetRuntime.until(sharedDefaults ?? userDefaults)
     guard until > 0 else { return false }
     return Date().timeIntervalSince1970 * 1000.0 < until
   }
@@ -1345,6 +1440,8 @@ public class ExpoAppBlockerModule: Module {
   /// Drop the persisted ticket and cancel its expiry DeviceActivity. Called on block teardown so a
   /// dangling ticket / orphan activity can't outlive the blocks it suppressed.
   private func clearSuppressionState() {
+    sharedDefaults?.removeObject(forKey: GuardianTargetRuntime.scopeKey)
+    userDefaults.removeObject(forKey: GuardianTargetRuntime.scopeKey)
     sharedDefaults?.removeObject(forKey: suppressionUntilKey)
     userDefaults.removeObject(forKey: suppressionUntilKey)
     // #598: drop the ticket's target app too so a later full ticket never inherits a stale exemption.
@@ -1600,25 +1697,35 @@ public class ExpoAppBlockerModule: Module {
 
     // #570 inversion: shield while OUTSIDE all free windows; open while inside one.
     // DeviceActivity only fires at interval boundaries, so seed the initial state here.
-    // 0 windows = not armed (JS clears the config in that case) — clear defensively so an
-    // empty window set can never become a 24h lockdown (#570 S2 regression guard).
+    // Legacy/malformed empty configs stay unarmed. Only continuous-v1 opts into no free time.
     // #572/#598: a live escape ticket also suppresses the schedule shield (the ticket is the only
     // escape for an out-of-window schedule lock). A full ticket keeps it down; a targeted ticket
     // (#598) instead exempts just the escaped app and leaves the gap shield up for the rest.
     let exempt = escapeExemptToken()
-    if windows.isEmpty {
+    if windows.isEmpty && !isContinuousSchedule(config) {
       clearScheduleShield()
-    } else if isSuppressedInternal() && exempt == nil {
+    } else if GuardianTargetRuntime.full(sharedDefaults ?? userDefaults) {
       clearScheduleShield()
     } else if isAnyScheduleWindowActive(windows: windows, at: Date()) {
       clearScheduleShield()
     } else {
-      applyScheduleShield(items, mode: mode, exempt: exempt)
+      if config["targetPolicy"] as? String == "dual-v1" {
+        try? GuardianTargetRuntime.render(config, store: scheduleStore, layer: "schedule", defaults: sharedDefaults ?? userDefaults, group: appGroupIdentifier)
+        updateScheduleShieldVariant()
+      } else { applyScheduleShield(items, mode: mode, exempt: exempt) }
     }
   }
 
   /// #563: the schedule block mode ("allow" | "block"), read from the JS config dict. Absent → block
   /// (legacy denylist), so an old config keeps its meaning.
+  /// Only an explicit empty array opts in; malformed/legacy configs keep their old meaning.
+  private func isContinuousSchedule(_ config: [String: Any]) -> Bool {
+    guard (config["targetPolicy"] as? String == "dual-v1" || config["mode"] as? String == "allow"),
+          config["policy"] as? String == "continuous-v1",
+          let raw = config["windows"] as? [Any] else { return false }
+    return raw.isEmpty
+  }
+
   private func scheduleMode(_ config: [String: Any]) -> BlockMode {
     return (config["mode"] as? String) == "allow" ? .allow : .block
   }
@@ -1686,15 +1793,17 @@ public class ExpoAppBlockerModule: Module {
   }
 
   private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
+    defer { updateScheduleShieldVariant() }
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore("schedule"))
     // #563 allowlist: an active window shields everything except the kept apps.
     if mode == .allow {
       applyAllowlistShield(scheduleStore, allowed: items, layer: "schedule", exempt: exempt)
       return
     }
-    let exemptSet: Set<ApplicationToken> = exempt.map { [$0] } ?? []
+    let exemptSet = GuardianTargetRuntime.opened(sharedDefaults ?? userDefaults, group: appGroupIdentifier).0
     let apps = items.compactMap { $0.appToken }.filter { !exemptSet.contains($0) }
     let categories = items.compactMap { $0.categoryToken }
-    let webDomains = items.compactMap { $0.webDomainToken }
+    let webDomains = items.compactMap { $0.webDomainToken }.filter { !GuardianTargetRuntime.opened(sharedDefaults ?? userDefaults, group: appGroupIdentifier).1.contains($0) }
     if apps.isEmpty {
       scheduleStore.shield.applications = nil
     } else {
@@ -1766,11 +1875,25 @@ public class ExpoAppBlockerModule: Module {
     if let refreshedExceptions { allowedAppTokens = refreshedExceptions }
     else if let exempt = exempt { allowedAppTokens.insert(exempt) }
     managedStore.shield.applications = nil
+    allowedAppTokens.formUnion(GuardianTargetRuntime.opened(sharedDefaults ?? userDefaults, group: appGroupIdentifier).0)
+    guard allowedAppTokens.count <= 50 else { return }
     managedStore.shield.applicationCategories = ShieldSettings.ActivityCategoryPolicy.all(except: allowedAppTokens)
     managedStore.shield.webDomains = nil
   }
 
+  private func updateScheduleShieldVariant() {
+    let defaults = sharedDefaults ?? UserDefaults.standard
+    let direct = GuardianTargetRuntime.directStore("schedule")
+    if scheduleStore.shield.applications != nil || scheduleStore.shield.applicationCategories != nil || scheduleStore.shield.webDomains != nil || direct.shield.applications != nil || direct.shield.webDomains != nil {
+      defaults.set("schedule", forKey: scheduleShieldVariantKey)
+    } else {
+      defaults.removeObject(forKey: scheduleShieldVariantKey)
+    }
+  }
+
   private func clearScheduleShield() {
+    GuardianTargetRuntime.clear(GuardianTargetRuntime.directStore("schedule"))
+    (sharedDefaults ?? UserDefaults.standard).removeObject(forKey: scheduleShieldVariantKey)
     scheduleStore.shield.applications = nil
     scheduleStore.shield.applicationCategories = nil
     scheduleStore.shield.webDomains = nil
@@ -1787,7 +1910,7 @@ public class ExpoAppBlockerModule: Module {
     // #598: a targeted ticket exempts one app but keeps the gap shield up for the rest; a full ticket
     // keeps the whole schedule shield down.
     let exempt = escapeExemptToken()
-    if isSuppressedInternal() && exempt == nil {
+    if GuardianTargetRuntime.full(sharedDefaults ?? userDefaults) {
       clearScheduleShield()
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
       return
@@ -1800,7 +1923,7 @@ public class ExpoAppBlockerModule: Module {
     let windows = parseScheduleWindows(dict)
     let mode = scheduleMode(dict)
     let items = makeBlockedItems(from: scheduleItemsRaw(dict, mode: mode))
-    if windows.isEmpty || isAnyScheduleWindowActive(windows: windows, at: Date()) {
+    if (windows.isEmpty && !isContinuousSchedule(dict)) || isAnyScheduleWindowActive(windows: windows, at: Date()) {
       // Not armed, or inside a free window → fully open.
       clearScheduleShield()
       sharedDefaults?.removeObject(forKey: scheduleShieldVariantKey)
@@ -1808,8 +1931,10 @@ public class ExpoAppBlockerModule: Module {
       // Outside every free window → restore the gap shield (minus the escaped app for a targeted
       // ticket). Mirrors the monitor: the gap shield always records the "schedule" variant (weekday
       // shield, keeps its redirect + escape buttons).
-      applyScheduleShield(items, mode: mode, exempt: exempt)
-      sharedDefaults?.set("schedule", forKey: scheduleShieldVariantKey)
+      if dict["targetPolicy"] as? String == "dual-v1" {
+        try? GuardianTargetRuntime.render(dict, store: scheduleStore, layer: "schedule", defaults: sharedDefaults ?? userDefaults, group: appGroupIdentifier)
+        updateScheduleShieldVariant()
+      } else { applyScheduleShield(items, mode: mode, exempt: exempt) }
     }
   }
 
@@ -1903,6 +2028,7 @@ public class ExpoAppBlockerModule: Module {
   // MARK: - Serialization
 
   private func serializeBlockConfig(_ config: BlockConfig) -> [String: Any] {
+    if let dual = config.targetConfiguration { return dual }
     let blockedItems: [[String: Any]] = config.items.compactMap { tokenInfo in
       var tokenId = tokenInfo.tokenId
       if tokenId.isEmpty {
@@ -2283,6 +2409,7 @@ struct BlockConfig {
   // `appBlocker.focus` store + focus slot; anything else / nil (old JS bundles) → the default
   // (gate) store + legacy slot.
   let guardType: String?
+  let targetConfiguration: [String: Any]?
 }
 
 struct ScheduleInfo {

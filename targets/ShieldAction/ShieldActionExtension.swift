@@ -75,14 +75,14 @@ class ShieldActionExtension: ShieldActionDelegate {
   }
 
   override func handle(action: ShieldAction, for webDomain: WebDomainToken, completionHandler: @escaping (ShieldActionResponse) -> Void) {
-    handleAction(action, application: nil, completionHandler: completionHandler)
+    handleAction(action, application: nil, webDomain: webDomain, completionHandler: completionHandler)
   }
 
   override func handle(action: ShieldAction, for category: ActivityCategoryToken, completionHandler: @escaping (ShieldActionResponse) -> Void) {
     handleAction(action, application: nil, completionHandler: completionHandler)
   }
 
-  private func handleAction(_ action: ShieldAction, application: ApplicationToken?, completionHandler: @escaping (ShieldActionResponse) -> Void) {
+  private func handleAction(_ action: ShieldAction, application: ApplicationToken?, webDomain: WebDomainToken? = nil, completionHandler: @escaping (ShieldActionResponse) -> Void) {
     // Any interaction with the shield is a confirmed block event. The
     // ShieldConfiguration data source is cached by the system and not
     // re-invoked per open, so this — the action handler, which fires every
@@ -105,7 +105,7 @@ class ShieldActionExtension: ShieldActionDelegate {
       // the OS gives no API to open the container app from a ShieldAction). Routes to the reason
       // screen via the payload's kind; does NOT set the pendingUnlock flag (that is the earn path).
       recordProbeEscapeHandlerFired()
-      recordEscapeTargetToken(application)  // #598: capture the pressed app for a targeted ticket
+      recordEscapeTargetToken(application, webDomain: webDomain)  // #598: capture the pressed app for a targeted ticket
       scheduleEscapeNotification { didSchedule in
         let response: ShieldActionResponse = didSchedule ? .none : .defer
         self.complete(on: response, completionHandler: completionHandler)
@@ -264,11 +264,31 @@ class ShieldActionExtension: ShieldActionDelegate {
   /// The chosen source + reason are written into the shieldAction probe so the next device round can
   /// attribute the outcome immediately. ApplicationToken is Codable; the container decodes the same
   /// base64 back into its allow-except set.
-  private func recordEscapeTargetToken(_ application: ApplicationToken?) {
+  private func recordEscapeTargetToken(_ application: ApplicationToken?, webDomain: WebDomainToken?) {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
     let nowMs = Date().timeIntervalSince1970 * 1000.0
+    // Replace candidate as one typed value. A web action NEVER inherits a prior app.
+    var candidate: [String: Any] = ["policy": "targets-v1", "kind": "targets", "apps": [String](), "webDomains": [String](), "atMillis": nowMs]
+    func publish(_ value: [String: Any]) {
+      defaults.set(value, forKey: "appBlocker.escapeScope.v1")
+      if let url = appGroupFileURL("escapeScope.v1.json"), let data = try? JSONSerialization.data(withJSONObject: value) {
+        try? data.write(to: url, options: .atomic)
+      }
+    }
+    if let domain = webDomain, let data = try? JSONEncoder().encode(domain) {
+      candidate["webDomains"] = [data.base64EncodedString()]
+      defaults.removeObject(forKey: escapeTargetTokenKey)
+      defaults.removeObject(forKey: escapeTargetTokenTsKey)
+      publish(candidate)
+      writeProbe(["escapeTargetSource": "web-handler"])
+      return
+    }
+    // Invalid/unknown origin clears the candidate first and never means full to new JS.
+    publish(candidate)
 
     if let application = application, let data = try? JSONEncoder().encode(application) {
+      candidate["apps"] = [data.base64EncodedString()]
+      publish(candidate)
       defaults.set(data.base64EncodedString(), forKey: escapeTargetTokenKey)
       defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
       writeProbe(["escapeTargetSource": "handler"])
@@ -279,6 +299,8 @@ class ShieldActionExtension: ShieldActionDelegate {
     // read file-first (durable) then the legacy UserDefaults mirror.
     if let last = readLastShieldedToken() {
       if last.ts > 0, nowMs - last.ts <= lastShieldedTokenMaxAgeMs {
+        candidate["apps"] = [last.encoded]
+        publish(candidate)
         defaults.set(last.encoded, forKey: escapeTargetTokenKey)
         defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
         writeProbe(["escapeTargetSource": "lastShielded"])

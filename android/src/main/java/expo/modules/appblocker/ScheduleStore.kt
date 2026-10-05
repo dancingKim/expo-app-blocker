@@ -18,12 +18,15 @@ import org.json.JSONObject
  * alive; [AlarmReceiver] wakes the service at boundaries in case it was killed.
  */
 object ScheduleStore {
+  private const val KEY_TARGET_CONFIG = "guardian_schedule_targets"
   private const val KEY_SCHEDULE_WINDOWS = "schedule_windows"
   private const val KEY_SCHEDULE_PACKAGES = "schedule_packages"
   // #563: schedule block mode ("allow" | "block"). In allow mode KEY_SCHEDULE_PACKAGES holds the
   // KEPT apps and the service shields everything else (+ system-essential apps) while a window is
   // active; in block mode it holds the apps to shield. Absent → block (legacy).
   private const val KEY_SCHEDULE_MODE = "schedule_mode"
+  private const val KEY_SCHEDULE_POLICY = "schedule_policy"
+  private const val CONTINUOUS_POLICY = "continuous-v1"
   private const val MINUTE_MS = 60_000L
 
   data class Window(val startMinute: Int, val endMinute: Int, val weekdays: Set<Int>)
@@ -34,6 +37,10 @@ object ScheduleStore {
    * names). On Android both item lists are plain package-name strings.
    */
   fun setConfiguration(context: Context, config: Map<String, Any?>) {
+    val dual = config["targetPolicy"] == "dual-v1"
+    if (dual) GuardianTargetPolicy.parse(config)
+    val continuous = (dual || config["mode"] == AppBlockerPrefs.MODE_ALLOW) &&
+      config["policy"] == CONTINUOUS_POLICY && (config["windows"] as? List<*>)?.isEmpty() == true
     val windowsJson = JSONArray()
     (config["windows"] as? List<*>)?.forEach { raw ->
       val w = raw as? Map<*, *> ?: return@forEach
@@ -49,25 +56,29 @@ object ScheduleStore {
       )
     }
 
-    val mode = (config["mode"] as? String) ?: AppBlockerPrefs.MODE_BLOCK
+    val mode = if (dual) AppBlockerPrefs.MODE_DUAL else (config["mode"] as? String) ?: AppBlockerPrefs.MODE_BLOCK
     val itemsKey = if (mode == AppBlockerPrefs.MODE_ALLOW) "allowedItems" else "blockedItems"
     val packages = (config[itemsKey] as? List<*>)
-      ?.mapNotNull { it as? String }
+      ?.mapNotNull { (it as? String)?.takeIf { name -> name.isNotBlank() } }
       ?.toSet()
       ?: emptySet()
 
     AppBlockerPrefs.get(context).edit()
+      .putString(KEY_TARGET_CONFIG, if (dual) JSONObject(config).toString() else null)
       .putString(KEY_SCHEDULE_WINDOWS, windowsJson.toString())
       .putStringSet(KEY_SCHEDULE_PACKAGES, packages)
       .putString(KEY_SCHEDULE_MODE, mode)
+      .putString(KEY_SCHEDULE_POLICY, if (continuous) CONTINUOUS_POLICY else null)
       .apply()
   }
 
   fun clear(context: Context) {
     AppBlockerPrefs.get(context).edit()
+      .remove(KEY_TARGET_CONFIG)
       .remove(KEY_SCHEDULE_WINDOWS)
       .remove(KEY_SCHEDULE_PACKAGES)
       .remove(KEY_SCHEDULE_MODE)
+      .remove(KEY_SCHEDULE_POLICY)
       .apply()
   }
 
@@ -77,6 +88,15 @@ object ScheduleStore {
   /** #563: the schedule block mode ("allow" | "block"); defaults to "block" (legacy). */
   fun getMode(context: Context): String =
     AppBlockerPrefs.get(context).getString(KEY_SCHEDULE_MODE, null) ?: AppBlockerPrefs.MODE_BLOCK
+
+  /** A corrupt/missing window value must never become continuous blocking. */
+  fun isContinuous(context: Context): Boolean {
+    val prefs = AppBlockerPrefs.get(context)
+    if ((getMode(context) != AppBlockerPrefs.MODE_ALLOW && getMode(context) != AppBlockerPrefs.MODE_DUAL) ||
+        prefs.getString(KEY_SCHEDULE_POLICY, null) != CONTINUOUS_POLICY) return false
+    val raw = prefs.getString(KEY_SCHEDULE_WINDOWS, null) ?: return false
+    return try { JSONArray(raw).length() == 0 } catch (e: Exception) { false }
+  }
 
   fun getWindows(context: Context): List<Window> {
     val json = AppBlockerPrefs.get(context).getString(KEY_SCHEDULE_WINDOWS, null) ?: return emptyList()
@@ -100,10 +120,18 @@ object ScheduleStore {
   }
 
   /** Reconstruct the config map for `getScheduleConfiguration`, or null if none is set. */
+  internal fun getTargetPolicy(context: Context): GuardianTargetPolicy? =
+    AppBlockerPrefs.get(context).getString(KEY_TARGET_CONFIG, null)?.let {
+      runCatching { GuardianTargetPolicy.parse(AppBlockerPrefs.jsonMap(it)) }.getOrNull()
+    }
+
   fun getConfigurationMap(context: Context): Map<String, Any?>? {
+    AppBlockerPrefs.get(context).getString(KEY_TARGET_CONFIG, null)?.let { raw ->
+      return runCatching { AppBlockerPrefs.jsonMap(raw) }.getOrNull()
+    }
     val windows = getWindows(context)
     val packages = getSchedulePackages(context)
-    if (windows.isEmpty() && packages.isEmpty()) return null
+    if (windows.isEmpty() && packages.isEmpty() && !isContinuous(context)) return null
     val mode = getMode(context)
     val itemsKey = if (mode == AppBlockerPrefs.MODE_ALLOW) "allowedItems" else "blockedItems"
     return mapOf(
@@ -116,7 +144,7 @@ object ScheduleStore {
         )
       },
       itemsKey to packages.toList(),
-    )
+    ) + if (isContinuous(context)) mapOf("policy" to CONTINUOUS_POLICY) else emptyMap()
   }
 
   /**

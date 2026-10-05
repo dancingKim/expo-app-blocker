@@ -36,7 +36,8 @@ class ExpoAppBlockerModule : Module() {
     // #535: Android compiles the blocker in (no separate extension), so guardian is attached
     // whenever this native module is present. Mirrors iOS's guardianExtensionAttached for the JS
     // exposure gate (#541).
-    Constants("guardianExtensionAttached" to true)
+    Constants("guardianExtensionAttached" to true, "guardianSchedulePolicy" to "continuous-v1",
+      "guardianTargetPolicy" to "dual-v1", "guardianKeyScopePolicy" to "targets-v1")
 
     OnCreate {
       AppBlockerService.start(context)
@@ -109,6 +110,29 @@ class ExpoAppBlockerModule : Module() {
         notificationText = config["notificationText"] as? String,
       )
       Log.d(TAG, "setAndroidConfig: $config")
+    }
+
+    AsyncFunction("setGuardianTargetConfiguration") { config: Map<String, Any?> ->
+      AppBlockerPrefs.setTargetConfiguration(context, config)
+      AlarmReceiver.scheduleNext(context)
+      AppBlockerService.start(context)
+    }
+
+    Function("getGuardianEscapeCandidate") {
+      AppBlockerPrefs.peekEscapeTargetPackage(context)?.let { GuardianKeyScope(false, setOf(it)).asMap() }
+    }
+
+    AsyncFunction("suppressBlocksWithScope") { untilMillis: Double, raw: Map<String, Any?> ->
+      val scope = GuardianKeyScope.parse(raw)
+      require(untilMillis.isFinite() && untilMillis > System.currentTimeMillis())
+      if (AppBlockerPrefs.isSuppressed(context)) {
+        require(AppBlockerPrefs.hasExplicitKeyScope(context) && AppBlockerPrefs.getKeyScope(context) == scope && AppBlockerPrefs.getSuppressionUntil(context) == untilMillis.toLong())
+      } else {
+        AppBlockerPrefs.setScopedSuppression(context, untilMillis.toLong(), scope)
+        AlarmReceiver.scheduleNext(context)
+        AppBlockerService.start(context)
+      }
+      mapOf("active" to true, "untilMillis" to untilMillis, "remainingMs" to (untilMillis.toLong() - System.currentTimeMillis()).coerceAtLeast(0L))
     }
 
     Function("setBlockedApps") { packageNames: List<String> ->
@@ -356,6 +380,7 @@ class ExpoAppBlockerModule : Module() {
         mapOf(
           "packageName" to appInfo.packageName,
           "isAlwaysAllowed" to (SystemEssentialApps.isSystemApp(appInfo.flags) || appInfo.packageName in essentialApps),
+          "isDirectlyBlockable" to (appInfo.enabled && resolveInfo.activityInfo.enabled && appInfo.packageName !in essentialApps),
           "name" to (pm.getApplicationLabel(appInfo)?.toString() ?: appInfo.packageName),
           "iconBase64" to iconBase64
         )
