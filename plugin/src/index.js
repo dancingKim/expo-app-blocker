@@ -289,6 +289,20 @@ function withAppBlockerIOS(config, pluginConfig) {
       }
     }
 
+    // The host advertises allow-layer scope only when BOTH built extensions
+    // carry this marker. Preserve app-owned plist values across config runs.
+    const plist = resolve("@expo/plist").default;
+    const { getTargetInfoPlistForType } = resolve("@bacons/apple-targets/build/target");
+    for (const [name, type] of [["ShieldAction", "shield-action"],
+      ["DeviceActivityMonitor", "device-activity-monitor"]]) {
+      const infoPath = path.join(targetsDir, name, "Info.plist");
+      const info = fs.existsSync(infoPath)
+        ? plist.parse(fs.readFileSync(infoPath, "utf8"))
+        : getTargetInfoPlistForType(type);
+      info.ExpoGuardianAllowLayerScopePolicy = "allow-layer-v1";
+      fs.writeFileSync(infoPath, plist.build(info));
+    }
+
     // 2. Substitute placeholders in the freshly-copied Swift files. The
     //    substitution map mirrors the original withDangerousMod block — kept
     //    here so config-eval produces final, build-ready Swift in one pass.

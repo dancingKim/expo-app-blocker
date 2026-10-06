@@ -152,7 +152,8 @@ public class ExpoAppBlockerModule: Module {
       "guardianExtensionAttached": self.hasGuardianExtension(),
       "guardianSchedulePolicy": self.hasGuardianExtension() ? "continuous-v1" : "",
       "guardianTargetPolicy": self.hasGuardianExtension() ? "dual-v1" : "",
-      "guardianKeyScopePolicy": self.hasGuardianExtension() ? "targets-v1" : ""
+      "guardianKeyScopePolicy": self.hasGuardianExtension() ? "targets-v1" : "",
+      "guardianAllowLayerScopePolicy": self.hasGuardianAllowLayerScope() ? "allow-layer-v1" : ""
     ])
 
     // Native view that renders blocked app tokens with real names and icons
@@ -678,6 +679,7 @@ public class ExpoAppBlockerModule: Module {
       guard let raw = saved, let at = (raw["atMillis"] as? NSNumber)?.doubleValue,
             (0...self.escapeTargetTokenMaxAgeMs).contains(Date().timeIntervalSince1970 * 1000 - at),
             let scope = try? GuardianOpeningScope(raw), !scope.full,
+            (!scope.allowLayer || self.hasGuardianAllowLayerScope()),
             (try? GuardianTargetRuntime.validateOpening(scope, configs: [], group: self.appGroupIdentifier)) != nil else { return nil }
       return scope.dictionary
     }
@@ -689,6 +691,9 @@ public class ExpoAppBlockerModule: Module {
           self.ensureLoadedPersistedConfig()
           let defaults = self.sharedDefaults ?? self.userDefaults
           let scope = try GuardianOpeningScope(raw)
+          guard !scope.allowLayer || self.hasGuardianAllowLayerScope() else {
+            throw GuardianOpeningScope.Failure.invalidScope
+          }
           guard untilMillis.isFinite, untilMillis > Date().timeIntervalSince1970 * 1000 else {
             throw GuardianOpeningScope.Failure.invalidScope
           }
@@ -783,6 +788,19 @@ public class ExpoAppBlockerModule: Module {
     return ["ShieldConfiguration", "ShieldAction", "DeviceActivityMonitor"].allSatisfy { name in
       contents.contains { $0.pathExtension == "appex" && $0.lastPathComponent.contains(name) }
     }
+  }
+
+  private func hasGuardianAllowLayerScope() -> Bool {
+    guard hasGuardianExtension(), let directory = Bundle.main.builtInPlugInsURL,
+          let contents = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return false }
+    var policies: [String: String] = [:]
+    for name in ["ShieldAction", "DeviceActivityMonitor"] {
+      guard let url = contents.first(where: { $0.pathExtension == "appex" && $0.lastPathComponent.contains(name) }),
+            let bundle = Bundle(url: url),
+            let policy = bundle.object(forInfoDictionaryKey: "ExpoGuardianAllowLayerScopePolicy") as? String else { return false }
+      policies[name] = policy
+    }
+    return GuardianOpeningScope.supportedExtensions(policies)
   }
 
   // MARK: - Authorization
@@ -1834,6 +1852,10 @@ public class ExpoAppBlockerModule: Module {
   /// tokens actually decoded (`layer` says which store). RECORD ONLY — no fail-open judgement and no
   /// threshold here; that decision is deferred (stage 2), so the shield applied is unchanged.
   private func applyAllowlistShield(_ managedStore: ManagedSettingsStore, allowed items: [BlockedItemInfo], layer: String, exempt: ApplicationToken? = nil) {
+    if GuardianTargetRuntime.allowLayer(sharedDefaults ?? userDefaults) {
+      GuardianTargetRuntime.clear(managedStore)
+      return
+    }
     var allowedAppTokens = Set(items.compactMap { $0.appToken })
     var refreshedExceptions: Set<ApplicationToken>?
     if GuardianTokenRecovery.supported {

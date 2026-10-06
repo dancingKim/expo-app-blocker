@@ -275,6 +275,11 @@ export function getGuardianTargetPolicy(): 'dual-v1' | null {
 export function getGuardianKeyScopePolicy(): 'targets-v1' | null {
   return isGuardianExtensionAttached() && NativeModule?.guardianKeyScopePolicy === 'targets-v1' ? 'targets-v1' : null;
 }
+/** iOS additive capability; keep targets-v1 unchanged for installed older JS bundles. */
+export function getGuardianAllowLayerScopePolicy(): 'allow-layer-v1' | null {
+  return Platform.OS === 'ios' && isGuardianExtensionAttached()
+    && NativeModule?.guardianAllowLayerScopePolicy === 'allow-layer-v1' ? 'allow-layer-v1' : null;
+}
 /** null is unresolved/absent, never permission to open everything. */
 export function getGuardianEscapeCandidate(): GuardianKeyScope | null {
   return getGuardianKeyScopePolicy() ? NativeModule.getGuardianEscapeCandidate() : null;
@@ -477,6 +482,9 @@ export async function suppressBlocks(options: {
   const { untilMillis, scope } = options;
   if (scope !== undefined) {
     if (!getGuardianKeyScopePolicy()) throw new Error("Guardian key scope requires a new native binary");
+    if (scope.policy === 'targets-v2' && !getGuardianAllowLayerScopePolicy()) {
+      throw new Error("Guardian allow-layer scope requires a new iOS native binary");
+    }
     return NativeModule.suppressBlocksWithScope(untilMillis, scope);
   }
   if (Platform.OS === "android") {

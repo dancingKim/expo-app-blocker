@@ -33,13 +33,14 @@ class ShieldActionExtension: ShieldActionDelegate {
   // #598 targeted escape ticket: on "지금 필요해" (secondary) this records the ApplicationToken the
   // user pressed on (+ a timestamp for freshness) into the App Group. The container app's
   // suppressBlocks consumes it and opens ONLY that app for the ticket, keeping every other blocked
-  // app shielded. Web/category shields (no app token) clear it so the ticket falls back to full open.
+  // app shielded. The typed candidate now distinguishes direct, website, and allow-layer scope;
+  // this token mirror remains only for legacy per-app consumers.
   private let escapeTargetTokenKey = "appBlocker.escapeTargetToken.v1"
   private let escapeTargetTokenTsKey = "appBlocker.escapeTargetTokenTs.v1"
   // #598: the guardian locks by category (`.all(except:)`), so escape almost always arrives on the
   // category overload with NO ApplicationToken. ShieldConfiguration records the app it last rendered a
   // shield for here; we read the freshest one as the target. See the ShieldConfiguration comment for
-  // the caching / background-render caveat that the freshness gate + full-open fallback guard against.
+  // the caching / background-render caveat. Missing identity never widens a typed scope to full.
   private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
   private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
   private let lastShieldedTokenMaxAgeMs: Double = 5 * 60 * 1000
@@ -253,68 +254,64 @@ class ShieldActionExtension: ShieldActionDelegate {
     probeLog.log("ShieldAction secondaryButtonPressed handler fired @\(nowMs, privacy: .public)")
   }
 
-  /// #598: record the app the user pressed "지금 필요해" on, so the container app's suppressBlocks can
-  /// open ONLY that app for the ticket. Three sources, in order:
-  ///   1. `handler` — the app-token overload carried it directly (rare: the guardian locks by
-  ///      category, so escape usually arrives on the category overload with no token).
-  ///   2. `lastShielded` — no token here → the app ShieldConfiguration last rendered a shield for
-  ///      (App Group), if fresh. This is the guardian's normal path.
-  ///   3. `fallback-full` — no usable token → clear the candidate so the ticket opens everything
-  ///      (the original safe behavior). Reason recorded for the real-device probe.
-  /// The chosen source + reason are written into the shieldAction probe so the next device round can
-  /// attribute the outcome immediately. ApplicationToken is Codable; the container decodes the same
-  /// base64 back into its allow-except set.
+  /// Freeze the scope from the shield origin. Direct application membership wins on overlap.
+  /// The legacy app mirror remains targeted for older bundles; the typed value never falls back to full.
   private func recordEscapeTargetToken(_ application: ApplicationToken?, webDomain: WebDomainToken?) {
     guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
     let nowMs = Date().timeIntervalSince1970 * 1000.0
-    // Replace candidate as one typed value. A web action NEVER inherits a prior app.
-    var candidate: [String: Any] = ["policy": "targets-v1", "kind": "targets", "apps": [String](), "webDomains": [String](), "atMillis": nowMs]
-    func publish(_ value: [String: Any]) {
-      defaults.set(value, forKey: "appBlocker.escapeScope.v1")
-      if let url = appGroupFileURL("escapeScope.v1.json"), let data = try? JSONSerialization.data(withJSONObject: value) {
+    func publish(_ value: [String: Any]?) {
+      var candidate = value ?? ["policy": "targets-v1", "kind": "targets", "apps": [String](), "webDomains": [String]()]
+      candidate["atMillis"] = nowMs
+      defaults.set(candidate, forKey: "appBlocker.escapeScope.v1")
+      if let url = appGroupFileURL("escapeScope.v1.json"), let data = try? JSONSerialization.data(withJSONObject: candidate) {
         try? data.write(to: url, options: .atomic)
       }
     }
-    if let domain = webDomain, let data = try? JSONEncoder().encode(domain) {
-      candidate["webDomains"] = [data.base64EncodedString()]
-      defaults.removeObject(forKey: escapeTargetTokenKey)
-      defaults.removeObject(forKey: escapeTargetTokenTsKey)
-      publish(candidate)
-      writeProbe(["escapeTargetSource": "web-handler"])
-      return
-    }
-    // Invalid/unknown origin clears the candidate first and never means full to new JS.
-    publish(candidate)
-
-    if let application = application, let data = try? JSONEncoder().encode(application) {
-      candidate["apps"] = [data.base64EncodedString()]
-      publish(candidate)
-      defaults.set(data.base64EncodedString(), forKey: escapeTargetTokenKey)
-      defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
-      writeProbe(["escapeTargetSource": "handler"])
-      return
-    }
-
-    // No token here → fall back to the app ShieldConfiguration last rendered a shield for (#598),
-    // read file-first (durable) then the legacy UserDefaults mirror.
-    if let last = readLastShieldedToken() {
-      if last.ts > 0, nowMs - last.ts <= lastShieldedTokenMaxAgeMs {
-        candidate["apps"] = [last.encoded]
-        publish(candidate)
-        defaults.set(last.encoded, forKey: escapeTargetTokenKey)
-        defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
-        writeProbe(["escapeTargetSource": "lastShielded"])
-        return
-      }
-      defaults.removeObject(forKey: escapeTargetTokenKey)
-      defaults.removeObject(forKey: escapeTargetTokenTsKey)
-      writeProbe(["escapeTargetSource": "fallback-full", "escapeTargetReason": "stale-last-shielded"])
-      return
-    }
-
     defaults.removeObject(forKey: escapeTargetTokenKey)
     defaults.removeObject(forKey: escapeTargetTokenTsKey)
-    writeProbe(["escapeTargetSource": "fallback-full", "escapeTargetReason": "no-last-shielded"])
+    publish(nil)
+    if let domain = webDomain {
+      if let data = try? JSONEncoder().encode(domain) {
+        publish(GuardianEscapeScope.candidate(app: nil, webDomain: data.base64EncodedString(), directlyBlocked: false, allowBlocked: false))
+        writeProbe(["escapeTargetSource": "web-handler"])
+      }
+      return
+    }
+    var token = application
+    var source = "handler"
+    if token == nil, let last = readLastShieldedToken(), last.ts > 0,
+       (0...lastShieldedTokenMaxAgeMs).contains(nowMs - last.ts),
+       let data = Data(base64Encoded: last.encoded) {
+      token = try? JSONDecoder().decode(ApplicationToken.self, from: data)
+      source = "lastShielded"
+    }
+    let stores = [ManagedSettingsStore(),
+      ManagedSettingsStore(named: .init("appBlocker.focus")),
+      ManagedSettingsStore(named: .init("appBlocker.schedule"))]
+    let directStores = ["gate", "focus", "schedule"].map {
+      ManagedSettingsStore(named: .init("appBlocker.direct.\($0)"))
+    }
+    // Inspect the applied stores, not merely saved lists: disabled/free/satisfied rules contribute nothing.
+    let directApps = (stores + directStores).reduce(into: Set<ApplicationToken>()) {
+      $0.formUnion($1.shield.applications ?? [])
+    }
+    let directlyBlocked = token.map { directApps.contains($0) } ?? false
+    let allowBlocked = stores.contains { store in
+      guard let policy = store.shield.applicationCategories, case let .all(exceptions) = policy else { return false }
+      if let token { return !exceptions.contains(token) }
+      // Without an app identity, a direct overlap cannot be excluded; require explicit selection instead.
+      return directApps.isEmpty
+    }
+    let encoded = token.flatMap { try? JSONEncoder().encode($0).base64EncodedString() }
+    let candidate = GuardianEscapeScope.candidate(app: encoded, webDomain: nil,
+      directlyBlocked: directlyBlocked, allowBlocked: allowBlocked)
+    publish(candidate)
+    if let encoded, candidate != nil {
+      defaults.set(encoded, forKey: escapeTargetTokenKey)
+      defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
+    }
+    writeProbe(["escapeTargetSource": candidate == nil ? "unresolved" : source,
+                "escapeScopeKind": candidate?["kind"] as? String ?? "unresolved"])
   }
 
   /// #598: read the last-shielded app record, file first (durable across ShieldConfiguration's instant
