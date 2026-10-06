@@ -38,9 +38,9 @@ final class ActionFixture {
     ManagedSettingsStore().shield.applicationCategories = .all(["safe"])
     ManagedSettingsStore(named: .init("appBlocker.direct.gate")).shield.applications = ["direct"]
     action.recordEscapeTargetToken(nil, webDomain: nil)
-    let unknown = defaults.dictionary(forKey: "appBlocker.escapeScope.v1")!
-    do { _ = try GuardianOpeningScope(unknown); preconditionFailure("Cached A cannot become B's scope") }
-    catch GuardianOpeningScope.Failure.invalidScope {}
+    let category = try GuardianOpeningScope(defaults.dictionary(forKey: "appBlocker.escapeScope.v1")!)
+    precondition(category.allowLayer && category.apps.isEmpty && category.webDomains.isEmpty)
+    precondition(ManagedSettingsStore(named: .init("appBlocker.direct.gate")).shield.applications == ["direct"])
     action.recordEscapeTargetToken("kakao", webDomain: nil)
     let outside = try GuardianOpeningScope(defaults.dictionary(forKey: "appBlocker.escapeScope.v1")!)
     precondition(outside.allowLayer && outside.apps.isEmpty)
@@ -54,6 +54,10 @@ final class ActionFixture {
     action.recordEscapeTargetToken(nil, webDomain: "site")
     let site = try GuardianOpeningScope(defaults.dictionary(forKey: "appBlocker.escapeScope.v1")!)
     precondition(site.apps.isEmpty && site.webDomains.count == 1)
-    print("Production ShieldAction origin: stale cached app ignored, typed and pure-allow scopes passed")
+    ManagedSettingsStore().shield.applicationCategories = nil
+    action.recordEscapeTargetToken(nil, webDomain: nil)
+    do { _ = try GuardianOpeningScope(defaults.dictionary(forKey: "appBlocker.escapeScope.v1")!); preconditionFailure("Unknown origin cannot open any layer") }
+    catch GuardianOpeningScope.Failure.invalidScope {}
+    print("Production ShieldAction origin: category opens only allow layer, typed direct/site and unknown origin passed")
   }
 }
