@@ -284,8 +284,9 @@ class ShieldActionExtension: ShieldActionDelegate {
     let allowBlocked = stores.contains { store in
       guard let policy = store.shield.applicationCategories, case let .all(exceptions) = policy else { return false }
       if let token { return !exceptions.contains(token) }
-      // Without an app identity, a direct overlap cannot be excluded; require explicit selection instead.
-      return directApps.isEmpty
+      // A category callback identifies the allow layer, not an individual app.
+      // Opening this layer preserves every direct app/domain shield, including overlaps.
+      return true
     }
     let encoded = token.flatMap { try? JSONEncoder().encode($0).base64EncodedString() }
     let candidate = GuardianEscapeScope.candidate(app: encoded, webDomain: nil,
