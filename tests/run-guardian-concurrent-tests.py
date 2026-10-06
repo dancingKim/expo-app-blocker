@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Run production concurrent key registry and persistence boundaries; no device, network, dependency install or app state."""
+from pathlib import Path
+import os
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def run(args):
+    subprocess.run([str(arg) for arg in args], cwd=ROOT, check=True)
+
+with tempfile.TemporaryDirectory(prefix='guardian-policy-tests-') as output:
+    output = Path(output)
+    assert (ROOT / 'ios/GuardianTargetPolicy.swift').read_bytes() == (ROOT / 'targets/DeviceActivityMonitor/GuardianTargetPolicy.swift').read_bytes(), 'Host/monitor policy drift'
+    assert (ROOT / 'ios/GuardianConcurrentKeys.swift').read_bytes() == (ROOT / 'targets/DeviceActivityMonitor/GuardianConcurrentKeys.swift').read_bytes(), 'Host/monitor registry drift'
+    run(['xcrun', 'swiftc', 'ios/GuardianTargetPolicy.swift', 'ios/GuardianConcurrentKeys.swift', 'tests/GuardianConcurrentKeysTests.swift', '-o', output / 'swift-tests'])
+    run([output / 'swift-tests'])
+    kotlin_sources = ['android/src/main/java/expo/modules/appblocker/' + name + '.kt' for name in ['GuardianTargetPolicy', 'GuardianConcurrentKeys', 'AppBlockerPrefs', 'ScheduleStore']] + ['tests/AndroidPreferencesFixture.kt', 'tests/GuardianConcurrentKeysTests.kt']
+    json_cache = Path(os.environ.get('GRADLE_USER_HOME', str(Path.home() / '.gradle'))) / 'caches/modules-2/files-2.1/org.json/json/20180813'
+    json_jar = next(json_cache.glob('*/*.jar'))
+    compiler = shutil.which('kotlinc')
+    if compiler:
+        run([compiler, *kotlin_sources, '-classpath', json_jar, '-include-runtime', '-d', output / 'kotlin-tests.jar'])
+        run(['java', '-cp', str(output / 'kotlin-tests.jar') + os.pathsep + str(json_jar), 'expo.modules.appblocker.GuardianConcurrentKeysTestsKt'])
+    else:
+        # Reuse exactly the already-installed Gradle compiler; this does not fetch anything.
+        cache = Path(os.environ.get('GRADLE_USER_HOME', str(Path.home() / '.gradle'))) / 'caches/modules-2/files-2.1'
+        specs = [('org.jetbrains.kotlin', 'kotlin-compiler-embeddable', '2.1.20'),
+                 ('org.jetbrains.kotlin', 'kotlin-stdlib', '2.1.20'),
+                 ('org.jetbrains.kotlin', 'kotlin-script-runtime', '2.1.20'),
+                 ('org.jetbrains.kotlin', 'kotlin-reflect', '1.6.10'),
+                 ('org.jetbrains.kotlinx', 'kotlinx-coroutines-core-jvm', '1.8.0'),
+                 ('org.jetbrains.intellij.deps', 'trove4j', '1.0.20200330'),
+                 ('org.jetbrains', 'annotations', '13.0')]
+        jars = [next((cache / group / artifact / version).glob('*/*.jar')) for group, artifact, version in specs]
+        classpath = os.pathsep.join(map(str, jars + [json_jar]))
+        java = Path(os.environ['JAVA_HOME']) / 'bin/java' if 'JAVA_HOME' in os.environ else Path(shutil.which('java') or 'java')
+        run([java, '-cp', classpath, 'org.jetbrains.kotlin.cli.jvm.K2JVMCompiler', '-no-stdlib', '-no-reflect', '-classpath', classpath, '-d', output / 'kotlin', *kotlin_sources])
+        run([java, '-cp', str(output / 'kotlin') + os.pathsep + classpath, 'expo.modules.appblocker.GuardianConcurrentKeysTestsKt'])
+
+# Compile actual storage and mutation/expiry methods with only OS boundaries replaced.
+def method(source, name):
+    start = source.index('  private func ' + name + '(')
+    end = source.index('\n  }', start) + len('\n  }')
+    return source[start:end].replace('private func', 'func', 1)
+source = (ROOT / 'ios/GuardianConcurrentKeys.swift').read_text()
+storage = source.split('enum GuardianConcurrentStorage {', 1)[1].rsplit('#endif', 1)[0]
+storage = 'enum GuardianConcurrentStorage {' + storage
+start = storage.index('  static func directory(')
+end = storage.index('\n  static func lock(', start)
+storage = storage[:start] + '  static func directory(_ group: String) throws -> URL { URL(fileURLWithPath: group) }\n' + storage[end:]
+fixture = (ROOT / 'tests/GuardianConcurrentRuntimeTests.swift').read_text().replace('// PRODUCTION_STORAGE', storage)
+policy = (ROOT / 'ios/GuardianTargetPolicy.swift').read_text()
+aggregate = []
+for name in ['until', 'active', 'full', 'allowLayer', 'opened', 'tokens', 'validate', 'validateRegistry']:
+    start = policy.index('  static func ' + name + '(')
+    end = policy.index('\n  static func ', start + 1)
+    aggregate.append(policy[start:end])
+fixture = fixture.replace('// PRODUCTION_AGGREGATE', '\n'.join(aggregate))
+fixture = fixture.replace('// PRODUCTION_COMMIT', method((ROOT / 'ios/ExpoAppBlockerModule.swift').read_text(), 'commitGuardianKeys'))
+fixture = fixture.replace('// PRODUCTION_EXPIRY', method((ROOT / 'targets/DeviceActivityMonitor/DeviceActivityMonitor.swift').read_text(), 'expireSuppressionIfDue'))
+with tempfile.TemporaryDirectory(prefix='guardian-concurrent-runtime-') as output:
+    output = Path(output)
+    (output / 'Fixture.swift').write_text(fixture)
+    run(['xcrun', 'swiftc', 'ios/GuardianTargetPolicy.swift', 'ios/GuardianConcurrentKeys.swift', output / 'Fixture.swift', '-o', output / 'tests'])
+    run([output / 'tests'])

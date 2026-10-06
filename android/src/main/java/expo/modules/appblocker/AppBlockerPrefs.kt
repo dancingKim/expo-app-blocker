@@ -19,6 +19,7 @@ object AppBlockerPrefs {
   const val KEY_IMMEDIATE_MODE = "immediate_mode"
   const val MODE_DUAL = "dual-v1"
   private const val KEY_TARGET_CONFIG = "guardian_target_configuration"
+  private const val KEY_CONCURRENT_KEYS = "guardian_concurrent_keys_v1"
   private const val KEY_KEY_SCOPE = "guardian_key_scope"
   const val MODE_ALLOW = "allow"
   const val MODE_BLOCK = "block"
@@ -188,7 +189,68 @@ object AppBlockerPrefs {
       runCatching { GuardianTargetPolicy.parse(jsonMap(it)) }.getOrNull()
     }
 
-  internal fun setScopedSuppression(context: Context, until: Long, scope: GuardianKeyScope) {
+  // Service, alarm receiver and Expo module share this application process and monitor.
+  // commit (not apply) makes successful Start durable before its native acknowledgement.
+  @Synchronized internal fun readGuardianKeys(context: Context, migrate: Boolean = false): GuardianKeyRegistry? {
+    val prefs = get(context)
+    var registry = prefs.getString(KEY_CONCURRENT_KEYS, null)?.let { raw ->
+      val values = JSONArray(raw)
+      GuardianKeyRegistry((0 until values.length()).map { GuardianScopedKey.parse(jsonMap(values.getJSONObject(it).toString())) })
+    }
+    if (migrate) {
+      registry = registry ?: GuardianKeyRegistry()
+      val end = prefs.getLong(KEY_SUPPRESSION_UNTIL, 0L)
+      if (end > System.currentTimeMillis()) {
+        val scope = if (prefs.contains(KEY_KEY_SCOPE)) GuardianKeyScope.parse(jsonMap(prefs.getString(KEY_KEY_SCOPE, "")!!))
+          else prefs.getString(KEY_SUPPRESSION_TARGET_PACKAGE, null).let { GuardianKeyScope(it == null, it?.let(::setOf) ?: emptySet()) }
+        val legacy = GuardianScopedKey("legacy-$end", scope, 0L, end)
+        if (registry.keys.none { it.id == legacy.id }) registry = GuardianKeyRegistry(registry.keys + legacy)
+      }
+    }
+    return registry
+  }
+  @Synchronized internal fun writeGuardianKeys(context: Context, registry: GuardianKeyRegistry) {
+    val prefs = get(context)
+    val old = prefs.getString(KEY_CONCURRENT_KEYS, null)
+    val oldScope = prefs.getString(KEY_KEY_SCOPE, null)
+    val oldEnd = prefs.getLong(KEY_SUPPRESSION_UNTIL, 0L)
+    val oldTarget = prefs.getString(KEY_SUPPRESSION_TARGET_PACKAGE, null)
+    if (!prefs.edit().putString(KEY_CONCURRENT_KEYS, JSONArray(registry.keys.map { JSONObject(it.persisted()) }).toString())
+        .remove(KEY_KEY_SCOPE).remove(KEY_SUPPRESSION_UNTIL).remove(KEY_SUPPRESSION_TARGET_PACKAGE).commit()) {
+      prefs.edit().putString(KEY_CONCURRENT_KEYS, old).putString(KEY_KEY_SCOPE, oldScope)
+        .putLong(KEY_SUPPRESSION_UNTIL, oldEnd).putString(KEY_SUPPRESSION_TARGET_PACKAGE, oldTarget).commit()
+      error("Guardian keys persistence failed")
+    }
+  }
+  @Synchronized internal fun validateGuardianKey(context: Context, raw: Map<String, Any?>): GuardianKeyRegistry {
+    val previous = readGuardianKeys(context, true)!!
+    return previous.adding(GuardianScopedKey.parse(raw), System.currentTimeMillis())
+  }
+  @Synchronized internal fun startGuardianKey(context: Context, raw: Map<String, Any?>): GuardianKeyRegistry {
+    val next = validateGuardianKey(context, raw)
+    writeGuardianKeys(context, next)
+    return next
+  }
+  @Synchronized internal fun closeGuardianKey(context: Context, id: String): GuardianKeyRegistry {
+    val next = readGuardianKeys(context, true)!!.closing(id)
+    writeGuardianKeys(context, next)
+    return next
+  }
+  internal fun hasGuardianKeys(context: Context) = get(context).contains(KEY_CONCURRENT_KEYS)
+  private fun activeRegistry(context: Context): GuardianKeyRegistry? {
+    val current = try { readGuardianKeys(context) } catch (_: Exception) { return GuardianKeyRegistry() }
+    // An old API remains a single opening until a new API explicitly migrates it.
+    if (get(context).getLong(KEY_SUPPRESSION_UNTIL, 0L) > System.currentTimeMillis() && current?.live(System.currentTimeMillis()).isNullOrEmpty()) return null
+    return current
+  }
+  internal fun nextGuardianKeyExpiry(context: Context): Long =
+    activeRegistry(context)?.live(System.currentTimeMillis())?.firstOrNull()?.untilMillis ?: getSuppressionUntil(context)
+  @Synchronized internal fun prepareLegacyGuardianKey(context: Context) {
+    if (readGuardianKeys(context)?.live(System.currentTimeMillis())?.isNotEmpty() == true) throw GuardianKeyFailure("ERR_GUARDIAN_KEY_CONFLICT")
+  }
+
+  @Synchronized internal fun setScopedSuppression(context: Context, until: Long, scope: GuardianKeyScope) {
+    prepareLegacyGuardianKey(context)
     val raw = scope.asMap() + ("untilMillis" to until)
     val prefs = get(context)
     val previous = prefs.getString(KEY_KEY_SCOPE, null)
@@ -205,6 +267,7 @@ object AppBlockerPrefs {
   internal fun hasExplicitKeyScope(context: Context): Boolean = get(context).contains(KEY_KEY_SCOPE)
 
   internal fun getKeyScope(context: Context): GuardianKeyScope? {
+    activeRegistry(context)?.let { return it.scope(System.currentTimeMillis()) }
     val prefs = get(context)
     if (prefs.contains(KEY_KEY_SCOPE)) {
       // An explicit but malformed value must never mean full opening.
@@ -234,10 +297,12 @@ object AppBlockerPrefs {
 
   /** #572: the escape-ticket end instant (epoch millis); 0 means no ticket. */
   fun getSuppressionUntil(context: Context): Long =
-    get(context).getLong(KEY_SUPPRESSION_UNTIL, 0L)
+    activeRegistry(context)?.live(System.currentTimeMillis())?.maxOfOrNull { it.untilMillis }
+      ?: if (activeRegistry(context) != null) 0L else get(context).getLong(KEY_SUPPRESSION_UNTIL, 0L)
 
   /** #572: plant/clear the escape-ticket end instant. Any value <= 0 clears it (no ticket). */
-  fun setSuppressionUntil(context: Context, untilMillis: Long) {
+  @Synchronized fun setSuppressionUntil(context: Context, untilMillis: Long) {
+    prepareLegacyGuardianKey(context)
     get(context).edit()
       .remove(KEY_KEY_SCOPE)
       .putLong(KEY_SUPPRESSION_UNTIL, if (untilMillis > 0L) untilMillis else 0L)
@@ -245,7 +310,8 @@ object AppBlockerPrefs {
   }
 
   /** #572: drop the escape ticket. #598: and its targeted package, so a later ticket starts clean. */
-  fun clearSuppression(context: Context) {
+  @Synchronized fun clearSuppression(context: Context) {
+    readGuardianKeys(context)?.let { registry -> writeGuardianKeys(context, GuardianKeyRegistry(registry.keys.map { it.copy(closed = true) })) }
     get(context).edit()
       .remove(KEY_KEY_SCOPE)
       .remove(KEY_SUPPRESSION_UNTIL)

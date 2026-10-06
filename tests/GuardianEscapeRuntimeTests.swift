@@ -1,6 +1,7 @@
 import Foundation
 
 // In-memory adapters for OS-owned stores; real reapply/schedule method bodies are injected by runner.
+final class TestLock { func unlock() {} }
 final class TestStore {
   var allowed: Set<String> = ["stale-allowed"]
   var apps: Set<String> = ["stale-direct"]
@@ -34,6 +35,7 @@ final class HostFixture {
   let blockSatisfiedKey = "gateSatisfied", focusBlockSatisfiedKey = "focusSatisfied", scheduleShieldVariantKey = "variant"
   let appGroupIdentifier = "fixture"
   init(_ defaults: UserDefaults) { sharedDefaults = defaults; userDefaults = defaults }
+  func lockGuardianKeys() throws -> TestLock { TestLock() }
   func clearImmediateStore(_ target: TestStore) { target.allowed = []; target.apps = []; target.web = [] }
   func clearScheduleShield() { clearImmediateStore(scheduleStore) }
   func parseBlockConfig(_ raw: [String: Any]) throws -> TestConfig {

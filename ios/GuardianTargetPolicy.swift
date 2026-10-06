@@ -68,6 +68,7 @@ enum GuardianTargetRuntime {
   static let untilKey = "appBlocker.suppressionUntil.v1"
   static let legacyTargetKey = "appBlocker.suppressionTargetToken.v1"
   static func until(_ defaults: UserDefaults) -> Double {
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) { return registry.live(Date().timeIntervalSince1970 * 1000).map(\.untilMillis).max() ?? 0 }
     if defaults.object(forKey: scopeKey) != nil {
       return (defaults.dictionary(forKey: scopeKey)?["untilMillis"] as? NSNumber)?.doubleValue ?? 0
     }
@@ -75,13 +76,15 @@ enum GuardianTargetRuntime {
   }
   static func active(_ defaults: UserDefaults) -> Bool { until(defaults) > Date().timeIntervalSince1970 * 1000 }
   static func full(_ defaults: UserDefaults) -> Bool {
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) { return registry.live(Date().timeIntervalSince1970 * 1000).contains { $0.scope.full } }
     guard active(defaults) else { return false }
     if let raw = defaults.dictionary(forKey: scopeKey) { return (try? GuardianOpeningScope(raw).full) == true }
     if defaults.object(forKey: scopeKey) != nil { return false }
     return defaults.string(forKey: legacyTargetKey) == nil
   }
   static func allowLayer(_ defaults: UserDefaults) -> Bool {
-    GuardianOpeningScope.live(defaults.dictionary(forKey: scopeKey),
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) { return registry.live(Date().timeIntervalSince1970 * 1000).contains { $0.scope.allowLayer } }
+    return GuardianOpeningScope.live(defaults.dictionary(forKey: scopeKey),
       nowMillis: Date().timeIntervalSince1970 * 1000)?.allowLayer == true
   }
   static func app(_ token: String, group: String) throws -> ApplicationToken {
@@ -97,6 +100,12 @@ enum GuardianTargetRuntime {
     return value
   }
   static func opened(_ defaults: UserDefaults, group: String) -> (Set<ApplicationToken>, Set<WebDomainToken>) {
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) {
+      let keys = registry.live(Date().timeIntervalSince1970 * 1000)
+      guard let apps = try? Set(keys.flatMap { $0.scope.apps }.map { try app($0, group: group) }),
+            let webs = try? Set(keys.flatMap { $0.scope.webDomains }.map { try web($0) }) else { return ([], []) }
+      return (apps, webs)
+    }
     guard active(defaults) else { return ([], []) }
     if let raw = defaults.dictionary(forKey: scopeKey) {
       guard let scope = try? GuardianOpeningScope(raw), !scope.full,
@@ -147,6 +156,20 @@ enum GuardianTargetRuntime {
       for token in try tokens(config["allowedItems"] ?? [], type: "app") { allowed.insert(try app(token, group: group)) }
     }
     if !allowed.isEmpty && allowed.union(opened).count > 50 { throw GuardianOpeningScope.Failure.capacity }
+  }
+  static func validateRegistry(_ registry: GuardianKeyRegistry, configs: [[String: Any]], group: String, now: Double) throws {
+    for key in registry.live(now) {
+      _ = try key.scope.apps.map { try app($0, group: group) }
+      _ = try key.scope.webDomains.map { try web($0) }
+    }
+    // Every persisted layer may become active before a later key expires.
+    for config in configs {
+      let dual = config["targetPolicy"] as? String == "dual-v1"
+      if dual { try validate(config, group: group) }
+      guard dual ? config["allowEnabled"] as? Bool == true : config["mode"] as? String == "allow" else { continue }
+      let allowed = try Set(tokens(config["allowedItems"] ?? [], type: "app").map { try app($0, group: group) })
+      try registry.validateCapacity(allowed: allowed, decode: { try app($0, group: group) }, now: now)
+    }
   }
   static func render(_ config: [String: Any], store: ManagedSettingsStore, layer: String,
                      defaults: UserDefaults, group: String) throws {

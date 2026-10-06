@@ -8,6 +8,8 @@ import React from "react";
 
 import type {
   GuardianKeyScope,
+  GuardianScopedKey,
+  GuardianScopedKeys,
   GuardianTargetConfiguration,
   PermissionStatus,
   AndroidPermissions,
@@ -30,6 +32,8 @@ import type {
 
 export type {
   GuardianKeyScope,
+  GuardianScopedKey,
+  GuardianScopedKeys,
   GuardianTargetConfiguration,
   PermissionStatus,
   AndroidPermissions,
@@ -700,4 +704,23 @@ export function FamilyActivityPickerView({
     ...(clearTrigger !== undefined ? { clearTrigger } : {}),
     style: [{ minHeight: 400 }, style],
   });
+}
+
+export function getGuardianConcurrentKeyPolicy(): "independent-v1" | null {
+  return NativeModule.guardianConcurrentKeyPolicy === "independent-v1" ? "independent-v1" : null;
+}
+function requireConcurrentKeys(): void {
+  if (!getGuardianConcurrentKeyPolicy()) throw new Error("ERR_GUARDIAN_KEY_UNSUPPORTED");
+}
+export async function validateGuardianScopedKey(input: GuardianScopedKey): Promise<void> {
+  requireConcurrentKeys(); await NativeModule.validateGuardianScopedKey(input);
+}
+export async function startGuardianScopedKey(input: GuardianScopedKey): Promise<GuardianScopedKeys> {
+  requireConcurrentKeys(); return NativeModule.startGuardianScopedKey(input);
+}
+export async function closeGuardianScopedKey(id: string): Promise<GuardianScopedKeys> {
+  requireConcurrentKeys(); return NativeModule.closeGuardianScopedKey(id);
+}
+export async function getGuardianScopedKeys(): Promise<GuardianScopedKeys> {
+  requireConcurrentKeys(); return NativeModule.getGuardianScopedKeys();
 }

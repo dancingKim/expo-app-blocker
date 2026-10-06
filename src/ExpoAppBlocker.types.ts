@@ -413,3 +413,7 @@ export interface PluginConfig {
     scheme?: string;
   };
 }
+
+/** Immutable native opening. Scope is frozen before explicit Start. */
+export type GuardianScopedKey = { id: string; scope: GuardianKeyScope; startedAtMillis: number; untilMillis: number };
+export type GuardianScopedKeys = { keys: GuardianScopedKey[]; nextExpiryMillis: number };

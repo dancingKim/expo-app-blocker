@@ -300,6 +300,7 @@ function withAppBlockerIOS(config, pluginConfig) {
         ? plist.parse(fs.readFileSync(infoPath, "utf8"))
         : getTargetInfoPlistForType(type);
       info.ExpoGuardianAllowLayerScopePolicy = "allow-layer-v1";
+      info.ExpoGuardianConcurrentKeyPolicy = "independent-v1";
       fs.writeFileSync(infoPath, plist.build(info));
     }
 
