@@ -25,3 +25,14 @@ with tempfile.TemporaryDirectory(prefix='guardian-escape-tests-') as directory:
     (output / 'Fixture.swift').write_text(fixture)
     subprocess.run(['xcrun', 'swiftc', str(root / 'ios/GuardianTargetPolicy.swift'), str(root / 'targets/ShieldAction/GuardianEscapeScope.swift'), str(output / 'Fixture.swift'), '-o', str(output / 'tests')], check=True)
     subprocess.run([str(output / 'tests')], check=True)
+
+action = (root / 'targets/ShieldAction/ShieldActionExtension.swift').read_text()
+start = action.index('  private func recordEscapeTargetToken(')
+end = action.index('\n  }', start) + len('\n  }')
+origin = action[start:end].replace('private func', 'func', 1)
+fixture = (root / 'tests/GuardianEscapeOriginTests.swift').read_text().replace('// PRODUCTION_ORIGIN', origin)
+with tempfile.TemporaryDirectory(prefix='guardian-origin-tests-') as directory:
+    output = Path(directory)
+    (output / 'Fixture.swift').write_text(fixture)
+    subprocess.run(['xcrun', 'swiftc', str(root / 'ios/GuardianTargetPolicy.swift'), str(root / 'targets/ShieldAction/GuardianEscapeScope.swift'), str(output / 'Fixture.swift'), '-o', str(output / 'tests')], check=True)
+    subprocess.run([str(output / 'tests')], check=True)

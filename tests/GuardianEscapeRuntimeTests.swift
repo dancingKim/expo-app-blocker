@@ -118,12 +118,6 @@ final class HostFixture {
     defaults.removeObject(forKey: "scope")
     try host.reapplyPersistedLayers()
     for store in [host.store, host.focusStore, host.scheduleStore] { precondition(store.allowed == ["safe"] && store.apps == ["direct"]) }
-    let old: [String: Any] = ["token":"direct", "ts":1000]
-    let nilOrigin: [String: Any] = ["tokenNil":true, "ts":2000]
-    precondition(GuardianEscapeScope.lastShielded(file: nilOrigin, mirror: old) == nil)
-    precondition(GuardianEscapeScope.lastShielded(file: old, mirror: ["ts":2000]) == nil)
-    precondition(GuardianEscapeScope.lastShielded(file: ["token":"kakao", "ts":2000], mirror: old)?.encoded == "kakao")
-    precondition(GuardianEscapeScope.lastShielded(file: nil, mirror: old)?.encoded == "direct")
     print("Guardian escape origin and production Start layer boundary: passed")
   }
 }

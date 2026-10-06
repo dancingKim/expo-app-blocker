@@ -37,16 +37,7 @@ class ShieldActionExtension: ShieldActionDelegate {
   // this token mirror remains only for legacy per-app consumers.
   private let escapeTargetTokenKey = "appBlocker.escapeTargetToken.v1"
   private let escapeTargetTokenTsKey = "appBlocker.escapeTargetTokenTs.v1"
-  // #598: the guardian locks by category (`.all(except:)`), so escape almost always arrives on the
-  // category overload with NO ApplicationToken. ShieldConfiguration records the app it last rendered a
-  // shield for here; we read the freshest one as the target. See the ShieldConfiguration comment for
-  // the caching / background-render caveat. Missing identity never widens a typed scope to full.
-  private let lastShieldedTokenKey = "appBlocker.lastShieldedToken.v1"
-  private let lastShieldedTokenTsKey = "appBlocker.lastShieldedTokenTs.v1"
-  private let lastShieldedTokenMaxAgeMs: Double = 5 * 60 * 1000
-  // #598 durability: ShieldConfiguration writes the last-shielded app to this App Group container file
-  // (its UserDefaults write is reaped before commit). Read it file-first here, UserDefaults fallback.
-  private let lastShieldedFileName = "lastShielded.json"
+  // Category callbacks have no app identity. Cached configuration tokens cannot identify them.
   // Diagnostics (#583): the shield → app landing is a 2-tap flow on iOS (the OS
   // gives no API to open the container app from a ShieldAction, so the primary
   // button posts a local notification whose tap deep-links home). When that
@@ -277,14 +268,8 @@ class ShieldActionExtension: ShieldActionDelegate {
       }
       return
     }
-    var token = application
-    var source = "handler"
-    if token == nil, let last = readLastShieldedToken(), last.ts > 0,
-       (0...lastShieldedTokenMaxAgeMs).contains(nowMs - last.ts),
-       let data = Data(base64Encoded: last.encoded) {
-      token = try? JSONDecoder().decode(ApplicationToken.self, from: data)
-      source = "lastShielded"
-    }
+    // Cached ShieldConfiguration records are not proof of this callback's app identity.
+    let token = application
     let stores = [ManagedSettingsStore(),
       ManagedSettingsStore(named: .init("appBlocker.focus")),
       ManagedSettingsStore(named: .init("appBlocker.schedule"))]
@@ -310,23 +295,8 @@ class ShieldActionExtension: ShieldActionDelegate {
       defaults.set(encoded, forKey: escapeTargetTokenKey)
       defaults.set(Int64(nowMs), forKey: escapeTargetTokenTsKey)
     }
-    writeProbe(["escapeTargetSource": candidate == nil ? "unresolved" : source,
+    writeProbe(["escapeTargetSource": candidate == nil ? "unresolved" : "handler",
                 "escapeScopeKind": candidate?["kind"] as? String ?? "unresolved"])
-  }
-
-  /// #598: read the last-shielded app record, file first (durable across ShieldConfiguration's instant
-  /// teardown) then the legacy UserDefaults mirror. Returns (base64 token, epoch-ms timestamp) or nil.
-  private func readLastShieldedToken() -> (encoded: String, ts: Double)? {
-    let file = appGroupFileURL(lastShieldedFileName)
-      .flatMap { try? Data(contentsOf: $0) }
-      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-    var mirror: [String: Any]?
-    if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
-      defaults.synchronize()
-      mirror = ["token": defaults.string(forKey: lastShieldedTokenKey) ?? "",
-                "ts": defaults.object(forKey: lastShieldedTokenTsKey) ?? 0]
-    }
-    return GuardianEscapeScope.lastShielded(file: file, mirror: mirror)
   }
 
   private func appGroupFileURL(_ name: String) -> URL? {
