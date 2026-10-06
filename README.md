@@ -805,3 +805,43 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup inst
 ## License
 
 MIT
+
+### Independent Guardian keys
+
+A rebuilt host and extensions expose `getGuardianConcurrentKeyPolicy() ===
+"independent-v1"`. Old binaries return `null`; keep the existing single-key path.
+
+- `validateGuardianScopedKey(key): Promise<void>` preflights without changing an opening.
+- `startGuardianScopedKey(key)`, `closeGuardianScopedKey(id)`, and
+  `getGuardianScopedKeys()` return `Promise<{keys, nextExpiryMillis}>`.
+- A key is `{id, scope, startedAtMillis, untilMillis}` with integer epoch milliseconds.
+  Scope is the existing `GuardianKeyScope`; each key retains its original deadline.
+- Retry the exact same ID, scope, start and deadline after response loss. Different
+  content is rejected. Closed IDs remain tombstoned through their original expiry.
+- `ERR_GUARDIAN_KEY_INVALID`, `ERR_GUARDIAN_KEY_CONFLICT`, and
+  `ERR_GUARDIAN_KEY_CLOSED` are pre-application refusals. Treat
+  `ERR_GUARDIAN_KEY_UNCERTAIN` as unknown: read back/retry the same immutable key,
+  never create a replacement window merely because its response was lost.
+
+The read result includes only live keys and the earliest deadline, or zero when
+none remain. An old native opening migrates to `legacy-<untilMillis>` with
+`startedAtMillis: 0`; its scope comes from persisted native state. No historical
+start time is invented. Legacy APIs retain their single-key behavior when no
+concurrent key is live; they cannot overwrite live concurrent keys. Global
+`endSuppression` remains the account-teardown path; individual closing uses the
+new ID-specific API.
+
+iOS composes app/domain unions and allow-layer scopes under an App Group file
+lock shared with Monitor. Every expiry re-evaluates the latest settings and
+schedules the next expiry. The 50-app exception limit is checked at Start and
+settings changes even while an allow-layer/full key masks the allow layer: that
+key can close early, so masking must not create an unclosable remaining state.
+Android serializes registry persistence and service evaluation, acknowledges only
+after evaluation, and rearms the earliest alarm. Existing OS alarm/DeviceActivity
+precision limits still apply; automated tests do not establish physical-device
+wake timing.
+
+Native regressions: `python3 tests/run-guardian-policy-tests.py`,
+`python3 tests/run-guardian-escape-tests.py`, and
+`python3 tests/run-guardian-concurrent-tests.py` (Swift and cached Kotlin compiler;
+set `JAVA_HOME` to the installed JDK when needed).

@@ -30,6 +30,27 @@ class ExpoAppBlockerModule : Module() {
   private val context: Context
     get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
 
+  private fun guardianKeyCommand(promise: Promise, raw: Map<String, Any?>?, closeId: String?) {
+    val handler = Handler(Looper.getMainLooper())
+    handler.post {
+      var settled = false
+      val timeout = Runnable { if (!settled) { settled = true; promise.reject("ERR_GUARDIAN_KEY_UNCERTAIN", "Blocker service did not acknowledge key", null) } }
+      val receiver = object : ResultReceiver(handler) {
+        override fun onReceiveResult(resultCode: Int, data: Bundle?) {
+          if (settled) return
+          settled = true; handler.removeCallbacks(timeout)
+          if (resultCode == 0) {
+            try { promise.resolve(AppBlockerPrefs.readGuardianKeys(context, true)!!.snapshot(System.currentTimeMillis())) }
+            catch (_: Exception) { promise.reject("ERR_GUARDIAN_KEY_UNCERTAIN", "Guardian key state unavailable", null) }
+          } else promise.reject(data?.getString("code") ?: "ERR_GUARDIAN_KEY_UNCERTAIN", "Guardian key could not be applied", null)
+        }
+      }
+      handler.postDelayed(timeout, 5000L)
+      try { AppBlockerService.guardianKeyCommand(context, raw, closeId, receiver) }
+      catch (_: Exception) { settled = true; handler.removeCallbacks(timeout); promise.reject("ERR_GUARDIAN_KEY_UNCERTAIN", "Blocker service unavailable", null) }
+    }
+  }
+
   override fun definition() = ModuleDefinition {
     Name("ExpoAppBlocker")
 
@@ -37,7 +58,7 @@ class ExpoAppBlockerModule : Module() {
     // whenever this native module is present. Mirrors iOS's guardianExtensionAttached for the JS
     // exposure gate (#541).
     Constants("guardianExtensionAttached" to true, "guardianSchedulePolicy" to "continuous-v1",
-      "guardianTargetPolicy" to "dual-v1", "guardianKeyScopePolicy" to "targets-v1")
+      "guardianConcurrentKeyPolicy" to "independent-v1", "guardianTargetPolicy" to "dual-v1", "guardianKeyScopePolicy" to "targets-v1")
 
     OnCreate {
       AppBlockerService.start(context)
@@ -133,6 +154,20 @@ class ExpoAppBlockerModule : Module() {
         AppBlockerService.start(context)
       }
       mapOf("active" to true, "untilMillis" to untilMillis, "remainingMs" to (untilMillis.toLong() - System.currentTimeMillis()).coerceAtLeast(0L))
+    }
+
+    AsyncFunction("validateGuardianScopedKey") { raw: Map<String, Any?>, promise: Promise ->
+      try { AppBlockerPrefs.validateGuardianKey(context, raw); promise.resolve(null) }
+      catch (error: Exception) { promise.reject((error as? GuardianKeyFailure)?.code ?: "ERR_GUARDIAN_KEY_INVALID", "Guardian key unavailable", null) }
+    }
+    AsyncFunction("startGuardianScopedKey") { raw: Map<String, Any?>, promise: Promise ->
+      guardianKeyCommand(promise, raw, null)
+    }
+    AsyncFunction("closeGuardianScopedKey") { id: String, promise: Promise ->
+      guardianKeyCommand(promise, null, id)
+    }
+    AsyncFunction("getGuardianScopedKeys") { promise: Promise ->
+      guardianKeyCommand(promise, null, null)
     }
 
     Function("setBlockedApps") { packageNames: List<String> ->

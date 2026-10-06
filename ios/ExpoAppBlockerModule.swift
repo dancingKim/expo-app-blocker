@@ -153,6 +153,7 @@ public class ExpoAppBlockerModule: Module {
       "guardianSchedulePolicy": self.hasGuardianExtension() ? "continuous-v1" : "",
       "guardianTargetPolicy": self.hasGuardianExtension() ? "dual-v1" : "",
       "guardianKeyScopePolicy": self.hasGuardianExtension() ? "targets-v1" : "",
+      "guardianConcurrentKeyPolicy": self.hasGuardianConcurrentKeys() ? "independent-v1" : "",
       "guardianAllowLayerScopePolicy": self.hasGuardianAllowLayerScope() ? "allow-layer-v1" : ""
     ])
 
@@ -207,6 +208,7 @@ public class ExpoAppBlockerModule: Module {
           return
         }
         do {
+          let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
           let remaps = try GuardianTokenRecovery.refresh(
             tokens + self.persistedRecoveryTokens(), group: self.appGroupIdentifier, persist: true)
           self.isReapplyingRecoveredTokens = true
@@ -224,6 +226,7 @@ public class ExpoAppBlockerModule: Module {
     AsyncFunction("refreshGuardianAllowedApps") { (items: [[String: Any]], pendingTokens: [String], promise: Promise) in
       self.stateQueue.async {
         do {
+          let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
           let tokens = items.compactMap { $0["token"] as? String }
           let remaps = GuardianTokenRecovery.supported
             ? try GuardianTokenRecovery.refresh(tokens + pendingTokens + self.persistedRecoveryTokens(), group: self.appGroupIdentifier, persist: true)
@@ -328,6 +331,7 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         do {
           self.ensureLoadedPersistedConfig()
+          let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
           try self.validateTargetConfiguration(config)
           let blockConfig = try self.parseBlockConfig(config)
           // Focus-store split: `guardType: "focus"` arms the focus slot/store; absent (old JS
@@ -382,6 +386,7 @@ public class ExpoAppBlockerModule: Module {
     // re-arms a gate whose session already ended (satisfied) — it only restores the schedule.
     Function("clearAllBlocks") {
       self.stateQueue.async {
+        guard let keyLock = try? self.lockGuardianKeys() else { return }; defer { keyLock.unlock() }
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
         // #535: drop any pending wall-clock expiry — BOTH layers' one-shots (legacy zero-arg
@@ -420,6 +425,7 @@ public class ExpoAppBlockerModule: Module {
     // which belongs to the gate layer.
     Function("clearBlocksForGuardType") { (guardType: String) in
       self.stateQueue.async {
+        guard let keyLock = try? self.lockGuardianKeys() else { return }; defer { keyLock.unlock() }
         self.ensureLoadedPersistedConfig()
         if guardType == "focus" {
           self.cancelImmediateExpiryActivity(guardType: "focus")
@@ -614,6 +620,9 @@ public class ExpoAppBlockerModule: Module {
     // that lowers BOTH stores and is re-applied by the monitor at the expiry instant (kill-proof).
     AsyncFunction("suppressBlocks") { (untilMillis: Double, promise: Promise) in
       self.stateQueue.async {
+        guard let keyLock = try? self.lockGuardianKeys() else { promise.reject("ERR_GUARDIAN_KEY_INVALID", "Guardian key unavailable"); return }
+        defer { keyLock.unlock() }
+        do { try self.prepareLegacyGuardianKey() } catch { self.rejectGuardianKey(promise, error); return }
         self.ensureLoadedPersistedConfig()
         let nowMillis = Date().timeIntervalSince1970 * 1000.0
         // Already-expired / absent target = no-op: never lower a shield without a live window.
@@ -688,6 +697,8 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         var persistedThisAttempt = false
         do {
+          let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
+          try self.prepareLegacyGuardianKey()
           self.ensureLoadedPersistedConfig()
           let defaults = self.sharedDefaults ?? self.userDefaults
           let scope = try GuardianOpeningScope(raw)
@@ -730,6 +741,48 @@ public class ExpoAppBlockerModule: Module {
       }
     }
 
+    AsyncFunction("validateGuardianScopedKey") { (raw: [String: Any], promise: Promise) in
+      self.stateQueue.async {
+        do {
+          let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
+          _ = try self.proposedGuardianKey(raw)
+          promise.resolve(nil)
+        } catch { self.rejectGuardianKey(promise, error) }
+      }
+    }
+    AsyncFunction("startGuardianScopedKey") { (raw: [String: Any], promise: Promise) in
+      self.stateQueue.async {
+        do {
+          let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
+          let (previous, next) = try self.proposedGuardianKey(raw)
+          try self.commitGuardianKeys(next, previous: previous)
+          promise.resolve(next.snapshot(Date().timeIntervalSince1970 * 1000))
+        } catch { self.rejectGuardianKey(promise, error) }
+      }
+    }
+    AsyncFunction("closeGuardianScopedKey") { (id: String, promise: Promise) in
+      self.stateQueue.async {
+        do {
+          let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
+          let previous = try self.loadGuardianKeys()
+          let next = previous.closing(id)
+          try self.commitGuardianKeys(next, previous: previous)
+          promise.resolve(next.snapshot(Date().timeIntervalSince1970 * 1000))
+        } catch { self.rejectGuardianKey(promise, error) }
+      }
+    }
+    AsyncFunction("getGuardianScopedKeys") { (promise: Promise) in
+      self.stateQueue.async {
+        do {
+          let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
+          let current = try self.loadGuardianKeys()
+          try self.reapplyPersistedLayers()
+          try GuardianConcurrentStorage.rearm(current, now: Date().timeIntervalSince1970 * 1000)
+          promise.resolve(current.snapshot(Date().timeIntervalSince1970 * 1000))
+        } catch { self.rejectGuardianKey(promise, error) }
+      }
+    }
+
     // Explicit user early close. Restore the same layers as natural expiry before acknowledging.
     AsyncFunction("endSuppression") { (promise: Promise) in
       self.stateQueue.async {
@@ -753,6 +806,7 @@ public class ExpoAppBlockerModule: Module {
     AsyncFunction("setScheduleConfiguration") { (config: [String: Any], promise: Promise) in
       self.stateQueue.async {
         do {
+          let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
           try self.validateTargetConfiguration(config)
           self.applyScheduleConfiguration(config)
           self.persistScheduleConfiguration(config)
@@ -801,6 +855,66 @@ public class ExpoAppBlockerModule: Module {
       policies[name] = policy
     }
     return GuardianOpeningScope.supportedExtensions(policies)
+  }
+
+  private func hasGuardianConcurrentKeys() -> Bool {
+    guard hasGuardianAllowLayerScope(), let directory = Bundle.main.builtInPlugInsURL,
+          let contents = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return false }
+    return ["ShieldAction", "DeviceActivityMonitor"].allSatisfy { name in
+      guard let url = contents.first(where: { $0.pathExtension == "appex" && $0.lastPathComponent.contains(name) }) else { return false }
+      return Bundle(url: url)?.object(forInfoDictionaryKey: "ExpoGuardianConcurrentKeyPolicy") as? String == "independent-v1"
+    }
+  }
+  private func lockGuardianKeys() throws -> GuardianKeyFileLock {
+    let lock = try GuardianConcurrentStorage.lock(appGroupIdentifier)
+    do {
+      if let defaults = sharedDefaults {
+        defaults.synchronize()
+        _ = try GuardianConcurrentStorage.read(defaults, group: appGroupIdentifier)
+      }
+      return lock
+    } catch { lock.unlock(); throw error }
+  }
+  private func loadGuardianKeys(persistMigration: Bool = true) throws -> GuardianKeyRegistry {
+    guard hasGuardianConcurrentKeys(), let defaults = sharedDefaults else { throw GuardianKeyFailure.invalid }
+    let current = try GuardianConcurrentStorage.load(defaults, group: appGroupIdentifier, now: Date().timeIntervalSince1970 * 1000, persistMigration: persistMigration)
+    if persistMigration { for key in [GuardianTargetRuntime.untilKey, GuardianTargetRuntime.scopeKey, GuardianTargetRuntime.legacyTargetKey] { userDefaults.removeObject(forKey: key) } }
+    return current
+  }
+  private func proposedGuardianKey(_ raw: [String: Any]) throws -> (GuardianKeyRegistry, GuardianKeyRegistry) {
+    let previous = try loadGuardianKeys(persistMigration: false)
+    let now = Date().timeIntervalSince1970 * 1000
+    do {
+      let next = try previous.adding(GuardianScopedKey(raw), now: now)
+      let configs = [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey].compactMap { sharedDefaults?.dictionary(forKey: $0) }
+      try GuardianTargetRuntime.validateRegistry(next, configs: configs, group: appGroupIdentifier, now: now)
+      return (previous, next)
+    } catch is GuardianOpeningScope.Failure { throw GuardianKeyFailure.invalid }
+  }
+  private func commitGuardianKeys(_ next: GuardianKeyRegistry, previous: GuardianKeyRegistry) throws {
+    guard let defaults = sharedDefaults else { throw GuardianKeyFailure.invalid }
+    do {
+      try GuardianConcurrentStorage.write(next, defaults: defaults, group: appGroupIdentifier)
+      for key in [GuardianTargetRuntime.untilKey, GuardianTargetRuntime.scopeKey, GuardianTargetRuntime.legacyTargetKey] {
+        defaults.removeObject(forKey: key); userDefaults.removeObject(forKey: key)
+      }
+      try reapplyPersistedLayers()
+      try GuardianConcurrentStorage.rearm(next, now: Date().timeIntervalSince1970 * 1000)
+    } catch {
+      try? GuardianConcurrentStorage.write(previous, defaults: defaults, group: appGroupIdentifier)
+      try? reapplyPersistedLayers()
+      try? GuardianConcurrentStorage.rearm(previous, now: Date().timeIntervalSince1970 * 1000)
+      throw GuardianKeyApplyFailure()
+    }
+  }
+  private func prepareLegacyGuardianKey() throws {
+    guard let defaults = sharedDefaults, let registry = try GuardianConcurrentStorage.read(defaults, group: appGroupIdentifier) else { return }
+    guard registry.live(Date().timeIntervalSince1970 * 1000).isEmpty else { throw GuardianKeyFailure.conflict }
+    // Keep tombstones in the file; a v1 ticket is imported only when a new key API is used.
+    defaults.removeObject(forKey: GuardianConcurrentStorage.key)
+  }
+  private func rejectGuardianKey(_ promise: Promise, _ error: Error) {
+    promise.reject((error as? GuardianKeyFailure)?.rawValue ?? "ERR_GUARDIAN_KEY_UNCERTAIN", "Guardian key could not be applied")
   }
 
   // MARK: - Authorization
@@ -940,12 +1054,14 @@ public class ExpoAppBlockerModule: Module {
   }
 
   private func replacePersistedAllowedItems(_ items: [[String: Any]]) throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
     guard let defaults = sharedDefaults else { return }
     let proposed = [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey].compactMap { key -> [String: Any]? in
       guard var config = defaults.dictionary(forKey: key) else { return nil }
       if config["targetPolicy"] as? String == "dual-v1" || config["mode"] as? String == "allow" { config["allowedItems"] = items }
       return config
     }
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) { try GuardianTargetRuntime.validateRegistry(registry, configs: proposed, group: appGroupIdentifier, now: Date().timeIntervalSince1970 * 1000) }
     for config in proposed where config["targetPolicy"] as? String == "dual-v1" { try GuardianTargetRuntime.validate(config, group: appGroupIdentifier) }
     if GuardianTargetRuntime.active(defaults), let raw = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey) {
       try GuardianTargetRuntime.validateOpening(GuardianOpeningScope(raw), configs: proposed, group: appGroupIdentifier)
@@ -990,9 +1106,11 @@ public class ExpoAppBlockerModule: Module {
     for key in [GuardianTargetRuntime.scopeKey, GuardianTargetRuntime.candidateKey] {
       tokens += defaults.dictionary(forKey: key)?["apps"] as? [String] ?? []
     }
+    tokens += GuardianConcurrentStorage.mirrored(defaults)?.keys.flatMap { $0.scope.apps } ?? []
     return tokens
   }
   private func reapplyPersistedLayers() throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
     // Re-read extension-owned expiry/satisfaction; never restore stale host snapshots.
     guard let defaults = sharedDefaults else { return }
     didLoadPersistedConfig = true
@@ -1021,6 +1139,12 @@ public class ExpoAppBlockerModule: Module {
   private func validateTargetConfiguration(_ config: [String: Any]) throws {
     if config["targetPolicy"] as? String == "dual-v1" { try GuardianTargetRuntime.validate(config, group: appGroupIdentifier) }
     let defaults = sharedDefaults ?? userDefaults
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) {
+      let replacing = config["windows"] != nil ? scheduleConfigStorageKey
+        : config["guardType"] as? String == "focus" ? focusBlockConfigStorageKey : blockConfigStorageKey
+      let configs = [blockConfigStorageKey, focusBlockConfigStorageKey, scheduleConfigStorageKey].filter { $0 != replacing }.compactMap { defaults.dictionary(forKey: $0) } + [config]
+      try GuardianTargetRuntime.validateRegistry(registry, configs: configs, group: appGroupIdentifier, now: Date().timeIntervalSince1970 * 1000)
+    }
     if GuardianTargetRuntime.active(defaults), let raw = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey) {
       let replacing = config["windows"] != nil ? scheduleConfigStorageKey
         : config["guardType"] as? String == "focus" ? focusBlockConfigStorageKey : blockConfigStorageKey
@@ -1132,6 +1256,7 @@ public class ExpoAppBlockerModule: Module {
   }
 
   private func applyBlocks(_ config: BlockConfig) throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
     // Focus-store split: every shield write below targets the config's OWN layer store, so applying
     // or lowering one immediate layer never touches the other's shield.
     let target = immediateStore(for: config)
@@ -1463,6 +1588,7 @@ public class ExpoAppBlockerModule: Module {
   /// Drop the persisted ticket and cancel its expiry DeviceActivity. Called on block teardown so a
   /// dangling ticket / orphan activity can't outlive the blocks it suppressed.
   private func clearSuppressionState() {
+    try? clearGuardianKeys()
     sharedDefaults?.removeObject(forKey: GuardianTargetRuntime.scopeKey)
     userDefaults.removeObject(forKey: GuardianTargetRuntime.scopeKey)
     sharedDefaults?.removeObject(forKey: suppressionUntilKey)
@@ -1473,10 +1599,20 @@ public class ExpoAppBlockerModule: Module {
     cancelSuppressionExpiryActivity()
   }
 
+  private func clearGuardianKeys() throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
+    if let defaults = sharedDefaults, var registry = GuardianConcurrentStorage.mirrored(defaults) {
+      for index in registry.keys.indices { registry.keys[index].closed = true }
+      try GuardianConcurrentStorage.write(registry, defaults: defaults, group: appGroupIdentifier)
+    }
+  }
+
   private func endSuppressionInternal() throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
     // Load while the ticket is still active, avoiding a transient re-arm before satisfied
     // markers have been consumed. Never manufacture a missing immediate configuration.
     ensureLoadedPersistedConfig()
+    try clearGuardianKeys()
     clearSuppressionState()
     for guardType in ["gate", "focus"] {
       let focus = guardType == "focus"
@@ -1792,6 +1928,7 @@ public class ExpoAppBlockerModule: Module {
   ///   · no live ticket → drop the stale ticket state as before.
   /// Only the ticket's lifetime changes; the schedule teardown itself is byte-for-byte the same.
   private func clearScheduleConfigurationInternal() {
+    guard let keyLock = try? lockGuardianKeys() else { return }; defer { keyLock.unlock() }
     stopScheduleActivities()
     clearScheduleShield()
     if !isSuppressedInternal() {
@@ -1939,6 +2076,7 @@ public class ExpoAppBlockerModule: Module {
 
   /// Explicit Start must surface a failed render instead of only acknowledging its deadline.
   private func reevaluateScheduleShieldThrowing() throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
     // #598: a targeted ticket exempts one app but keeps the gap shield up for the rest; a full ticket
     // keeps the whole schedule shield down.
     let exempt = escapeExemptToken()

@@ -43,7 +43,7 @@ class AppBlockerService : Service() {
     }
   }
 
-  private fun tick() {
+  private fun tick() = synchronized(AppBlockerPrefs) {
     maybeExpireImmediateBlock()
     maybeExpireSuppression()
     getCurrentForegroundPackage()?.let { currentForeground = it }
@@ -131,7 +131,13 @@ class AppBlockerService : Service() {
 
   // #572: drop an escape ticket once its wall-clock instant has passed so the next tick re-blocks
   // (and a stale timestamp never lingers). Independent of the immediate-block expiry above.
+  private var nextGuardianExpiry = 0L
   private fun maybeExpireSuppression() {
+    if (AppBlockerPrefs.hasGuardianKeys(this)) {
+      val next = AppBlockerPrefs.nextGuardianKeyExpiry(this)
+      if (next != nextGuardianExpiry) { nextGuardianExpiry = next; AlarmReceiver.scheduleNext(this) }
+      return
+    }
     val until = AppBlockerPrefs.getSuppressionUntil(this)
     if (until != 0L && System.currentTimeMillis() >= until) {
       Log.d(TAG, "Escape ticket expired ($until) — clearing suppression")
@@ -303,6 +309,27 @@ class AppBlockerService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
+      ACTION_GUARDIAN_KEY -> {
+        @Suppress("DEPRECATION")
+        val receiver = intent.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER)
+        synchronized(AppBlockerPrefs) {
+          var previous: GuardianKeyRegistry? = null
+          try {
+            previous = AppBlockerPrefs.readGuardianKeys(this, true)!!
+            val raw = intent.getStringExtra(EXTRA_GUARDIAN_KEY)
+            val closeId = intent.getStringExtra(EXTRA_GUARDIAN_CLOSE)
+            if (raw != null) AppBlockerPrefs.startGuardianKey(this, AppBlockerPrefs.jsonMap(raw))
+            else if (closeId != null) AppBlockerPrefs.closeGuardianKey(this, closeId)
+            else AppBlockerPrefs.writeGuardianKeys(this, previous)
+            AlarmReceiver.scheduleNext(this)
+            tick()
+            receiver?.send(0, null)
+          } catch (error: Exception) {
+            previous?.let { runCatching { AppBlockerPrefs.writeGuardianKeys(this, it); AlarmReceiver.scheduleNext(this); tick() } }
+            receiver?.send(1, android.os.Bundle().apply { putString("code", (error as? GuardianKeyFailure)?.code ?: "ERR_GUARDIAN_KEY_UNCERTAIN") })
+          }
+        }
+      }
       ACTION_END_SUPPRESSION -> {
         @Suppress("DEPRECATION")
         val receiver = intent.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER)
@@ -411,6 +438,18 @@ class AppBlockerService : Service() {
     private const val EXTRA_DURATION_MINUTES = "duration_minutes"
     private const val ACTION_END_SUPPRESSION = "expo.modules.appblocker.END_SUPPRESSION"
     private const val EXTRA_RESULT_RECEIVER = "result_receiver"
+
+    private const val ACTION_GUARDIAN_KEY = "expo.modules.appblocker.GUARDIAN_KEY"
+    private const val EXTRA_GUARDIAN_KEY = "guardian_key"
+    private const val EXTRA_GUARDIAN_CLOSE = "guardian_close"
+    internal fun guardianKeyCommand(context: Context, raw: Map<String, Any?>?, closeId: String?, receiver: ResultReceiver) {
+      startCommand(context, Intent(context, AppBlockerService::class.java).apply {
+        action = ACTION_GUARDIAN_KEY
+        if (raw != null) putExtra(EXTRA_GUARDIAN_KEY, org.json.JSONObject(raw).toString())
+        if (closeId != null) putExtra(EXTRA_GUARDIAN_CLOSE, closeId)
+        putExtra(EXTRA_RESULT_RECEIVER, receiver)
+      })
+    }
 
     fun endSuppression(context: Context, receiver: ResultReceiver) {
       startCommand(context, Intent(context, AppBlockerService::class.java).apply {

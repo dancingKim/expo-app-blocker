@@ -98,6 +98,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     activity: DeviceActivityName
   ) {
     super.eventDidReachThreshold(event, activity: activity)
+    guard let keyLock = try? GuardianConcurrentStorage.lock(appGroupIdentifier) else { return }
+    defer { keyLock.unlock() }
+    do { if let defaults = sharedDefaults { defaults.synchronize(); _ = try GuardianConcurrentStorage.read(defaults, group: appGroupIdentifier) } }
+    catch { return }
 
     let stepSeconds = parseStepSeconds(from: event.rawValue)
     guard stepSeconds > 0 else {
@@ -140,6 +144,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// boundary, so only honor it in the last couple of minutes before midnight.
   override func intervalDidEnd(for activity: DeviceActivityName) {
     super.intervalDidEnd(for: activity)
+    guard let keyLock = try? GuardianConcurrentStorage.lock(appGroupIdentifier) else { return }
+    defer { keyLock.unlock() }
+    do { if let defaults = sharedDefaults { defaults.synchronize(); _ = try GuardianConcurrentStorage.read(defaults, group: appGroupIdentifier) } }
+    catch { return }
 
     // #570: a free window boundary — re-evaluate the union of all windows (handles overlaps and
     // weekday gating). A free window just ended → now outside it → the shield is re-applied
@@ -159,6 +167,10 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
 
   override func intervalDidStart(for activity: DeviceActivityName) {
     super.intervalDidStart(for: activity)
+    guard let keyLock = try? GuardianConcurrentStorage.lock(appGroupIdentifier) else { return }
+    defer { keyLock.unlock() }
+    do { if let defaults = sharedDefaults { defaults.synchronize(); _ = try GuardianConcurrentStorage.read(defaults, group: appGroupIdentifier) } }
+    catch { return }
 
     // #535: the immediate-block wall-clock expiry fired (interval starts at the expiry instant).
     // Lift the immediate shield if the persisted expiry has actually passed. Kill-proof: runs even
@@ -236,6 +248,12 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// from the stored config (kill-proof re-application). Guards a spurious/early boundary fire.
   private func expireSuppressionIfDue() {
     let defaults = sharedDefaults ?? UserDefaults.standard
+    if let registry = GuardianConcurrentStorage.mirrored(defaults) {
+      // A stale alarm reads the newest snapshot; no shared-state RMW and no whole-ticket clear.
+      recomputeShieldsAfterSuppression()
+      try? GuardianConcurrentStorage.rearm(registry, now: Date().timeIntervalSince1970 * 1000)
+      return
+    }
     let until = GuardianTargetRuntime.until(defaults)
     guard until > 0 else {
       // #661: the one-shot fired but no ticket is recorded — the App Group read came back empty
