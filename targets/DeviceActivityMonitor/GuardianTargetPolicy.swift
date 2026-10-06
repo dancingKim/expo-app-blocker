@@ -137,11 +137,11 @@ enum GuardianTargetRuntime {
   static func validateOpening(_ scope: GuardianOpeningScope, configs: [[String: Any]], group: String) throws {
     let opened = try Set(scope.apps.map { try app($0, group: group) })
     _ = try scope.webDomains.map { try web($0) }
+    for config in configs where config["targetPolicy"] as? String == "dual-v1" { try validate(config, group: group) }
     guard !scope.full && !scope.allowLayer else { return }
     var allowed = Set<ApplicationToken>()
     for config in configs {
       let dual = config["targetPolicy"] as? String == "dual-v1"
-      if dual { try validate(config, group: group) }
       guard (dual ? config["allowEnabled"] as? Bool == true : config["mode"] as? String == "allow"),
             config["isActive"] as? Bool != false else { continue }
       for token in try tokens(config["allowedItems"] ?? [], type: "app") { allowed.insert(try app(token, group: group)) }

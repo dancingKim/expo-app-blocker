@@ -317,21 +317,16 @@ class ShieldActionExtension: ShieldActionDelegate {
   /// #598: read the last-shielded app record, file first (durable across ShieldConfiguration's instant
   /// teardown) then the legacy UserDefaults mirror. Returns (base64 token, epoch-ms timestamp) or nil.
   private func readLastShieldedToken() -> (encoded: String, ts: Double)? {
-    if let fileURL = appGroupFileURL(lastShieldedFileName),
-       let data = try? Data(contentsOf: fileURL),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let encoded = obj["token"] as? String, !encoded.isEmpty {
-      let ts = (obj["ts"] as? NSNumber)?.doubleValue ?? 0
-      return (encoded, ts)
-    }
+    let file = appGroupFileURL(lastShieldedFileName)
+      .flatMap { try? Data(contentsOf: $0) }
+      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    var mirror: [String: Any]?
     if let defaults = UserDefaults(suiteName: appGroupIdentifier) {
       defaults.synchronize()
-      if let encoded = defaults.string(forKey: lastShieldedTokenKey), !encoded.isEmpty {
-        let ts = (defaults.object(forKey: lastShieldedTokenTsKey) as? NSNumber)?.doubleValue ?? 0
-        return (encoded, ts)
-      }
+      mirror = ["token": defaults.string(forKey: lastShieldedTokenKey) ?? "",
+                "ts": defaults.object(forKey: lastShieldedTokenTsKey) ?? 0]
     }
-    return nil
+    return GuardianEscapeScope.lastShielded(file: file, mirror: mirror)
   }
 
   private func appGroupFileURL(_ name: String) -> URL? {

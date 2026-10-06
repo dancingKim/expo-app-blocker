@@ -258,11 +258,12 @@ class ShieldConfigurationExtension: ShieldConfigurationDataSource {
     mirrorLastShieldedToUserDefaults(encoded: encoded, tsMs: tsMs)
   }
 
-  /// UserDefaults mirror of the last-shielded token (only when a token exists), for ShieldAction's
+  /// UserDefaults mirror of the latest origin, including absence, for ShieldAction's
   /// fallback read. Best-effort — this extension's UserDefaults writes are frequently reaped.
   private func mirrorLastShieldedToUserDefaults(encoded: String?, tsMs: Int64) {
-    guard let encoded = encoded, let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
-    defaults.set(encoded, forKey: lastShieldedTokenKey)
+    guard let defaults = UserDefaults(suiteName: appGroupIdentifier) else { return }
+    if let encoded { defaults.set(encoded, forKey: lastShieldedTokenKey) }
+    else { defaults.removeObject(forKey: lastShieldedTokenKey) }
     defaults.set(tsMs, forKey: lastShieldedTokenTsKey)
   }
 

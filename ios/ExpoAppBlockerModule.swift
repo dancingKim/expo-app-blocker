@@ -211,7 +211,7 @@ public class ExpoAppBlockerModule: Module {
             tokens + self.persistedRecoveryTokens(), group: self.appGroupIdentifier, persist: true)
           self.isReapplyingRecoveredTokens = true
           defer { self.isReapplyingRecoveredTokens = false }
-          try self.reapplyTokenRecoveryLayers()
+          try self.reapplyPersistedLayers()
           promise.resolve(["supported": true, "remaps": remaps])
         } catch {
           promise.reject("TOKEN_RECOVERY_FAILED", "Application identity recovery could not complete")
@@ -235,7 +235,7 @@ public class ExpoAppBlockerModule: Module {
             throw NSError(domain: "AppBlocker", code: 2)
           }
           try self.replacePersistedAllowedItems(items)
-          try self.reapplyTokenRecoveryLayers()
+          try self.reapplyPersistedLayers()
           promise.resolve(["supported": true, "remaps": remaps])
         } catch {
           promise.reject("TOKEN_RECOVERY_FAILED", "Allowed applications could not be reconciled")
@@ -701,6 +701,7 @@ public class ExpoAppBlockerModule: Module {
             guard let previous = defaults.dictionary(forKey: GuardianTargetRuntime.scopeKey),
                   try GuardianOpeningScope(previous) == scope,
                   GuardianTargetRuntime.until(defaults) == untilMillis else { throw GuardianOpeningScope.Failure.invalidScope }
+            try self.reapplyPersistedLayers()
             promise.resolve(self.suppressionState()); return
           }
           let configs = [self.blockConfigStorageKey, self.focusBlockConfigStorageKey, self.scheduleConfigStorageKey].compactMap { defaults.dictionary(forKey: $0) }
@@ -715,15 +716,14 @@ public class ExpoAppBlockerModule: Module {
           self.userDefaults.set(untilMillis, forKey: self.suppressionUntilKey)
           defaults.removeObject(forKey: self.suppressionTargetTokenKey)
           self.userDefaults.removeObject(forKey: self.suppressionTargetTokenKey)
-          if let config = self.currentBlockConfig { try self.applyBlocks(config) }
-          if let config = self.focusBlockConfig { try self.applyBlocks(config) }
-          self.reevaluateScheduleShieldFromPersisted()
+          try self.reapplyPersistedLayers()
           self.updateSuppressionExpiryMonitoring(untilMillis: untilMillis)
           promise.resolve(self.suppressionState())
         } catch {
           // Preflight rejects before storage; an unexpected render failure also restores policy.
           if persistedThisAttempt {
-            try? self.endSuppressionInternal()
+            self.clearSuppressionState()
+            try? self.reapplyPersistedLayers()
           }
           promise.reject("ERR_GUARDIAN_KEY_SCOPE", "Opening scope could not be applied")
         }
@@ -992,25 +992,30 @@ public class ExpoAppBlockerModule: Module {
     }
     return tokens
   }
-  private func reapplyTokenRecoveryLayers() throws {
+  private func reapplyPersistedLayers() throws {
     // Re-read extension-owned expiry/satisfaction; never restore stale host snapshots.
     guard let defaults = sharedDefaults else { return }
     didLoadPersistedConfig = true
     currentBlockConfig = nil
     focusBlockConfig = nil
+    var firstError: Error?
     for (key, satisfied, target) in [(blockConfigStorageKey, blockSatisfiedKey, store),
                                      (focusBlockConfigStorageKey, focusBlockSatisfiedKey, focusStore)] {
-      guard defaults.object(forKey: satisfied) == nil,
-            let dict = defaults.dictionary(forKey: key) else { clearImmediateStore(target); continue }
-      let config = try parseBlockConfig(dict)
-      guard config.isActive else { clearImmediateStore(target); continue }
-      if let expiry = config.expiresAtMillis, expiry > 0,
-         expiry <= Date().timeIntervalSince1970 * 1000 { clearImmediateStore(target); continue }
-      if isFocus(config) { focusBlockConfig = config }
-      else { currentBlockConfig = config }
-      try applyBlocks(config)
+      do {
+        guard defaults.object(forKey: satisfied) == nil,
+              let dict = defaults.dictionary(forKey: key) else { clearImmediateStore(target); continue }
+        let config = try parseBlockConfig(dict)
+        guard config.isActive else { clearImmediateStore(target); continue }
+        if let expiry = config.expiresAtMillis, expiry > 0,
+           expiry <= Date().timeIntervalSince1970 * 1000 { clearImmediateStore(target); continue }
+        if isFocus(config) { focusBlockConfig = config }
+        else { currentBlockConfig = config }
+        try applyBlocks(config)
+      } catch { if firstError == nil { firstError = error } }
     }
-    reevaluateScheduleShieldFromPersisted()
+    do { try reevaluateScheduleShieldThrowing() }
+    catch { if firstError == nil { firstError = error } }
+    if let firstError { throw firstError }
   }
 
   private func validateTargetConfiguration(_ config: [String: Any]) throws {
@@ -1929,6 +1934,11 @@ public class ExpoAppBlockerModule: Module {
   /// not re-armed) and the App-Group variant key ShieldConfiguration reads. Callers must run this only
   /// when no live ticket exists; a live ticket keeps the schedule shield down (defensive re-check).
   private func reevaluateScheduleShieldFromPersisted() {
+    try? reevaluateScheduleShieldThrowing()
+  }
+
+  /// Explicit Start must surface a failed render instead of only acknowledging its deadline.
+  private func reevaluateScheduleShieldThrowing() throws {
     // #598: a targeted ticket exempts one app but keeps the gap shield up for the rest; a full ticket
     // keeps the whole schedule shield down.
     let exempt = escapeExemptToken()
@@ -1954,7 +1964,7 @@ public class ExpoAppBlockerModule: Module {
       // ticket). Mirrors the monitor: the gap shield always records the "schedule" variant (weekday
       // shield, keeps its redirect + escape buttons).
       if dict["targetPolicy"] as? String == "dual-v1" {
-        try? GuardianTargetRuntime.render(dict, store: scheduleStore, layer: "schedule", defaults: sharedDefaults ?? userDefaults, group: appGroupIdentifier)
+        try GuardianTargetRuntime.render(dict, store: scheduleStore, layer: "schedule", defaults: sharedDefaults ?? userDefaults, group: appGroupIdentifier)
         updateScheduleShieldVariant()
       } else { applyScheduleShield(items, mode: mode, exempt: exempt) }
     }
