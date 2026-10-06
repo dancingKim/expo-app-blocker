@@ -2239,9 +2239,10 @@ public class ExpoAppBlockerModule: Module {
 /// identity + the identifier echoed back in `onRemoveItem`), so RN can match the removed row precisely.
 struct BlockedAppRenderItem: Identifiable {
   let id: String
-  let type: String   // "app" | "category"
+  let type: String   // "app" | "category" | "webDomain"
   let appToken: ApplicationToken?
   let categoryToken: ActivityCategoryToken?
+  let webDomainToken: WebDomainToken?
 }
 
 class BlockedAppsViewModel: ObservableObject {
@@ -2281,11 +2282,15 @@ class BlockedAppsView: ExpoView {
       guard let tokenString = tokenInfo["token"], let type = tokenInfo["type"] else { continue }
       if type == "app" {
         if let token = ExpoAppBlockerModule.decodeApplicationTokenStatic(from: tokenString) {
-          items.append(BlockedAppRenderItem(id: tokenString, type: "app", appToken: token, categoryToken: nil))
+          items.append(BlockedAppRenderItem(id: tokenString, type: "app", appToken: token, categoryToken: nil, webDomainToken: nil))
+        }
+      } else if type == "webDomain" {
+        if let token = try? GuardianTargetRuntime.web(tokenString) {
+          items.append(BlockedAppRenderItem(id: tokenString, type: "webDomain", appToken: nil, categoryToken: nil, webDomainToken: token))
         }
       } else if type == "category" {
         if let token = ExpoAppBlockerModule.decodeCategoryTokenStatic(from: tokenString) {
-          items.append(BlockedAppRenderItem(id: tokenString, type: "category", appToken: nil, categoryToken: token))
+          items.append(BlockedAppRenderItem(id: tokenString, type: "category", appToken: nil, categoryToken: token, webDomainToken: nil))
         }
       }
     }
@@ -2299,12 +2304,17 @@ class BlockedAppsView: ExpoView {
     var items: [BlockedAppRenderItem] = []
     for token in selection.applicationTokens {
       if let data = try? JSONEncoder().encode(token) {
-        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "app", appToken: token, categoryToken: nil))
+        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "app", appToken: token, categoryToken: nil, webDomainToken: nil))
       }
     }
     for token in selection.categoryTokens {
       if let data = try? JSONEncoder().encode(token) {
-        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "category", appToken: nil, categoryToken: token))
+        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "category", appToken: nil, categoryToken: token, webDomainToken: nil))
+      }
+    }
+    for token in selection.webDomainTokens {
+      if let data = try? JSONEncoder().encode(token) {
+        items.append(BlockedAppRenderItem(id: data.base64EncodedString(), type: "webDomain", appToken: nil, categoryToken: nil, webDomainToken: token))
       }
     }
     viewModel.items = items
@@ -2350,6 +2360,13 @@ struct BlockedAppsContentView: View {
               .tint(labelColor)
               .foregroundStyle(labelColor)
               .lineLimit(1)
+          } else if let webDomainToken = item.webDomainToken {
+            Label(webDomainToken)
+              .labelStyle(.titleAndIcon)
+              .font(.system(size: 16, weight: .semibold))
+              .tint(labelColor)
+              .foregroundStyle(labelColor)
+              .lineLimit(1)
           } else if let categoryToken = item.categoryToken {
             Label(categoryToken)
               .labelStyle(.titleAndIcon)
@@ -2369,7 +2386,7 @@ struct BlockedAppsContentView: View {
             }
             .buttonStyle(.plain)
           } else {
-            Text(item.type == "category" ? "Category" : "App")
+            Text(item.type == "category" ? "Category" : (item.type == "webDomain" ? "Website" : "App"))
               .font(.system(size: 11, weight: .semibold))
               .foregroundColor(greenText)
               .padding(.horizontal, 10)

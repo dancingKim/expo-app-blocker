@@ -265,7 +265,7 @@ export interface BlockedAppsRemoveEvent {
   index: number;
   /** Base64 token string of the removed item (matches `items[].token`). */
   token: string;
-  /** "app" | "category" */
+  /** "app" | "category" | "webDomain" */
   type: string;
 }
 
