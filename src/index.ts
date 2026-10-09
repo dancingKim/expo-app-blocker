@@ -318,6 +318,15 @@ export function clearAllBlocks(guardType?: "gate" | "focus"): void {
   NativeModule.clearAllBlocks();
 }
 
+/** Completion of the iOS settings write. Android release uses setAllowedApps. */
+export async function clearAllBlocksAsync(): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  if (typeof NativeModule.clearAllBlocksAsync !== 'function') {
+    throw new Error('Guardian release acknowledgement requires a new native binary');
+  }
+  await NativeModule.clearAllBlocksAsync();
+}
+
 /**
  * #657 (iOS; no-op elsewhere): tell the native side that an immediate layer's lock is **satisfied** —
  * the thing it was guarding is done — while its configuration is still installed. The host defers the
@@ -401,6 +410,15 @@ export function clearScheduleConfiguration(): void {
 export function getScheduleConfiguration(): ScheduleConfiguration | null {
   if (Platform.OS !== "ios" && Platform.OS !== "android") return null;
   return NativeModule.getScheduleConfiguration() ?? null;
+}
+
+/** Avoid blocking the JS thread behind a pending native scheduling operation. */
+export async function getScheduleConfigurationAsync(): Promise<ScheduleConfiguration | null> {
+  if (Platform.OS !== 'ios') return getScheduleConfiguration();
+  if (typeof NativeModule.getScheduleConfigurationAsync !== 'function') {
+    throw new Error('Guardian schedule read requires a new native binary');
+  }
+  return await NativeModule.getScheduleConfigurationAsync() ?? null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

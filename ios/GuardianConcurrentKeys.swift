@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(os)
+import os
+#endif
 #if canImport(Darwin)
 import Darwin
 #else
@@ -83,9 +86,14 @@ struct GuardianKeyRegistry {
   }
 }
 
-/// The same file lock protects host and Monitor read/render/rearm. Recursive on one thread.
+/// Serialize shared state, but never hold flock across a DeviceActivity IPC call:
+/// the daemon may wait for a Monitor callback which needs this same file lock.
 final class GuardianKeyFileLock {
   private static let processLock = NSRecursiveLock()
+  private static let descriptorsKey = "guardian-key-descriptors"
+#if canImport(os)
+  private static let log = Logger(subsystem: "com.worthyi.chapchu.guardian", category: "scheduling")
+#endif
   private let path: String
   private let fd: Int32?
   private var released = false
@@ -103,6 +111,9 @@ final class GuardianKeyFileLock {
         close(descriptor); Self.processLock.unlock(); throw GuardianKeyFailure.invalid
       }
       fd = descriptor
+      var descriptors = Thread.current.threadDictionary[Self.descriptorsKey] as? [Int32] ?? []
+      descriptors.append(descriptor)
+      Thread.current.threadDictionary[Self.descriptorsKey] = descriptors
     }
     Thread.current.threadDictionary[nestingKey] = depth + 1
   }
@@ -112,8 +123,34 @@ final class GuardianKeyFileLock {
     let depth = (Thread.current.threadDictionary[key] as? Int ?? 1) - 1
     if depth == 0 { Thread.current.threadDictionary.removeObject(forKey: key) }
     else { Thread.current.threadDictionary[key] = depth }
-    if let fd { _ = flock(fd, LOCK_UN); close(fd) }
+    if let fd {
+      let descriptors = Thread.current.threadDictionary[Self.descriptorsKey] as? [Int32] ?? []
+      Thread.current.threadDictionary[Self.descriptorsKey] = descriptors.filter { $0 != fd }
+      _ = flock(fd, LOCK_UN); close(fd)
+    }
     Self.processLock.unlock()
+  }
+  /// Call only after publishing the state the Monitor must observe. Keep the
+  /// in-process recursive lock: another host mutation cannot overtake this one.
+  /// The Monitor reads/renders the committed snapshot and does not mutate keys.
+  static func withDeviceActivity<T>(_ operation: () throws -> T) rethrows -> T {
+    let descriptors = Thread.current.threadDictionary[descriptorsKey] as? [Int32] ?? []
+    for fd in descriptors { _ = flock(fd, LOCK_UN) }
+#if canImport(os)
+    let started = Date()
+    log.info("device-activity begin")
+#endif
+    defer {
+      for fd in descriptors {
+        var result: Int32
+        repeat { result = flock(fd, LOCK_EX) } while result != 0 && errno == EINTR
+        precondition(result == 0, "Guardian file lock descriptor must remain valid during OS scheduling")
+      }
+#if canImport(os)
+      log.info("device-activity end durationMs=\(Int(Date().timeIntervalSince(started) * 1000), privacy: .public)")
+#endif
+    }
+    return try operation()
   }
   deinit { unlock() }
 }
@@ -183,7 +220,9 @@ enum GuardianConcurrentStorage {
   static func rearm(_ registry: GuardianKeyRegistry, now: Double) throws {
     let center = DeviceActivityCenter()
     let name = DeviceActivityName(activity)
-    guard let next = registry.live(now).first?.untilMillis else { center.stopMonitoring([name]); return }
+    guard let next = registry.live(now).first?.untilMillis else {
+      GuardianKeyFileLock.withDeviceActivity { center.stopMonitoring([name]) }; return
+    }
     let start = Date(timeIntervalSince1970: ceil(next / 60000) * 60)
     var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
     func components(_ date: Date) -> DateComponents {
@@ -191,8 +230,10 @@ enum GuardianConcurrentStorage {
       value.calendar = calendar; value.timeZone = calendar.timeZone; return value
     }
     // Replaces the same name; do not cancel a good alarm before registration succeeds.
-    try center.startMonitoring(name, during: DeviceActivitySchedule(intervalStart: components(start),
-      intervalEnd: components(start.addingTimeInterval(86400)), repeats: false), events: [:])
+    try GuardianKeyFileLock.withDeviceActivity {
+      try center.startMonitoring(name, during: DeviceActivitySchedule(intervalStart: components(start),
+        intervalEnd: components(start.addingTimeInterval(86400)), repeats: false), events: [:])
+    }
   }
 }
 #endif

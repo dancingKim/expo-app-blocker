@@ -346,8 +346,8 @@ public class ExpoAppBlockerModule: Module {
           // config lands is what keeps a stale marker from ever meeting a freshly-armed config — if
           // the monitor woke up in between it would drop the lock the user is arming right now.
           self.setGuardSatisfiedInternal(guardType: blockConfig.guardType, satisfied: false)
-          try self.applyBlocks(blockConfig)
           self.persistBlockConfiguration(config, guardType: blockConfig.guardType)
+          try self.applyBlocks(blockConfig)
           // #535: (re)arm or cancel the wall-clock expiry DeviceActivity for this config.
           self.updateImmediateExpiryMonitoring(blockConfig)
 
@@ -385,34 +385,24 @@ public class ExpoAppBlockerModule: Module {
     // In BOTH branches the immediate config is removed, so a suppression-expiry recompute never
     // re-arms a gate whose session already ended (satisfied) — it only restores the schedule.
     Function("clearAllBlocks") {
+      self.stateQueue.async { try? self.clearImmediateBlocksInternal() }
+    }
+    // Acknowledges the native settings write, not another application's launch.
+    AsyncFunction("clearAllBlocksAsync") { (promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
-        guard let keyLock = try? self.lockGuardianKeys() else { return }; defer { keyLock.unlock() }
-        self.ensureLoadedPersistedConfig()
-        self.cancelRelockActivity()
-        // #535: drop any pending wall-clock expiry — BOTH layers' one-shots (legacy zero-arg
-        // contract: everything immediate goes down, exactly what an old JS bundle expects).
-        self.cancelImmediateExpiryActivity(guardType: nil)
-        self.cancelImmediateExpiryActivity(guardType: "focus")
-        self.clearImmediateStore(self.store)
-        self.clearImmediateStore(self.focusStore)
-        self.currentBlockConfig = nil
-        self.focusBlockConfig = nil
-        self.userDefaults.removeObject(forKey: self.blockConfigStorageKey)
-        self.sharedDefaults?.removeObject(forKey: self.blockConfigStorageKey)
-        self.userDefaults.removeObject(forKey: self.focusBlockConfigStorageKey)
-        self.sharedDefaults?.removeObject(forKey: self.focusBlockConfigStorageKey)
-        self.clearUnlockState()
-        // #657: both configs are gone, so their satisfied markers have nothing left to refer to.
-        self.setGuardSatisfiedInternal(guardType: nil, satisfied: false)
-        self.setGuardSatisfiedInternal(guardType: "focus", satisfied: false)
-
-        if self.isSuppressedInternal() {
-          // Ticket still live — leave suppression state + its expiry DeviceActivity + the persisted
-          // schedule config untouched. The monitor's suppression-expiry backstop re-applies the
-          // schedule shield from config when the ticket ends. (Do NOT clearSuppressionState here.)
-        } else {
-          self.clearSuppressionState()
-          self.reevaluateScheduleShieldFromPersisted()
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
+        let started = Date()
+        do {
+          try self.clearImmediateBlocksInternal()
+          self.diagLog.info("release native-complete durationMs=\(Int(Date().timeIntervalSince(started) * 1000), privacy: .public)")
+          promise.resolve(nil)
+        } catch {
+          self.diagLog.error("release native-failed")
+          promise.reject("ERR_GUARDIAN_RELEASE", "Native release did not complete")
         }
       }
     }
@@ -742,7 +732,12 @@ public class ExpoAppBlockerModule: Module {
     }
 
     AsyncFunction("validateGuardianScopedKey") { (raw: [String: Any], promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
         do {
           let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
           _ = try self.proposedGuardianKey(raw)
@@ -751,7 +746,12 @@ public class ExpoAppBlockerModule: Module {
       }
     }
     AsyncFunction("startGuardianScopedKey") { (raw: [String: Any], promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
         do {
           let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
           let (previous, next) = try self.proposedGuardianKey(raw)
@@ -761,7 +761,12 @@ public class ExpoAppBlockerModule: Module {
       }
     }
     AsyncFunction("closeGuardianScopedKey") { (id: String, promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
         do {
           let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
           let previous = try self.loadGuardianKeys()
@@ -772,7 +777,12 @@ public class ExpoAppBlockerModule: Module {
       }
     }
     AsyncFunction("getGuardianScopedKeys") { (promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
         do {
           let lock = try self.lockGuardianKeys(); defer { lock.unlock() }
           let current = try self.loadGuardianKeys()
@@ -804,12 +814,17 @@ public class ExpoAppBlockerModule: Module {
     // MARK: Schedule-window blocking
 
     AsyncFunction("setScheduleConfiguration") { (config: [String: Any], promise: Promise) in
+      let enqueuedAt = Date()
       self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
         do {
           let keyLock = try self.lockGuardianKeys(); defer { keyLock.unlock() }
           try self.validateTargetConfiguration(config)
-          self.applyScheduleConfiguration(config)
           self.persistScheduleConfiguration(config)
+          try self.applyScheduleConfiguration(config)
           DispatchQueue.main.async { promise.resolve(nil) }
         } catch { promise.reject("ERR_GUARDIAN_TARGETS", "Target policy could not be applied") }
       }
@@ -818,6 +833,18 @@ public class ExpoAppBlockerModule: Module {
     Function("clearScheduleConfiguration") {
       self.stateQueue.async {
         self.clearScheduleConfigurationInternal()
+      }
+    }
+
+    AsyncFunction("getScheduleConfigurationAsync") { (promise: Promise) in
+      let enqueuedAt = Date()
+      self.stateQueue.async {
+        guard Date().timeIntervalSince(enqueuedAt) < 14 else {
+          promise.reject("ERR_GUARDIAN_NATIVE_TIMEOUT", "Native request expired before execution")
+          return
+        }
+        promise.resolve(self.sharedDefaults?.dictionary(forKey: self.scheduleConfigStorageKey)
+          ?? self.userDefaults.dictionary(forKey: self.scheduleConfigStorageKey))
       }
     }
 
@@ -855,6 +882,37 @@ public class ExpoAppBlockerModule: Module {
       policies[name] = policy
     }
     return GuardianOpeningScope.supportedExtensions(policies)
+  }
+
+  private func clearImmediateBlocksInternal() throws {
+    let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
+    // #535: drop any pending wall-clock expiry — BOTH layers' one-shots (legacy zero-arg
+    // contract: everything immediate goes down, exactly what an old JS bundle expects).
+    clearImmediateStore(store)
+    clearImmediateStore(focusStore)
+    currentBlockConfig = nil
+    focusBlockConfig = nil
+    userDefaults.removeObject(forKey: blockConfigStorageKey)
+    sharedDefaults?.removeObject(forKey: blockConfigStorageKey)
+    userDefaults.removeObject(forKey: focusBlockConfigStorageKey)
+    sharedDefaults?.removeObject(forKey: focusBlockConfigStorageKey)
+    clearUnlockState()
+    sharedDefaults?.synchronize()
+    // #657: both configs are gone, so their satisfied markers have nothing left to refer to.
+    setGuardSatisfiedInternal(guardType: nil, satisfied: false)
+    setGuardSatisfiedInternal(guardType: "focus", satisfied: false)
+
+    if isSuppressedInternal() {
+      // Ticket still live — leave suppression state + its expiry DeviceActivity + the persisted
+      // schedule config untouched. The monitor's suppression-expiry backstop re-applies the
+      // schedule shield from config when the ticket ends. (Do NOT clearSuppressionState here.)
+    } else {
+      clearSuppressionState()
+      reevaluateScheduleShieldFromPersisted()
+    }
+    cancelRelockActivity()
+    cancelImmediateExpiryActivity(guardType: nil)
+    cancelImmediateExpiryActivity(guardType: "focus")
   }
 
   private func hasGuardianConcurrentKeys() -> Bool {
@@ -1042,7 +1100,7 @@ public class ExpoAppBlockerModule: Module {
           !defaults.bool(forKey: "appBlocker.isolatedStorage.v1") else { return }
     // No owner can be proved for the old shared container. Drop only this app's
     // enforcement and private cache; JS re-arms from its account-owned state.
-    activityCenter.stopMonitoring()
+    GuardianKeyFileLock.withDeviceActivity { activityCenter.stopMonitoring() }
     store.clearAllSettings()
     focusStore.clearAllSettings()
     scheduleStore.clearAllSettings()
@@ -1439,11 +1497,11 @@ public class ExpoAppBlockerModule: Module {
       repeats: false
     )
 
-    try activityCenter.startMonitoring(
+    try GuardianKeyFileLock.withDeviceActivity { try activityCenter.startMonitoring(
       DeviceActivityName(unlockActivityName),
       during: schedule,
       events: events
-    )
+    ) }
   }
 
   private func cancelRelockActivity() {
@@ -1454,7 +1512,7 @@ public class ExpoAppBlockerModule: Module {
 
   private func cancelRelockActivityLocked() {
     let activityName = DeviceActivityName(unlockActivityName)
-    activityCenter.stopMonitoring([activityName])
+    GuardianKeyFileLock.withDeviceActivity { activityCenter.stopMonitoring([activityName]) }
   }
 
   // MARK: - Immediate-Block Wall-Clock Expiry (#535)
@@ -1509,11 +1567,11 @@ public class ExpoAppBlockerModule: Module {
       repeats: false
     )
     do {
-      try activityCenter.startMonitoring(
+      try GuardianKeyFileLock.withDeviceActivity { try activityCenter.startMonitoring(
         DeviceActivityName(activityName),
         during: schedule,
         events: [:]
-      )
+      ) }
       writeImmediateExpiryProbe([
         "phase": "registered",
         "guardType": layer,
@@ -1531,7 +1589,7 @@ public class ExpoAppBlockerModule: Module {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
     let activityName = guardType == "focus" ? focusImmediateExpiryActivityName : immediateExpiryActivityName
-    activityCenter.stopMonitoring([DeviceActivityName(activityName)])
+    GuardianKeyFileLock.withDeviceActivity { activityCenter.stopMonitoring([DeviceActivityName(activityName)]) }
   }
 
   // MARK: - Escape Ticket Suppression (#572)
@@ -1596,6 +1654,7 @@ public class ExpoAppBlockerModule: Module {
     // #598: drop the ticket's target app too so a later full ticket never inherits a stale exemption.
     sharedDefaults?.removeObject(forKey: suppressionTargetTokenKey)
     userDefaults.removeObject(forKey: suppressionTargetTokenKey)
+    sharedDefaults?.synchronize()
     cancelSuppressionExpiryActivity()
   }
 
@@ -1677,11 +1736,11 @@ public class ExpoAppBlockerModule: Module {
       repeats: false
     )
     do {
-      try activityCenter.startMonitoring(
+      try GuardianKeyFileLock.withDeviceActivity { try activityCenter.startMonitoring(
         DeviceActivityName(suppressionExpiryActivityName),
         during: schedule,
         events: [:]
-      )
+      ) }
       writeSuppressionExpiryProbe([
         "phase": "registered",
         "startMs": Int64(interval.start.date!.timeIntervalSince1970 * 1000.0),
@@ -1768,7 +1827,7 @@ public class ExpoAppBlockerModule: Module {
   private func cancelSuppressionExpiryActivity() {
     scheduleLock.lock()
     defer { scheduleLock.unlock() }
-    activityCenter.stopMonitoring([DeviceActivityName(suppressionExpiryActivityName)])
+    GuardianKeyFileLock.withDeviceActivity { activityCenter.stopMonitoring([DeviceActivityName(suppressionExpiryActivityName)]) }
   }
 
   // MARK: - Schedule-Window Blocking
@@ -1779,80 +1838,12 @@ public class ExpoAppBlockerModule: Module {
   /// then apply the shield now iff we are currently outside all free windows. Only the schedule
   /// activities and the dedicated `scheduleStore` are touched — the immediate-block `store` and
   /// the temporary-unlock activity are untouched.
-  private func applyScheduleConfiguration(_ config: [String: Any]) {
+  private func applyScheduleConfiguration(_ config: [String: Any]) throws {
     let windows = parseScheduleWindows(config)
     // #563 allowlist: read the kept apps from `allowedItems` (mode "allow") or the blocked apps
     // from `blockedItems` (legacy). The shield policy is chosen by `mode` in `applyScheduleShield`.
     let mode = scheduleMode(config)
     let items = makeBlockedItems(from: scheduleItemsRaw(config, mode: mode))
-
-    // Stop only previously-registered schedule activities (never the unlock activity), so
-    // re-configuring with a different window count leaves no orphans.
-    stopScheduleActivities()
-
-    // DeviceActivity intervals are only wake-up triggers; `reevaluateScheduleShield` /
-    // `isAnyScheduleWindowActive` (the evaluator) is the SSOT for shield state. A
-    // cross-midnight window (startMinute > endMinute) is split into two non-wrapping
-    // activities so we never rely on a wrapping interval firing:
-    //   evening [startMinute, 23:59]  +  morning [00:00, endMinute]
-    // A fragment shorter than DeviceActivity's ~15-minute minimum is registered as a
-    // minimum-length activity with ONE boundary pinned on the meaningful instant instead
-    // (see the branches below) — never skipped, so both window edges always get a wake-up.
-    // Both names keep the schedule prefix so `stopScheduleActivities` still filters them.
-    for (index, window) in windows.enumerated() {
-      if window.startMinute <= window.endMinute {
-        registerScheduleActivity(
-          name: "\(scheduleActivityPrefix)\(index)",
-          startMinute: window.startMinute,
-          endMinute: window.endMinute
-        )
-      } else {
-        let eveningEnd = 23 * 60 + 59
-        if eveningEnd - window.startMinute >= minScheduleIntervalMinutes {
-          registerScheduleActivity(
-            name: "\(scheduleActivityPrefix)\(index).evening",
-            startMinute: window.startMinute,
-            endMinute: eveningEnd
-          )
-        } else {
-          // Sub-15-minute evening fragment (start after 23:44): DeviceActivity rejects an interval
-          // this short, and skipping it (the old behavior) left the free window's OPEN instant
-          // without any wake-up — the gap shield lingered until the morning activity's 00:00
-          // boundary. Register a minimum-length activity that ENDS exactly at the window start
-          // instead: intervalDidEnd is the wake-up, and the evaluator (the SSOT for shield state)
-          // recomputes "inside the window" and opens on time. Its early intervalDidStart boundary is
-          // harmless — the evaluator just re-asserts the current gap state. Same +1 pad past the
-          // ~15-minute minimum as the expiry one-shots.
-          registerScheduleActivity(
-            name: "\(scheduleActivityPrefix)\(index).evening",
-            startMinute: window.startMinute - (minScheduleIntervalMinutes + 1),
-            endMinute: window.startMinute
-          )
-        }
-        if window.endMinute > 0 {
-          if window.endMinute >= minScheduleIntervalMinutes {
-            registerScheduleActivity(
-              name: "\(scheduleActivityPrefix)\(index).morning",
-              startMinute: 0,
-              endMinute: window.endMinute
-            )
-          } else {
-            // Sub-15-minute morning fragment (endMinute < 15): same rejection — and skipping it left
-            // the free window's CLOSE instant without a wake-up, so everything stayed OPEN until a
-            // later boundary happened to fire (a guardian hole; if the evening fragment was also
-            // short, the whole window used to lose both boundaries). Register a minimum-length
-            // activity that STARTS exactly at the window end: intervalDidStart is the wake-up and
-            // the evaluator re-shields on time. Its late intervalDidEnd boundary is a harmless
-            // re-assert.
-            registerScheduleActivity(
-              name: "\(scheduleActivityPrefix)\(index).morning",
-              startMinute: window.endMinute,
-              endMinute: window.endMinute + minScheduleIntervalMinutes + 1
-            )
-          }
-        }
-      }
-    }
 
     // #570 inversion: shield while OUTSIDE all free windows; open while inside one.
     // DeviceActivity only fires at interval boundaries, so seed the initial state here.
@@ -1873,6 +1864,76 @@ public class ExpoAppBlockerModule: Module {
         updateScheduleShieldVariant()
       } else { applyScheduleShield(items, mode: mode, exempt: exempt) }
     }
+
+    // Stop only previously-registered schedule activities (never the unlock activity), so
+    // re-configuring with a different window count leaves no orphans.
+    stopScheduleActivities()
+
+    // DeviceActivity intervals are only wake-up triggers; `reevaluateScheduleShield` /
+    // `isAnyScheduleWindowActive` (the evaluator) is the SSOT for shield state. A
+    // cross-midnight window (startMinute > endMinute) is split into two non-wrapping
+    // activities so we never rely on a wrapping interval firing:
+    //   evening [startMinute, 23:59]  +  morning [00:00, endMinute]
+    // A fragment shorter than DeviceActivity's ~15-minute minimum is registered as a
+    // minimum-length activity with ONE boundary pinned on the meaningful instant instead
+    // (see the branches below) — never skipped, so both window edges always get a wake-up.
+    // Both names keep the schedule prefix so `stopScheduleActivities` still filters them.
+    for (index, window) in windows.enumerated() {
+      if window.startMinute <= window.endMinute {
+        try registerScheduleActivity(
+          name: "\(scheduleActivityPrefix)\(index)",
+          startMinute: window.startMinute,
+          endMinute: window.endMinute
+        )
+      } else {
+        let eveningEnd = 23 * 60 + 59
+        if eveningEnd - window.startMinute >= minScheduleIntervalMinutes {
+          try registerScheduleActivity(
+            name: "\(scheduleActivityPrefix)\(index).evening",
+            startMinute: window.startMinute,
+            endMinute: eveningEnd
+          )
+        } else {
+          // Sub-15-minute evening fragment (start after 23:44): DeviceActivity rejects an interval
+          // this short, and skipping it (the old behavior) left the free window's OPEN instant
+          // without any wake-up — the gap shield lingered until the morning activity's 00:00
+          // boundary. Register a minimum-length activity that ENDS exactly at the window start
+          // instead: intervalDidEnd is the wake-up, and the evaluator (the SSOT for shield state)
+          // recomputes "inside the window" and opens on time. Its early intervalDidStart boundary is
+          // harmless — the evaluator just re-asserts the current gap state. Same +1 pad past the
+          // ~15-minute minimum as the expiry one-shots.
+          try registerScheduleActivity(
+            name: "\(scheduleActivityPrefix)\(index).evening",
+            startMinute: window.startMinute - (minScheduleIntervalMinutes + 1),
+            endMinute: window.startMinute
+          )
+        }
+        if window.endMinute > 0 {
+          if window.endMinute >= minScheduleIntervalMinutes {
+            try registerScheduleActivity(
+              name: "\(scheduleActivityPrefix)\(index).morning",
+              startMinute: 0,
+              endMinute: window.endMinute
+            )
+          } else {
+            // Sub-15-minute morning fragment (endMinute < 15): same rejection — and skipping it left
+            // the free window's CLOSE instant without a wake-up, so everything stayed OPEN until a
+            // later boundary happened to fire (a guardian hole; if the evening fragment was also
+            // short, the whole window used to lose both boundaries). Register a minimum-length
+            // activity that STARTS exactly at the window end: intervalDidStart is the wake-up and
+            // the evaluator re-shields on time. Its late intervalDidEnd boundary is a harmless
+            // re-assert.
+            try registerScheduleActivity(
+              name: "\(scheduleActivityPrefix)\(index).morning",
+              startMinute: window.endMinute,
+              endMinute: window.endMinute + minScheduleIntervalMinutes + 1
+            )
+          }
+        }
+      }
+    }
+
+
   }
 
   /// #563: the schedule block mode ("allow" | "block"), read from the JS config dict. Absent → block
@@ -1901,16 +1962,14 @@ public class ExpoAppBlockerModule: Module {
   /// Register one non-wrapping repeating DeviceActivity (no events — boundaries only).
   /// Each window may register one or two of these; failures are logged and isolated so a
   /// rejected schedule can't break the others.
-  private func registerScheduleActivity(name: String, startMinute: Int, endMinute: Int) {
+  private func registerScheduleActivity(name: String, startMinute: Int, endMinute: Int) throws {
     let schedule = DeviceActivitySchedule(
       intervalStart: scheduleTimeComponents(minuteOfDay: startMinute),
       intervalEnd: scheduleTimeComponents(minuteOfDay: endMinute),
       repeats: true
     )
-    do {
+    try GuardianKeyFileLock.withDeviceActivity {
       try activityCenter.startMonitoring(DeviceActivityName(name), during: schedule, events: [:])
-    } catch {
-      print("[AppBlocker] schedule activity \(name) startMonitoring failed: \(error.localizedDescription)")
     }
   }
 
@@ -1929,27 +1988,30 @@ public class ExpoAppBlockerModule: Module {
   /// Only the ticket's lifetime changes; the schedule teardown itself is byte-for-byte the same.
   private func clearScheduleConfigurationInternal() {
     guard let keyLock = try? lockGuardianKeys() else { return }; defer { keyLock.unlock() }
-    stopScheduleActivities()
+    userDefaults.removeObject(forKey: scheduleConfigStorageKey)
+    sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
+    sharedDefaults?.synchronize()
     clearScheduleShield()
     if !isSuppressedInternal() {
       clearSuppressionState()
     }
-    userDefaults.removeObject(forKey: scheduleConfigStorageKey)
-    sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
+    stopScheduleActivities()
   }
 
   private func stopScheduleActivities() {
-    let scheduleActivities = activityCenter.activities.filter {
+    let activities = GuardianKeyFileLock.withDeviceActivity { activityCenter.activities }
+    let scheduleActivities = activities.filter {
       $0.rawValue.hasPrefix(scheduleActivityPrefix)
     }
     if !scheduleActivities.isEmpty {
-      activityCenter.stopMonitoring(scheduleActivities)
+      GuardianKeyFileLock.withDeviceActivity { activityCenter.stopMonitoring(scheduleActivities) }
     }
   }
 
   private func persistScheduleConfiguration(_ config: [String: Any]) {
     userDefaults.set(config, forKey: scheduleConfigStorageKey)
     sharedDefaults?.set(config, forKey: scheduleConfigStorageKey)
+    sharedDefaults?.synchronize()
   }
 
   private func applyScheduleShield(_ items: [BlockedItemInfo], mode: BlockMode, exempt: ApplicationToken? = nil) {
@@ -2324,6 +2386,7 @@ public class ExpoAppBlockerModule: Module {
     let key = guardType == "focus" ? focusBlockConfigStorageKey : blockConfigStorageKey
     userDefaults.set(config, forKey: key)
     sharedDefaults?.set(config, forKey: key)
+    sharedDefaults?.synchronize()
   }
 
   // MARK: - Token Encoding/Decoding
