@@ -44,6 +44,7 @@ class AppBlockerService : Service() {
   }
 
   private fun tick() = synchronized(AppBlockerPrefs) {
+    ScheduleLockRecords.observeNow(this) // chapchu #988: actual schedule-lock boundary
     maybeExpireImmediateBlock()
     maybeExpireSuppression()
     getCurrentForegroundPackage()?.let { currentForeground = it }

@@ -24,6 +24,8 @@ class AlarmReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     if (intent.action != ACTION_BOUNDARY) return
     Log.d(TAG, "AlarmReceiver: boundary/expiry, waking service + re-arming")
+    // chapchu #988: stamp the boundary now, even if the service start below is deferred.
+    ScheduleLockRecords.observeNow(context.applicationContext)
     // Wake the service; its poll re-reads the wall clock and applies/clears the block
     // (schedule transition or immediate-block auto-release, whichever this wake was for).
     AppBlockerService.start(context.applicationContext)
