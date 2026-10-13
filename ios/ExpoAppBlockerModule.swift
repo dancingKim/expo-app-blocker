@@ -851,6 +851,28 @@ public class ExpoAppBlockerModule: Module {
     Function("getScheduleConfiguration") { () -> [String: Any]? in
       return self.userDefaults.dictionary(forKey: self.scheduleConfigStorageKey)
     }
+
+    // chapchu #988: actual schedule-lock boundaries recorded natively (monitor or module). Observes
+    // the current state first so a boundary the monitor missed is still closed/opened now.
+    AsyncFunction("getScheduleLockRecords") { (promise: Promise) in
+      self.stateQueue.async {
+        guard let keyLock = try? self.lockGuardianKeys() else { promise.resolve([[String: Any]]()); return }
+        defer { keyLock.unlock() }
+        let defaults = self.sharedDefaults ?? self.userDefaults
+        defaults.synchronize()
+        self.observeScheduleLock(defaults.dictionary(forKey: self.scheduleConfigStorageKey))
+        promise.resolve(GuardianLockRecords.read(defaults))
+      }
+    }
+
+    AsyncFunction("acknowledgeScheduleLockRecords") { (ids: [String], promise: Promise) in
+      self.stateQueue.async {
+        guard let keyLock = try? self.lockGuardianKeys() else { promise.resolve(nil); return }
+        defer { keyLock.unlock() }
+        GuardianLockRecords.acknowledge(ids: ids, defaults: self.sharedDefaults ?? self.userDefaults)
+        promise.resolve(nil)
+      }
+    }
   }
 
   // MARK: - Guardian binary capability (#535)
@@ -1852,6 +1874,7 @@ public class ExpoAppBlockerModule: Module {
     // escape for an out-of-window schedule lock). A full ticket keeps it down; a targeted ticket
     // (#598) instead exempts just the escaped app and leaves the gap shield up for the rest.
     let exempt = escapeExemptToken()
+    observeScheduleLock(config)
     if windows.isEmpty && !isContinuousSchedule(config) {
       clearScheduleShield()
     } else if GuardianTargetRuntime.full(sharedDefaults ?? userDefaults) {
@@ -1991,6 +2014,7 @@ public class ExpoAppBlockerModule: Module {
     userDefaults.removeObject(forKey: scheduleConfigStorageKey)
     sharedDefaults?.removeObject(forKey: scheduleConfigStorageKey)
     sharedDefaults?.synchronize()
+    observeScheduleLock(nil)
     clearScheduleShield()
     if !isSuppressedInternal() {
       clearSuppressionState()
@@ -2139,6 +2163,7 @@ public class ExpoAppBlockerModule: Module {
   /// Explicit Start must surface a failed render instead of only acknowledging its deadline.
   private func reevaluateScheduleShieldThrowing() throws {
     let keyLock = try lockGuardianKeys(); defer { keyLock.unlock() }
+    observeScheduleLock((sharedDefaults ?? userDefaults).dictionary(forKey: scheduleConfigStorageKey))
     // #598: a targeted ticket exempts one app but keeps the gap shield up for the rest; a full ticket
     // keeps the whole schedule shield down.
     let exempt = escapeExemptToken()
@@ -2168,6 +2193,17 @@ public class ExpoAppBlockerModule: Module {
         updateScheduleShieldVariant()
       } else { applyScheduleShield(items, mode: mode, exempt: exempt) }
     }
+  }
+
+  /// chapchu #988: feed the schedule-lock recorder (armed and outside every free window, regardless
+  /// of a live escape ticket). Callers hold the Guardian key lock, same as the monitor.
+  private func observeScheduleLock(_ config: [String: Any]?) {
+    var locked = false
+    if let config = config {
+      let windows = parseScheduleWindows(config)
+      locked = !(windows.isEmpty && !isContinuousSchedule(config)) && !isAnyScheduleWindowActive(windows: windows, at: Date())
+    }
+    GuardianLockRecords.observe(locked: locked, at: Date(), defaults: sharedDefaults ?? userDefaults)
   }
 
   private func parseScheduleWindows(_ config: [String: Any]) -> [ScheduleWindowInfo] {

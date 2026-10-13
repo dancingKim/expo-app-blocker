@@ -235,6 +235,7 @@ class ExpoAppBlockerModule : Module() {
 
     Function("setScheduleConfiguration") { config: Map<String, Any?> ->
       ScheduleStore.setConfiguration(context, config)
+      ScheduleLockRecords.observeNow(context)
       // Arm the boundary alarm and make sure the service is alive so an already-open
       // window is enforced on the next poll tick.
       AlarmReceiver.scheduleNext(context)
@@ -244,6 +245,7 @@ class ExpoAppBlockerModule : Module() {
 
     Function("clearScheduleConfiguration") {
       ScheduleStore.clear(context)
+      ScheduleLockRecords.observeNow(context)
       // #656: keep a LIVE escape ticket. An escape ticket is a fixed-duration promise and is
       // layer-agnostic (it suppresses the immediate block too), so ending it early because the
       // schedule layer was torn down re-locked the phone mid-ticket. Only a ticket that is already
@@ -258,6 +260,16 @@ class ExpoAppBlockerModule : Module() {
 
     Function("getScheduleConfiguration") {
       ScheduleStore.getConfigurationMap(context)
+    }
+
+    // chapchu #988: actual schedule-lock boundaries; observe first so a missed boundary is stamped now.
+    AsyncFunction("getScheduleLockRecords") {
+      ScheduleLockRecords.observeNow(context)
+      ScheduleLockRecords.read(context)
+    }
+
+    AsyncFunction("acknowledgeScheduleLockRecords") { ids: List<String> ->
+      ScheduleLockRecords.acknowledge(context, ids)
     }
 
     Function("drainPendingIntercepts") {

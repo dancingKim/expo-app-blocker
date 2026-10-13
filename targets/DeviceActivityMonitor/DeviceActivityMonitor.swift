@@ -477,6 +477,8 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   /// `store` (immediate blocks) and the temporary-unlock state.
   private func reevaluateScheduleShield() {
     let defaults = sharedDefaults ?? UserDefaults.standard
+    // chapchu #988: record the actual lock boundary while the host app may not be running.
+    GuardianLockRecords.observe(locked: scheduleCommitmentInForce(defaults), at: Date(), defaults: defaults)
     // #572/#598: a live FULL escape ticket also suppresses the schedule shield — keep it down while
     // valid. A TARGETED ticket instead exempts just the escaped app and keeps the gap shield up.
     let exempt = escapeExemptToken()
@@ -514,6 +516,15 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
         updateScheduleShieldVariant()
       } else { applyScheduleShield(parseScheduleItems(dict, mode: mode), mode: mode, exempt: exempt) }
     }
+  }
+
+  /// #988: armed and outside every free window — independent of a live escape ticket (tickets are
+  /// recorded as door passes and subtracted, not as a schedule-session gap).
+  private func scheduleCommitmentInForce(_ defaults: UserDefaults) -> Bool {
+    guard let dict = defaults.dictionary(forKey: scheduleConfigStorageKey) else { return false }
+    let windows = parseScheduleWindows(dict)
+    if windows.isEmpty && !isContinuousSchedule(dict) { return false }
+    return !isInsideAnyScheduleWindow(windows: windows, at: Date())
   }
 
   /// Only an explicit empty array opts in; malformed/legacy configs keep their old meaning.

@@ -421,6 +421,36 @@ export async function getScheduleConfigurationAsync(): Promise<ScheduleConfigura
   return await NativeModule.getScheduleConfigurationAsync() ?? null;
 }
 
+/**
+ * chapchu #988: one actual schedule-lock interval recorded natively at the moment the schedule
+ * commitment came into force (`startedAt`) and lifted (`endedAt`, absent while still locked). Epoch
+ * ms. `id` is stable for the record's lifetime — use it as the idempotency key when uploading.
+ */
+export interface ScheduleLockRecord {
+  id: string;
+  startedAt: number;
+  endedAt?: number;
+}
+
+/**
+ * Pending schedule-lock records, oldest first. The native side observes the current state before
+ * answering, so a boundary missed while nothing was running is stamped now. Returns `null` on a
+ * binary that predates the recorder (caller should fall back / skip).
+ */
+export async function getScheduleLockRecords(): Promise<ScheduleLockRecord[] | null> {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return null;
+  if (typeof NativeModule.getScheduleLockRecords !== "function") return null;
+  const raw = await NativeModule.getScheduleLockRecords();
+  return Array.isArray(raw) ? raw : [];
+}
+
+/** Drop closed records the host durably handed off. Open records are never dropped. */
+export async function acknowledgeScheduleLockRecords(ids: string[]): Promise<void> {
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return;
+  if (typeof NativeModule.acknowledgeScheduleLockRecords !== "function" || ids.length === 0) return;
+  await NativeModule.acknowledgeScheduleLockRecords(ids);
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // iOS-specific: Temporary unlock
 // ──────────────────────────────────────────────────────────────────────────────

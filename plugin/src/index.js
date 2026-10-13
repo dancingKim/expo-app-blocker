@@ -272,6 +272,9 @@ function withAppBlockerIOS(config, pluginConfig) {
     fs.mkdirSync(recoveryTarget, { recursive: true });
     fs.copyFileSync(path.resolve(__dirname, "../../ios/GuardianTokenRecovery.swift"),
       path.join(recoveryTarget, "GuardianTokenRecovery.swift"));
+    // chapchu #988: the schedule-lock boundary recorder is shared by module and monitor.
+    fs.copyFileSync(path.resolve(__dirname, "../../ios/GuardianLockRecords.swift"),
+      path.join(recoveryTarget, "GuardianLockRecords.swift"));
 
     // 1. Copy template Swift files + expo-target.config.js from this package
     //    into the consumer's `targets/`. Preserves any user-managed assets.
